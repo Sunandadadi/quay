@@ -8,6 +8,7 @@ from collections import namedtuple
 logger = logging.getLogger(__name__)
 
 SKOPEO_TIMEOUT_SECONDS = 300
+import time
 
 # success: True or False whether call was successful
 # tags: list of tags or empty list
@@ -123,7 +124,10 @@ class SkopeoMirror(object):
         )
 
         try:
+            start = time.time()
             (stdout, stderr) = job.communicate(timeout=SKOPEO_TIMEOUT_SECONDS)
+            end = time.time()
+            print(f"Time taken for {args} is {end - start}")
         except subprocess.TimeoutExpired:
             job.kill()
             (stdout, stderr) = job.communicate()

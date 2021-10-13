@@ -14,7 +14,10 @@ from workers.repomirrorworker.models_interface import RepoMirrorToken, RepoMirro
 class RepoMirrorModel(RepoMirrorWorkerDataInterface):
     def repositories_to_mirror(self, start_token=None):
         def batch_query():
-            return get_eligible_mirrors()
+            ans = get_eligible_mirrors()
+            print("get_eligible_mirrors", ans)
+
+            return ans
 
         # Find the minimum ID.
         if start_token is not None:

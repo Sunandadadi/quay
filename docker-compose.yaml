@@ -46,6 +46,7 @@ services:
       context: .
       target: local-dev-env
     image: quay-local:local
+#    quay.io/redhat/quay:v3.3.4
     volumes:
       - ".:/quay-registry"
     ports:
@@ -54,6 +55,7 @@ services:
     environment:
       DEBUGLOG: "true"
       IGNORE_VALIDATION: "true"
+      QUAY_OVERRIDE_SERVICES: "repomirrorworker=true"
 
   # clair is configured to share it's network 
   # namespace with quay. this allows quay to serve

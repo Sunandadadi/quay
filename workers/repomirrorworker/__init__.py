@@ -60,7 +60,11 @@ def process_mirrors(skopeo, token=None):
         logger.debug("Repository mirror disabled; skipping RepoMirrorWorker process_mirrors")
         return None
 
+    print("In process_mirrorors token is", token)
+
     iterator, next_token = model.repositories_to_mirror(start_token=token)
+    print("In process_mirrorors iterator is", iterator)
+
     if not iterator:
         logger.debug("Found no additional repositories to mirror")
         return next_token
@@ -68,6 +72,7 @@ def process_mirrors(skopeo, token=None):
     with database.UseThenDisconnect(app.config):
         for mirror, abt, num_remaining in iterator:
             try:
+                print("In process_mirrorors mirror", mirror, "skopeo", skopeo)
                 perform_mirror(skopeo, mirror)
             except PreemptedException:
                 logger.info(
@@ -87,14 +92,16 @@ def perform_mirror(skopeo, mirror):
     """
     Run mirror on all matching tags of remote repository.
     """
-
+    print("In perform_mirror going to claim_mirror!!")
     if os.getenv("DEBUGLOG", "false").lower() == "true":
         verbose_logs = True
     else:
         verbose_logs = False
 
     mirror = claim_mirror(mirror)
+
     if not mirror:
+        print("In perform_mirror mirror is", mirror)
         raise PreemptedException
 
     emit_log(
@@ -109,8 +116,11 @@ def perform_mirror(skopeo, mirror):
     # easy communication by user through bug report.
     tags = []
     try:
+        print("In perform_mirror try!!!!")
         tags = tags_to_mirror(skopeo, mirror)
+
     except RepoMirrorSkopeoException as e:
+        print("In perform_mirror RepoMirrorSkopeoException!!!!")
         emit_log(
             mirror,
             "repo_mirror_sync_failed",
@@ -121,9 +131,11 @@ def perform_mirror(skopeo, mirror):
             stdout=e.stdout,
             stderr=e.stderr,
         )
+        print("In perform_mirror releasing mirror here1")
         release_mirror(mirror, RepoMirrorStatus.FAIL)
         return
     except Exception as e:
+        print("In perform_mirror Exception!!!!")
         emit_log(
             mirror,
             "repo_mirror_sync_failed",
@@ -134,6 +146,7 @@ def perform_mirror(skopeo, mirror):
             stdout="Not applicable",
             stderr=traceback.format_exc(),
         )
+        print("In perform_mirror releasing mirror here2")
         release_mirror(mirror, RepoMirrorStatus.FAIL)
         return
     if tags == []:
@@ -145,6 +158,7 @@ def perform_mirror(skopeo, mirror):
             % (mirror.external_reference, ",".join(mirror.root_rule.rule_value)),
             tags="No tags matched",
         )
+        print("In perform_mirror releasing mirror here3")
         release_mirror(mirror, RepoMirrorStatus.SUCCESS)
         return
 
@@ -233,6 +247,7 @@ def perform_mirror(skopeo, mirror):
         delete_obsolete_tags(mirror, tags)
 
     except PreemptedException as e:
+        print("In perform_mirror In Preempted Exception", e)
         overall_status = RepoMirrorStatus.FAIL
         emit_log(
             mirror,
@@ -243,6 +258,7 @@ def perform_mirror(skopeo, mirror):
             stdout="Not applicable",
             stderr="Not applicable",
         )
+        print("In perform_mirror releasing mirror here4")
         release_mirror(mirror, overall_status)
         return
 
@@ -258,10 +274,13 @@ def perform_mirror(skopeo, mirror):
             stdout="Not applicable",
             stderr=traceback.format_exc(),
         )
+        print("In perform_mirror releasing mirror here5")
         release_mirror(mirror, overall_status)
         return
     finally:
+        print("In perform_mirror In finally, overall_Status", overall_status)
         if overall_status == RepoMirrorStatus.FAIL:
+            print("In perform_mirror In finally, overall_Status if block")
             emit_log(
                 mirror,
                 "repo_mirror_sync_failed",
@@ -271,6 +290,7 @@ def perform_mirror(skopeo, mirror):
             )
             rollback(mirror, now_ms)
         else:
+            print("In perform_mirror In finally, overall_Status else block", mirror.__dict__, tags)
             emit_log(
                 mirror,
                 "repo_mirror_sync_success",
@@ -279,6 +299,7 @@ def perform_mirror(skopeo, mirror):
                 % (mirror.external_reference, ",".join(mirror.root_rule.rule_value)),
                 tags=", ".join(tags),
             )
+        print("In perform_mirror releasing mirror here6")
         release_mirror(mirror, overall_status)
 
     return overall_status
@@ -286,6 +307,7 @@ def perform_mirror(skopeo, mirror):
 
 def tags_to_mirror(skopeo, mirror):
     all_tags = get_all_tags(skopeo, mirror)
+    print("all tags", all_tags)
     if all_tags == []:
         return []
 
@@ -298,6 +320,7 @@ def tags_to_mirror(skopeo, mirror):
 
 
 def get_all_tags(skopeo, mirror):
+    print("in get_all_tags!!")
     verbose_logs = os.getenv("DEBUGLOG", "false").lower() == "true"
 
     username = (
@@ -306,6 +329,8 @@ def get_all_tags(skopeo, mirror):
     password = (
         mirror.external_registry_password.decrypt() if mirror.external_registry_password else None
     )
+
+    print("verbose_logs", verbose_logs)
 
     with database.CloseForLongOperation(app.config):
         result = skopeo.tags(
@@ -317,7 +342,10 @@ def get_all_tags(skopeo, mirror):
             verify_tls=mirror.external_registry_config.get("verify_tls", True),
             proxy=mirror.external_registry_config.get("proxy", {}),
         )
+        print("in database result is", result)
 
+    print("I am gerree!!??")
+    print("result.success is ", result.success)
     if not result.success:
         raise RepoMirrorSkopeoException(
             "skopeo inspect failed: %s" % _skopeo_inspect_failure(result),

@@ -509,13 +509,13 @@ class DefaultConfig(ImmutableConfig):
     SECURITY_SCANNER_V4_PSK = None
 
     # Repository mirror
-    FEATURE_REPO_MIRROR = False
+    FEATURE_REPO_MIRROR = True
 
     # The number of seconds between indexing intervals in the repository mirror
     REPO_MIRROR_INTERVAL = 30
 
     # Require HTTPS and verify certificates of Quay registry during mirror.
-    REPO_MIRROR_TLS_VERIFY = True
+    REPO_MIRROR_TLS_VERIFY = False
 
     # Replaces the SERVER_HOSTNAME as the destination for mirroring.
     REPO_MIRROR_SERVER_HOSTNAME = None
