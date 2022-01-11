@@ -118,7 +118,6 @@ def get_namespace_quota(name):
             raise InvalidUsernameException("This Namespace does not exist : " + name)
 
         quota = UserOrganizationQuota.select().where(UserOrganizationQuota.namespace_id == space.id)
-
         # TODO: I dont like this so we will need to find a better way to test if the query is empty.
         return quota.get()
     except UserOrganizationQuota.DoesNotExist:
