@@ -23,6 +23,7 @@
     $scope.showTeamsCounter = 0;
     $scope.changeEmailInfo = null;
     $scope.context = {};
+    $scope.quotaReportingEnabled = Config.FEATURE_QUOTA_REPORTING
 
     $scope.Config = Config;
     $scope.Features = Features;
@@ -41,7 +42,8 @@
         'namespace': orgname,
         'public': true,
         'last_modified': true,
-        'popularity': true
+        'popularity': true,
+        'quota': $scope.quotaReportingEnabled,
       };
 
       $scope.organization.repositories = ApiService.listReposAsResource().withPagination('repositories').withOptions(options).get(function(resp) {

@@ -35,7 +35,7 @@ angular.module('quay').directive('repoListTable', function () {
 
         $scope.orderedRepositories = TableService.buildOrderedItems($scope.repositories,
             $scope.options,
-            ['namespace', 'name'], ['last_modified_datetime', 'popularity'])
+            ['namespace', 'name', 'quota'], ['last_modified_datetime', 'popularity'])
       };
 
       $scope.tablePredicateClass = function(name, predicate, reverse) {
@@ -92,8 +92,7 @@ angular.module('quay').directive('repoListTable', function () {
           (resource.value || []).forEach(function(repository) {
             var repositoryInfo = $.extend(repository, {
               'full_name': repository.namespace + '/' + repository.name,
-              'last_modified_datetime': TableService.getReversedTimestamp(repository.last_modified),
-              'quota': '324 MB'
+              'last_modified_datetime': TableService.getReversedTimestamp(repository.last_modified)
             });
 
             $scope.repositories.push(repositoryInfo);

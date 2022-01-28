@@ -89,11 +89,13 @@ class PreOCIModel(RepositoryDataInterface):
         page_token,
         last_modified,
         popularity,
+        quota,
     ):
         next_page_token = None
 
         # Lookup the requested repositories (either starred or non-starred.)
         if starred:
+            # TODO: Add Quota stuff here
             # Return the full list of repos starred by the current user that are still visible to them.
             def can_view_repo(repo):
                 assert repo.state != RepositoryState.MARKED_FOR_DELETION
@@ -132,6 +134,7 @@ class PreOCIModel(RepositoryDataInterface):
         # and/or last modified.
         last_modified_map = {}
         action_sum_map = {}
+        quota_map = {}
         if last_modified or popularity:
             repository_refs = [RepositoryReference.for_id(repo.rid) for repo in repos]
             repository_ids = [repo.rid for repo in repos]
@@ -147,6 +150,9 @@ class PreOCIModel(RepositoryDataInterface):
 
             if popularity:
                 action_sum_map = model.log.get_repositories_action_sums(repository_ids)
+
+        if quota:
+            quota_map = {repo_id: model.repository.get_repository_size_and_cache(repo_id).get('repository_size') for repo_id in repository_ids}
 
         # Collect the IDs of the repositories that are starred for the user, so we can mark them
         # in the returned results.
@@ -173,6 +179,7 @@ class PreOCIModel(RepositoryDataInterface):
                     username,
                     None,
                     repo.state,
+                    quota_map.get(repo.rid)
                 )
                 for repo in repos
             ],
