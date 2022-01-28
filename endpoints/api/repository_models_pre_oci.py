@@ -25,6 +25,9 @@ from endpoints.api.repository_models_interface import (
     Count,
 )
 
+import humanize
+
+
 MAX_DAYS_IN_3_MONTHS = 92
 REPOS_PER_PAGE = 100
 
@@ -152,7 +155,8 @@ class PreOCIModel(RepositoryDataInterface):
                 action_sum_map = model.log.get_repositories_action_sums(repository_ids)
 
         if quota:
-            quota_map = {repo_id: model.repository.get_repository_size_and_cache(repo_id).get('repository_size') for repo_id in repository_ids}
+            for repo_id in repository_ids:
+                quota_map[repo_id] = humanize.naturalsize(model.repository.get_repository_size_and_cache(repo_id).get('repository_size', 0))
 
         # Collect the IDs of the repositories that are starred for the user, so we can mark them
         # in the returned results.
