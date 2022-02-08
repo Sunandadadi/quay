@@ -13,7 +13,9 @@ angular.module('quay').directive('repoListTable', function () {
       'namespaces': '=namespaces',
       'starToggled': '&starToggled',
       'repoKind': '@repoKind',
-      'repoMirroringEnabled': '=repoMirroringEnabled'}, 
+      'repoMirroringEnabled': '=repoMirroringEnabled',
+      'quotaReportingEnabled': '=quotaReportingEnabled'
+    },
     controller: function($scope, $element, $filter, TableService, UserService, StateService) {
       $scope.inReadOnlyMode = StateService.inReadOnlyMode();
       $scope.repositories = null;
@@ -91,6 +93,7 @@ angular.module('quay').directive('repoListTable', function () {
             var repositoryInfo = $.extend(repository, {
               'full_name': repository.namespace + '/' + repository.name,
               'last_modified_datetime': TableService.getReversedTimestamp(repository.last_modified),
+              'quota': '324 MB'
             });
 
             $scope.repositories.push(repositoryInfo);

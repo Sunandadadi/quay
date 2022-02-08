@@ -13,7 +13,8 @@ angular.module('quay').directive('repoListView', function () {
       starredRepositories: '=starredRepositories',
       starToggled: '&starToggled',
       repoKind: '@repoKind',
-      repoMirroringEnabled: '=repoMirroringEnabled'
+      repoMirroringEnabled: '=repoMirroringEnabled',
+      quotaReportingEnabled: '=quotaReportingEnabled'
     },
     controller: function($scope, $element, CookieService, StateService) {
       $scope.inReadOnlyMode = StateService.inReadOnlyMode();

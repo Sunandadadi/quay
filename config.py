@@ -44,6 +44,7 @@ CLIENT_WHITELIST = [
     "DOCUMENTATION_ROOT",
     "FEATURE_REPO_MIRROR",
     "FEATURE_QUOTA_MANAGEMENT",
+    "FEATURE_QUOTA_REPORTING",
 ]
 
 
@@ -361,6 +362,9 @@ class DefaultConfig(ImmutableConfig):
 
     # Feature Flag: Whether to support signing
     FEATURE_SIGNING = False
+
+    # Feature Flag: If set to True, reports quota consumption on UI
+    FEATURE_QUOTA_REPORTING = True
 
     # Feature Flag: Whether to enable support for App repositories.
     FEATURE_APP_REGISTRY = False

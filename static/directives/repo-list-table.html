@@ -37,6 +37,12 @@
       <a ng-click="orderBy('state')">State</a>
     </td>
     <td class="hidden-xs"
+        ng-class="tablePredicateClass('quota', options.predicate, options.reverse)"
+        style="min-width: 20px;"
+        ng-show="quotaReportingEnabled">
+      <a ng-click="orderBy('quota')">Quota Consumed</a>
+    </td>
+    <td class="hidden-xs"
         ng-class="tablePredicateClass('popularity', options.predicate, options.reverse)"
         style="min-width: 20px;">
       <a ng-click="orderBy('popularity')">Activity</a>
@@ -71,6 +77,11 @@
        <td class="repo-state" ng-show="repoMirroringEnabled">
         <span>
           {{ ::repository.state.replace('_', ' ').toLowerCase() }}
+        </span>
+      </td>
+       <td class="repo-quota" ng-show="quotaReportingEnabled">
+        <span>
+          {{ "12.3 MB" }}
         </span>
       </td>
        <td class="popularity hidden-xs">
