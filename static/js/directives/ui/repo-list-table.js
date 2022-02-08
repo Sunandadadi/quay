@@ -16,11 +16,13 @@ angular.module('quay').directive('repoListTable', function () {
       'repoMirroringEnabled': '=repoMirroringEnabled',
       'quotaReportingEnabled': '=quotaReportingEnabled'
     },
-    controller: function($scope, $element, $filter, TableService, UserService, StateService) {
+    controller: function($scope, $element, $filter, TableService, UserService, StateService, Config) {
       $scope.inReadOnlyMode = StateService.inReadOnlyMode();
       $scope.repositories = null;
       $scope.orderedRepositories = [];
       $scope.reposPerPage = 25;
+      $scope.quotaReportingEnabled = Config.FEATURE_QUOTA_REPORTING;
+      $scope.repoMirroringEnabled = Config.FEATURE_REPO_MIRROR;
 
       $scope.maxPopularity = 0;
       $scope.options = {
@@ -35,7 +37,7 @@ angular.module('quay').directive('repoListTable', function () {
 
         $scope.orderedRepositories = TableService.buildOrderedItems($scope.repositories,
             $scope.options,
-            ['namespace', 'name', 'quota'], ['last_modified_datetime', 'popularity'])
+            ['namespace', 'name', 'state'], ['last_modified_datetime', 'popularity', 'quota'])
       };
 
       $scope.tablePredicateClass = function(name, predicate, reverse) {

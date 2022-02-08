@@ -83,7 +83,9 @@
       var options = {
         'starred': true,
         'last_modified': true,
-        'popularity': true
+        'popularity': true,
+        'quota': $scope.quotaReportingEnabled,
+        'state': $scope.repoMirroringEnabled,
       };
 
       $scope.starred_repositories = ApiService.listReposAsResource().withOptions(options).get(function(resp) {

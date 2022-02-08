@@ -13,14 +13,14 @@ angular.module('quay').directive('repoListView', function () {
       starredRepositories: '=starredRepositories',
       starToggled: '&starToggled',
       repoKind: '@repoKind',
-      repoMirroringEnabled: '=repoMirroringEnabled',
-      quotaReportingEnabled: '=quotaReportingEnabled'
     },
-    controller: function($scope, $element, CookieService, StateService) {
+    controller: function($scope, $element, CookieService, StateService, Config) {
       $scope.inReadOnlyMode = StateService.inReadOnlyMode();
       $scope.resources = [];
       $scope.loading = true;
       $scope.optionAllowed = true;
+      $scope.quotaReportingEnabled = Config.FEATURE_QUOTA_REPORTING;
+      $scope.repoMirroringEnabled = Config.FEATURE_REPO_MIRROR;
 
       $scope.$watch('namespaces', function(namespaces) {
         if (!namespaces) { return; }

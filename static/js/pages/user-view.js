@@ -27,6 +27,8 @@
     $scope.changeMetadataInfo = null;
 
     $scope.hasSingleSignin = ExternalLoginService.hasSingleSignin();
+    $scope.repoMirroringEnabled = Config.FEATURE_REPO_MIRROR
+    $scope.quotaReportingEnabled = Config.FEATURE_QUOTA_REPORTING
     $scope.context = {};
 
     $scope.oidcLoginProvider = null;
@@ -56,7 +58,9 @@
         'public': true,
         'namespace': username,
         'last_modified': true,
-        'popularity': true
+        'popularity': true,
+        'quota': $scope.quotaReportingEnabled,
+        'state': $scope.repoMirroringEnabled,
       };
 
       $scope.context.viewuser.repositories = ApiService.listReposAsResource().withPagination('repositories').withOptions(options).get(function(resp) {
