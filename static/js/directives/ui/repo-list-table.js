@@ -94,7 +94,7 @@ angular.module('quay').directive('repoListTable', function () {
           (resource.value || []).forEach(function(repository) {
             var repositoryInfo = $.extend(repository, {
               'full_name': repository.namespace + '/' + repository.name,
-              'last_modified_datetime': TableService.getReversedTimestamp(repository.last_modified)
+              'last_modified_datetime': TableService.getReversedTimestamp(repository.last_modified),
             });
 
             $scope.repositories.push(repositoryInfo);
