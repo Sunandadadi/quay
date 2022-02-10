@@ -13,8 +13,7 @@ angular.module('quay').directive('repoListTable', function () {
       'namespaces': '=namespaces',
       'starToggled': '&starToggled',
       'repoKind': '@repoKind',
-      'repoMirroringEnabled': '=repoMirroringEnabled',
-      'quotaManagementEnabled': '=quotaManagementEnabled'
+      'repoMirroringEnabled': '=repoMirroringEnabled'
     },
     controller: function($scope, $element, $filter, TableService, UserService, StateService, Config) {
       $scope.inReadOnlyMode = StateService.inReadOnlyMode();

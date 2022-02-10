@@ -33,7 +33,7 @@
     <td class="hidden-xs"
         ng-class="tablePredicateClass('state', options.predicate, options.reverse)"
         style="min-width: 20px;"
-        ng-if="repoMirroringEnabled">
+        ng-show="repoMirroringEnabled">
       <a ng-click="orderBy('state')">State</a>
     </td>
 
@@ -75,7 +75,7 @@
          </span>
          <span class="empty" ng-if="::!repository.last_modified">(Empty Repository)</span>
        </td>
-       <td class="repo-state hidden-xs" ng-show="repoMirroringEnabled">
+       <td class="repo-state" ng-show="repoMirroringEnabled">
         <span>
           {{ ::repository.state.replace('_', ' ').toLowerCase() }}
         </span>
