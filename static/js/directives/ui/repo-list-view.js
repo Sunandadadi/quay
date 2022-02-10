@@ -19,7 +19,7 @@ angular.module('quay').directive('repoListView', function () {
       $scope.resources = [];
       $scope.loading = true;
       $scope.optionAllowed = true;
-      $scope.quotaReportingEnabled = Config.FEATURE_QUOTA_REPORTING;
+      $scope.quotaManagementEnabled = Config.FEATURE_QUOTA_MANAGEMENT;
       $scope.repoMirroringEnabled = Config.FEATURE_REPO_MIRROR;
 
       $scope.$watch('namespaces', function(namespaces) {

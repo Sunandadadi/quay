@@ -2,6 +2,7 @@ from collections import defaultdict
 
 from datetime import datetime, timedelta
 
+import features
 from auth.permissions import ReadRepositoryPermission
 from data.database import Repository as RepositoryTable, RepositoryState
 from data import model
@@ -154,7 +155,7 @@ class PreOCIModel(RepositoryDataInterface):
             if popularity:
                 action_sum_map = model.log.get_repositories_action_sums(repository_ids)
 
-        if quota:
+        if features.QUOTA_MANAGEMENT and quota:
             for repo_id in repository_ids:
                 quota_map[repo_id] = humanize.naturalsize(model.repository.get_repository_size_and_cache(repo_id).get('repository_size', 0))
 
@@ -243,6 +244,7 @@ class PreOCIModel(RepositoryDataInterface):
             False,
             repo.namespace_user.stripe_id is None,
             repo.state,
+            features.QUOTA_MANAGEMENT is True,
         )
 
         if base.kind_name == "application":

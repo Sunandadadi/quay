@@ -114,14 +114,13 @@ def create_namespace_limit(orgname, quota_type_id, percent_of_limit):
 def get_namespace_quota(name):
     try:
         space = user.get_namespace_user(name)
-
         if space is None:
             raise InvalidUsernameException("This Namespace does not exist : " + name)
 
         quota = UserOrganizationQuota.select().where(UserOrganizationQuota.namespace_id == space.id)
+
         # TODO: I dont like this so we will need to find a better way to test if the query is empty.
-        quota.get()
-        return quota
+        return quota.get()
     except UserOrganizationQuota.DoesNotExist:
         return None
 
@@ -154,10 +153,10 @@ def get_namespace_limit(name, quota_type_id, percent_of_limit):
 
 
 def get_namespace_limit_types():
-    return QuotaType.select()
+    return [qtype.name for qtype in QuotaType.select()]
 
 
-def get_namespace_limit_types(quota_limit_type_id):
+def get_namespace_limit_types_for_id(quota_limit_type_id):
     return QuotaType.select().where(QuotaType.id == quota_limit_type_id).get()
 
 

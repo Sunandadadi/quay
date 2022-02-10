@@ -65,7 +65,7 @@ def team_view(orgname, team):
     }
 
 
-def org_view(o, teams):
+def org_view(o, teams, data=None):
     is_admin = AdministerOrganizationPermission(o.username).can()
     is_member = OrganizationMemberPermission(o.username).can()
 
@@ -75,6 +75,7 @@ def org_view(o, teams):
         "avatar": avatar.get_data_for_user(o),
         "is_admin": is_admin,
         "is_member": is_member,
+        "quota": data
     }
 
     if teams is not None:
@@ -216,11 +217,21 @@ class Organization(ApiResource):
             raise NotFound()
 
         teams = None
+        data = {}
         if OrganizationMemberPermission(orgname).can():
             has_syncing = features.TEAM_SYNCING and bool(authentication.federated_service)
             teams = model.team.get_teams_within_org(org, has_syncing)
 
-        return org_view(org, teams)
+        #TODO: Move this to a function in model.namespacequota
+        if features.QUOTA_MANAGEMENT:
+            data['quota_limit_types'] = model.namespacequota.get_namespace_limit_types()
+            data['quota_limits'] = list(model.namespacequota.get_namespace_limits(orgname))
+            quota = model.namespacequota.get_namespace_quota(orgname)
+
+            if quota is not None:
+                data['set_quota'] = quota.limit_bytes
+
+        return org_view(org, teams, data)
 
     @require_scope(scopes.ORG_ADMIN)
     @nickname("changeOrganizationDetails")

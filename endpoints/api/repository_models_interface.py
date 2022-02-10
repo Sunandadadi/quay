@@ -56,7 +56,7 @@ class RepositoryBaseElement(
             "is_public": self.is_public,
             "kind": self.kind_name,
             "state": self.state.name if self.state is not None else None,
-            "quota": self.quota if self.quota is not None else None,
+            "quota": self.quota if features.QUOTA_MANAGEMENT is True else None,
         }
 
         if self.should_last_modified:
@@ -117,6 +117,7 @@ class ImageRepositoryRepository(
     :type badge_token: string
     :type trust_enabled: boolean
     """
+    # TODO: Add quota stuff here?
 
     def to_dict(self):
         img_repo = {

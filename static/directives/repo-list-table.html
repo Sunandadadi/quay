@@ -40,7 +40,7 @@
     <td class="hidden-xs"
         ng-class="tablePredicateClass('quota', options.predicate, options.reverse)"
         style="min-width: 20px;"
-        ng-if="quotaReportingEnabled">
+        ng-if="quotaManagementEnabled">
       <a ng-click="orderBy('quota')">Quota Consumed</a>
     </td>
     <td class="hidden-xs"
@@ -80,7 +80,7 @@
           {{ ::repository.state.replace('_', ' ').toLowerCase() }}
         </span>
       </td>
-       <td class="repo-quota hidden-xs" ng-show="quotaReportingEnabled">
+       <td class="repo-quota hidden-xs" ng-show="quotaManagementEnabled">
         <span>
           {{ ::repository.quota }}
         </span>

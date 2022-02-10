@@ -20,7 +20,7 @@
     $scope.resources = [];
     $scope.Features = Features;
     $scope.inReadOnlyMode = StateService.inReadOnlyMode();
-    $scope.quotaReportingEnabled = Config.FEATURE_QUOTA_REPORTING
+    $scope.quotaManagementEnabled = Config.FEATURE_QUOTA_MANAGEMENT
     $scope.repoMirroringEnabled = Config.FEATURE_REPO_MIRROR
 
     // When loading the UserService, if the user is logged in, create a list of
@@ -74,7 +74,7 @@
           'popularity': true,
           'repo_kind': 'application',
           'public': true,
-          'quota': $scope.quotaReportingEnabled,
+          'quota': $scope.quotaManagementEnabled,
           'state': $scope.repoMirroringEnabled,
         };
 

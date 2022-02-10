@@ -14,14 +14,14 @@ angular.module('quay').directive('repoListTable', function () {
       'starToggled': '&starToggled',
       'repoKind': '@repoKind',
       'repoMirroringEnabled': '=repoMirroringEnabled',
-      'quotaReportingEnabled': '=quotaReportingEnabled'
+      'quotaManagementEnabled': '=quotaManagementEnabled'
     },
     controller: function($scope, $element, $filter, TableService, UserService, StateService, Config) {
       $scope.inReadOnlyMode = StateService.inReadOnlyMode();
       $scope.repositories = null;
       $scope.orderedRepositories = [];
       $scope.reposPerPage = 25;
-      $scope.quotaReportingEnabled = Config.FEATURE_QUOTA_REPORTING;
+      $scope.quotaManagementEnabled = Config.FEATURE_QUOTA_MANAGEMENT;
       $scope.repoMirroringEnabled = Config.FEATURE_REPO_MIRROR;
 
       $scope.maxPopularity = 0;

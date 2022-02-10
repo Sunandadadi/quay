@@ -28,7 +28,7 @@
 
     $scope.hasSingleSignin = ExternalLoginService.hasSingleSignin();
     $scope.repoMirroringEnabled = Config.FEATURE_REPO_MIRROR
-    $scope.quotaReportingEnabled = Config.FEATURE_QUOTA_REPORTING
+    $scope.quotaManagementEnabled = Config.FEATURE_QUOTA_MANAGEMENT
     $scope.context = {};
 
     $scope.oidcLoginProvider = null;
@@ -59,7 +59,7 @@
         'namespace': username,
         'last_modified': true,
         'popularity': true,
-        'quota': $scope.quotaReportingEnabled,
+        'quota': $scope.quotaManagementEnabled,
         'state': $scope.repoMirroringEnabled,
       };
 
