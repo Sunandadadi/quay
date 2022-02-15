@@ -29,15 +29,14 @@ from endpoints.exception import InvalidToken, Unauthorized
 logger = logging.getLogger(__name__)
 
 
-def quota_view(orgname: str, quota):
-    return {"orgname": orgname, "limit_bytes": quota.limit_bytes}
+def quota_view(orgname: str, quota, quota_limit_types):
+    return {"orgname": orgname, "limit_bytes": quota.limit_bytes, "quota_limit_types": quota_limit_types}
 
 
 def quota_limit_view(orgname: str, quota_limit):
     return {
-        "orgname": orgname,
         "percent_of_limit": quota_limit["percent_of_limit"],
-        "quota_type": quota_limit["name"],
+        "name": quota_limit["name"],
     }
 
 
@@ -77,11 +76,12 @@ class OrganizationQuota(ApiResource):
             raise Unauthorized()
 
         quota = model.namespacequota.get_namespace_quota(namespace)
+        quota_limit_types = model.namespacequota.get_namespace_limit_types()
 
         if quota is None:
             return {}
 
-        return quota_view(namespace, quota.get())
+        return quota_view(namespace, quota.get(), quota_limit_types)
 
     @nickname("createNamespaceQuota")
     @validate_json_request("NewOrgQuota")
@@ -200,7 +200,7 @@ class OrganizationQuotaLimits(ApiResource):
 
         quota_limits = list(model.namespacequota.get_namespace_limits(namespace))
 
-        return [quota_limit_view(namespace, limit) for limit in quota_limits]
+        return {'quota_limits': [quota_limit_view(namespace, limit) for limit in quota_limits]}, 200
 
     @nickname("createOrganizationQuotaLimit")
     @validate_json_request("NewOrgQuotaLimit")
@@ -220,9 +220,8 @@ class OrganizationQuotaLimits(ApiResource):
                 raise Unauthorized()
 
         quota_limit_data = request.get_json()
-
         quota = model.namespacequota.get_namespace_limit(
-            namespace, quota_limit_data["quota_type_id"], quota_limit_data["percent_of_limit"]
+            namespace, quota_limit_data["name"], quota_limit_data["percent_of_limit"]
         )
 
         if quota is not None:
@@ -257,7 +256,7 @@ class OrganizationQuotaLimits(ApiResource):
             raise request_error(message=msg)
 
         quota = model.namespacequota.get_namespace_limit(
-            namespace, quota_limit_data["quota_type_id"], quota_limit_data["percent_of_limit"]
+            namespace, quota_limit_data["name"], quota_limit_data["percent_of_limit"]
         )
 
         if quota is None:
@@ -287,7 +286,7 @@ class OrganizationQuotaLimits(ApiResource):
         quota_limit_data = request.get_json()
 
         quota = model.namespacequota.get_namespace_limit(
-            namespace, quota_limit_data["quota_type_id"], quota_limit_data["percent_of_limit"]
+            namespace, quota_limit_data["name"], quota_limit_data["percent_of_limit"]
         )
 
         if quota is None:
@@ -318,4 +317,4 @@ class OrganizationQuotaReport(ApiResource):
         if not orgperm.can() and not userperm.can():
             raise Unauthorized()
 
-        return model.namespacequota.get_namespace_repository_sizes_and_cache(namespace)
+        return {"response": model.namespacequota.get_namespace_repository_sizes_and_cache(namespace)}, 200

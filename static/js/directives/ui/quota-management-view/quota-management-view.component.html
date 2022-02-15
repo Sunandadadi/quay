@@ -5,14 +5,33 @@
              Quota Management:
          </td>
          <td>
-             <input type="checkbox" ng-model="$ctrl.quotaEnabled">
-             <div>
-                 <div>
-                     <label>Set Organization quota (bytes)</label>
-                     <input type="number" name="quota-limit" ng-model="$ctrl.newQuota">
+             <div class="width-50">
+                 <div class="row-alignment">
+
+                     <label class="margin-2">Set Organization quota (bytes)</label>
+
+                     <input class="margin-2 form-control width-50" type="number" name="quota-limit" ng-model="$ctrl.currentQuotaConfig['quota']">
+
+                     <button class="margin-2 add-quota-limit btn btn-success hidden-xs" ng-click="$ctrl.addQuotaLimit($event)">
+                         <i class="fa fa-plus margin-right-4"></i>
+                         Add Quota Limit
+                     </button>
+                 </div>
+
+                 <div class="row-alignment" ng-repeat="limit in $ctrl.limitElements track by ('div-' + $ctrl.limitCounter + '-option-' + $index)" id="limit-id-$ctrl.limitCounter">
+                     <select ng-model="$ctrl.currentQuotaConfig['limits'][$index]['name']" ng-options="obj.name for obj in $ctrl.quotaLimitTypes track by ($ctrl.limitCounter + $index)" class="form-control">
+                    </select>
+                     <input class="form-control margin-2" type="number" name="limit-percent" placeholder="Limit Percent" ng-model="$ctrl.currentQuotaConfig['limits'][$index]['percent_of_limit']"/>
+                     <span class="margin-2" ng-hide="$ctrl.limitElements.length < 1">
+                        <button class="margin-2 btn btn-danger" ng-click="$ctrl.removeQuotaLimit($index)" ng-model="$index">
+                            <i class="fa fa-trash"></i>
+                            {{ $index }}Remove
+                        </button>
+                     </span>
                  </div>
                  <a class="btn btn-primary save-quota-details" ng-disabled="$ctrl.disablesave()" ng-click="$ctrl.updateQuotaDetails()">Save Quota Details</a>
              </div>
+
          </td>
      </tr>
  </table>

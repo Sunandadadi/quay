@@ -128,7 +128,7 @@ def get_namespace_limits(name):
     return _basequery.get_namespace_quota_limits(name)
 
 
-def get_namespace_limit(name, quota_type_id, percent_of_limit):
+def get_namespace_limit(name, quota_type_name, percent_of_limit):
     try:
         quota = get_namespace_quota(name)
 
@@ -136,6 +136,7 @@ def get_namespace_limit(name, quota_type_id, percent_of_limit):
             raise InvalidUsernameException("Quota for this namespace does not exist")
 
         quota = quota.get()
+        quota_type_id = get_namespace_limit_types_for_name(quota_type_name).id
 
         query = (
             QuotaLimits.select()
@@ -152,11 +153,16 @@ def get_namespace_limit(name, quota_type_id, percent_of_limit):
 
 
 def get_namespace_limit_types():
-    return [qtype.name for qtype in QuotaType.select()]
+    # return [qtype.name for qtype in QuotaType.select()]
+    return [{'id': qtype.id, 'name': qtype.name} for qtype in QuotaType.select()]
 
 
 def get_namespace_limit_types_for_id(quota_limit_type_id):
     return QuotaType.select().where(QuotaType.id == quota_limit_type_id).get()
+
+
+def get_namespace_limit_types_for_name(name):
+    return QuotaType.select().where(QuotaType.name == name).get()
 
 
 def change_namespace_quota(name, limit_bytes):
