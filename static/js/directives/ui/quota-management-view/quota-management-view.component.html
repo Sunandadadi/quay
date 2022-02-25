@@ -2,7 +2,7 @@
  <table class="co-list-table">
      <tr>
          <td>
-             Quota Management:
+             Quota Management: {{ $ctrl.organization.name }}
          </td>
          <td>
              <div class="width-50">
@@ -18,18 +18,25 @@
                      </button>
                  </div>
 
-                 <div class="row-alignment" ng-repeat="limit in $ctrl.limitElements track by ('div-' + $ctrl.limitCounter + '-option-' + $index)" id="limit-id-$ctrl.limitCounter">
-                     <select ng-model="$ctrl.currentQuotaConfig['limits'][$index]['name']" ng-options="obj.name for obj in $ctrl.quotaLimitTypes track by ($ctrl.limitCounter + $index)" class="form-control">
-                    </select>
-                     <input class="form-control margin-2" type="number" name="limit-percent" placeholder="Limit Percent" ng-model="$ctrl.currentQuotaConfig['limits'][$index]['percent_of_limit']"/>
-                     <span class="margin-2" ng-hide="$ctrl.limitElements.length < 1">
+                 <div class="row-alignment" ng-model="$ctrl.limitCounter" ng-repeat="x in [].constructor($ctrl.limitCounter) track by $index" id="limit-id-$ctrl.limitCounter">
+                     <select class="form-control" name="quotaLimitType" id="quotaLimitType"
+                        ng-options="obj as obj.name for obj in $ctrl.quotaLimitTypes track by obj.name"
+                        ng-model="$ctrl.currentQuotaConfig['limits'][$index]['limit_type']">
+                     </select>
+
+                     <input class="form-control margin-2" type="number" name="limit-percent" min="1" max="100" placeholder="Limit Percent" ng-model="$ctrl.currentQuotaConfig['limits'][$index]['percent_of_limit']"/>
+
+                     <span class="margin-2" ng-hide="$ctrl.limitCounter < 1">
                         <button class="margin-2 btn btn-danger" ng-click="$ctrl.removeQuotaLimit($index)" ng-model="$index">
                             <i class="fa fa-trash"></i>
-                            {{ $index }}Remove
+                            Remove
                         </button>
                      </span>
+                     cur: {{ $ctrl.currentQuotaConfig['limits'] }}
+                     prev: {{ $ctrl.prevQuotaConfig['limits'] }}
+
                  </div>
-                 <a class="btn btn-primary save-quota-details" ng-disabled="$ctrl.disablesave()" ng-click="$ctrl.updateQuotaDetails()">Save Quota Details</a>
+                 <button class="margin-2 btn btn-primary save-quota-details" ng-disabled="$ctrl.disableSave()" ng-click="$ctrl.updateQuotaDetails()">Save Quota Details</button>
              </div>
 
          </td>

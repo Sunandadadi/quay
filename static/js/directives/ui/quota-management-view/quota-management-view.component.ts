@@ -19,10 +19,10 @@ export class QuotaManagementViewComponent {
   private updating: boolean;
   private quotaLimitTypes: any[];
   private limitCounter: number;
-  private limitElements: any[];
   private prevquotaEnabled: boolean;
   private nameSpaceResource: any;
   private nameSpaceQuotaLimitsResource: any;
+  private rejectLimitType: string = 'Reject';
 
   constructor(@Inject('Config') private Config: any, @Inject('ApiService') private ApiService: any,
                @Inject('Features') private Features: any) {
@@ -30,60 +30,54 @@ export class QuotaManagementViewComponent {
       this.prevquotaEnabled = false;
       this.updating = false;
       this.limitCounter = 0;
-      this.limitElements = [];
       this.quotaLimitTypes = [];
 
-      console.log("this.organization.name", this.organization.name);
-      this.loadOrgQuota();
-      this.loadQuotaLimits();
-
-      // Check if org config has previously configured quota details
-      if (this.organization.quota) {
-        // Check if org quota was previously set
-
-        // If org quota is previously set and is more than 0
-        if (this.organization.quota["set_quota"] != null) {
-          this.prevQuotaConfig['quota'] = this.organization.quota["set_quota"];
-          this.currentQuotaConfig['quota'] = this.organization.quota["set_quota"];
-          this.prevQuotaConfig['limits'] = [...this.organization.quota["limits"]];
-          this.currentQuotaConfig['limits'] = [...this.organization.quota["limits"]];
-          this.prevquotaEnabled = true;
-        }
-
-        // this.quotaLimitTypes = this.organization.quota["quota_limit_types"];
-      }
+      this.loadOrgQuota(true);
+      this.loadQuotaLimits(true);
       console.log("this is", this);
   }
 
-  private loadOrgQuota() {
+  private loadOrgQuota(fresh) {
     this.nameSpaceResource = this.ApiService.getNamespaceQuota(null,
         {'namespace': this.organization.name}).then((resp) => {
         this.prevQuotaConfig['quota'] = resp["limit_bytes"];
         this.currentQuotaConfig['quota'] = resp["limit_bytes"];
-        this.quotaLimitTypes = resp["quota_limit_types"];
+
+        if (fresh) {
+          for (let i = 0; i < resp["quota_limit_types"].length; i++) {
+            let temp = resp["quota_limit_types"][i];
+            temp["quota_limit_id"] = null;
+            this.quotaLimitTypes.push(temp);
+          }
+        }
+
         if (resp["limit_bytes"] != null) {
           this.prevquotaEnabled = true;
         }
       });
   }
 
-  private loadQuotaLimits() {
+  private loadQuotaLimits(fresh) {
     this.nameSpaceQuotaLimitsResource = this.ApiService.getOrganizationQuotaLimit(null,
         {'namespace': this.organization.name}).then((resp) => {
         this.prevQuotaConfig['limits'] = resp['quota_limits'];
         this.currentQuotaConfig['limits'] = resp['quota_limits'];
-        if (this.currentQuotaConfig['limits']) {
-          for (let i = 0; i < this.currentQuotaConfig['limits'].length; i++) {
-            this.populateQuotaLimit(this.currentQuotaConfig['limits'][i]);
+
+        if (fresh) {
+          if (this.currentQuotaConfig['limits']) {
+            for (let i = 0; i < this.currentQuotaConfig['limits'].length; i++) {
+              this.populateQuotaLimit(this.currentQuotaConfig['limits'][i]);
+            }
           }
         }
+
       });
   }
 
-
-
-  private updateOrganizationQuota(data, params, errorDisplay): void {
+  private updateOrganizationQuota(data, params): void {
+    console.log("In updateOrganizationQuota");
     if (!this.prevquotaEnabled || this.prevQuotaConfig['quota'] != this.currentQuotaConfig['quota']) {
+      console.log("inside updateOrganizationQuota");
       let quotaMethod = this.ApiService.createNamespaceQuota;
       let m1 = "createNamespaceQuota";
 
@@ -97,54 +91,176 @@ export class QuotaManagementViewComponent {
         this.updating = false;
         this.prevQuotaConfig = {...this.currentQuotaConfig};
         this.prevquotaEnabled = true;
-      }, errorDisplay);
+      }, this.displayError());
     }
   }
 
-  private updateQuotaLimits(data, params, errorDisplay): void {
-    if (JSON.stringify(this.prevQuotaConfig['limits']) != JSON.stringify(this.currentQuotaConfig['limits'])) {
-      return;
-    }
-
-    let limitData = this.currentQuotaConfig['limits'];
-    let quotaLimitMethod = null;
-    let met1 = null;
-
-    if (this.prevQuotaConfig['limits'].length == 0) {
-      quotaLimitMethod = this.ApiService.createOrganizationQuotaLimit;
-      met1 = "createOrganizationQuotaLimit";
-    } else if (JSON.stringify(this.prevQuotaConfig['limits']) != JSON.stringify(this.currentQuotaConfig['limits'])) {
-      quotaLimitMethod = this.ApiService.changeOrganizationQuotaLimit;
-      met1 = "changeOrganizationQuotaLimit";
-    }
-
-    console.log("met1", met1);
-    for(var i = 0; i < limitData.length; i++) {
-      console.log("limitData", limitData[i]);
-      limitData[i]['name'] = limitData[i]['name'];
-      quotaLimitMethod(limitData[i], params).then((resp) => {
-        this.prevQuotaConfig['limits'][i] = {...limitData[i]};
+  private createOrgQuotaLimit(data, params): void {
+    for (let i = 0; i < data.length; i++) {
+      let to_send = {
+          'percent_of_limit': data[i]['percent_of_limit'],
+          'quota_type_id': data[i]['limit_type']['quota_type_id']
+      };
+      this.ApiService.createOrganizationQuotaLimit(to_send, params).then((resp) => {
+        // this.prevQuotaConfig['limits'].push({...data[i]});
         this.prevquotaEnabled = true;
-      }, errorDisplay);
-      this.updating = false;
+      }, this.displayError());
     }
   }
 
-  private disablesave(): boolean {
-     return JSON.stringify(this.prevQuotaConfig) === JSON.stringify(this.currentQuotaConfig);
+  private updateOrgQuotaLimit(data, params): void {
+    console.log("In updateOrgQuotaLimit");
+    if (!data) {
+      return;
+    }
+    for (let i = 0; i < data.length; i++) {
+      console.log("Sending", data[i]);
+      let to_send = {
+          'percent_of_limit': data[i]['percent_of_limit'],
+          'quota_type_id': data[i]['limit_type']['quota_type_id'],
+          'quota_limit_id': data[i]['limit_type']['quota_limit_id']
+      };
+      console.log("Sending to update", data[i]);
+      console.log("params", params);
+      this.ApiService.changeOrganizationQuotaLimit(to_send, params).then((resp) => {
+        // this.prevQuotaConfig['limits'].push({...data});
+        this.prevquotaEnabled = true;
+      }, this.displayError());
+    }
   }
 
-    private updateQuotaDetails(): void {
+  private deleteOrgQuotaLimit(data, params): void {
+    console.log("In deleteOrgQuotaLimit");
+    if (!data) {
+      return;
+    }
+    for (let i = 0; i < data.length; i++) {
+      params['quota_limit_id'] = data[i]['limit_type']['quota_limit_id'];
+      console.log("params isssss", params);
+      this.ApiService.deleteOrganizationQuotaLimit(null, params).then((resp) => {
+        // this.prevQuotaConfig['limits'].push({...data});
+        this.prevquotaEnabled = true;
+      }, this.displayError());
+    }
+  }
 
-    // If current state is same as previous do nothing
-    if (this.disablesave()) {
+  private similarLimits(): boolean {
+    return JSON.stringify(this.prevQuotaConfig['limits']) === JSON.stringify(this.currentQuotaConfig['limits']);
+  }
+
+  private fetchLimitsToDelete(): object {
+    // In prev but not in current => to be deleted
+    let currentQuotaConfig = this.currentQuotaConfig['limits'];
+    let prevQuotaConfig = this.prevQuotaConfig['limits'];
+    return prevQuotaConfig.filter(function(obj1) {
+      return !currentQuotaConfig.some(function(obj2) {
+        return obj1.percent_of_limit === obj2.percent_of_limit && obj1.limit_type.name === obj2.limit_type.name;
+      });
+    });
+  }
+
+  private fetchLimitsToAdd(): object {
+    // In current but not in prev => to add
+    let currentQuotaConfig = this.currentQuotaConfig['limits'];
+    let prevQuotaConfig = this.prevQuotaConfig['limits'];
+    return currentQuotaConfig.filter(function(obj1) {
+      return !prevQuotaConfig.some(function(obj2) {
+        return obj1.limit_type.name === obj2.limit_type.name && obj1.percent_of_limit === obj2.percent_of_limit;
+      });
+    });
+  }
+
+  private fetchLimitsToUpdate(): object {
+    // In current and prev but different values
+    let currentQuotaConfig = this.currentQuotaConfig['limits'];
+    let prevQuotaConfig = this.prevQuotaConfig['limits'];
+
+    return currentQuotaConfig.filter(function(obj1) {
+      return prevQuotaConfig.some(function(obj2) {
+        return obj1.limit_type.quota_limit_id == obj2.limit_type.quota_limit_id &&
+          (obj1.percent_of_limit != obj2.percent_of_limit || obj1.limit_type.name != obj2.limit_type.name);
+      });
+    });
+
+  }
+
+  private filterDelFromUpdateItems(deletedItems, updatedItems): object {
+    return updatedItems.filter(function(obj1) {
+      return !deletedItems.find(function(obj2) {
+        return obj1.limit_type.name === obj2.limit_type.name && obj1.percent_of_limit === obj2.percent_of_limit;
+      });
+    });
+  }
+
+  private updateQuotaLimits(data, params): void {
+    console.log("In updateQuotaLimits");
+    if (this.similarLimits()) {
+      console.log("similarLimits");
       return;
     }
 
+
+    let toDelete = this.fetchLimitsToDelete();
+    console.log("toDelete", toDelete);
+    let toAdd = this.fetchLimitsToAdd();
+    console.log("toAdd", toAdd);
+
+    let toUpdate = this.filterDelFromUpdateItems(toDelete, this.fetchLimitsToUpdate());
+    console.log("toUpdate", toUpdate);
+
+    this.createOrgQuotaLimit(toAdd, params);
+    this.updateOrgQuotaLimit(toUpdate, params);
+    this.deleteOrgQuotaLimit(toDelete, params);
+    // this.prevQuotaConfig['limits'] == [...this.currentQuotaConfig['limits']];
+
+  }
+
+  private validLimits(): boolean {
+    let valid = true;
+    let rejectCount = 0;
+    for (let i = 0; i < this.currentQuotaConfig['limits'].length; i++) {
+
+      if (this.currentQuotaConfig['limits'][i]['limit_type']['name'] === this.rejectLimitType) {
+        rejectCount++;
+
+        if (rejectCount > 1) {
+          let alert = this.displayError('You can only have one Reject type of Quota Limits. Please remove to proceed');
+          alert();
+          valid = false;
+          break;
+        }
+      }
+
+    }
+
+    return valid;
+  }
+
+  private displayError(message = 'Could not update quota details'): any {
     this.updating = true;
-    let errorDisplay = this.ApiService.errorDisplay('Could not update quota details', () => {
+    let errorDisplay = this.ApiService.errorDisplay(message, () => {
       this.updating = false;
     });
+    return errorDisplay;
+  }
+
+  private disableSave(): boolean {
+    return this.prevQuotaConfig['quota'] === this.currentQuotaConfig['quota'] && this.similarLimits();
+  }
+
+  private updateQuotaDetails(): void {
+
+    // If current state is same as previous do nothing
+    if (this.disableSave()) {
+      return;
+    }
+
+    // Validate correctness
+    if (!this.validLimits()) {
+      console.log("Not valid!");
+      return;
+    }
+    console.log("Input data is valid!!");
 
     let params = {
       'namespace': this.organization.name
@@ -154,28 +270,27 @@ export class QuotaManagementViewComponent {
       'limit_bytes': this.currentQuotaConfig['quota'],
     };
 
-    this.updateOrganizationQuota(data, params, errorDisplay);
-    this.updateQuotaLimits(data, params, errorDisplay);
+    this.updateOrganizationQuota(data, params);
+    this.updateQuotaLimits(data, params);
+    this.loadOrgQuota(false);
+    this.loadQuotaLimits(false);
+    console.log("All done");
+    console.log("this.prevQuotaConfig", this.prevQuotaConfig);
+    console.log("this.currentQuotaConfig", this.currentQuotaConfig);
   }
 
   private addQuotaLimit($event): void {
     this.limitCounter++;
-    let temp = {'percent_of_limit': '', 'name': this.quotaLimitTypes[0]};
+    let temp = {'percent_of_limit': '', 'limit_type': this.quotaLimitTypes[0]};
     this.currentQuotaConfig['limits'].push(temp);
-    this.limitElements.push([...this.quotaLimitTypes]);
     $event.preventDefault();
   }
 
   private populateQuotaLimit(data): void {
     this.limitCounter++;
-    this.limitElements.push(data);
-    console.log("Got data as", data);
-    console.log("After populateQuotaLimit", this.limitElements);
-    console.log(this.currentQuotaConfig['limits']);
   }
 
   private removeQuotaLimit(index): void {
-    this.limitElements.splice(index, 1);
     this.currentQuotaConfig['limits'].splice(index, 1);
     this.limitCounter--;
   }
