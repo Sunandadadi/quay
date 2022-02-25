@@ -1,4 +1,5 @@
 import json
+import humanfriendly
 
 from peewee import fn, JOIN
 
@@ -22,6 +23,7 @@ from data.model import (
     notification,
 )
 
+HUMANIZED_QUOTA_UNITS = [i.decimal.symbol for i in humanfriendly.disk_size_units] + ['bytes']
 
 def verify_namespace_quota(namespace_name, repository_ref):
     repository.get_repository_size_and_cache(repository_ref._db_id)
@@ -128,7 +130,7 @@ def get_namespace_limits(name):
     return _basequery.get_namespace_quota_limits(name)
 
 
-def get_namespace_limit(name, quota_type_name, percent_of_limit):
+def get_namespace_limit(name, quota_type_id, percent_of_limit):
     try:
         quota = get_namespace_quota(name)
 
@@ -136,7 +138,6 @@ def get_namespace_limit(name, quota_type_name, percent_of_limit):
             raise InvalidUsernameException("Quota for this namespace does not exist")
 
         quota = quota.get()
-        quota_type_id = get_namespace_limit_types_for_name(quota_type_name).id
 
         query = (
             QuotaLimits.select()
@@ -152,9 +153,53 @@ def get_namespace_limit(name, quota_type_name, percent_of_limit):
         return None
 
 
+def get_namespace_limit_from_id(name, quota_limit_id):
+    try:
+        quota = get_namespace_quota(name)
+
+        if quota is None:
+            raise InvalidUsernameException("Quota for this namespace does not exist")
+
+        quota = quota.get()
+
+        query = (
+            QuotaLimits.select()
+            .join(QuotaType)
+            .where(QuotaLimits.quota_id == quota.id)
+            .where(QuotaLimits.id == quota_limit_id)
+        )
+
+        return query.get()
+
+    except QuotaLimits.DoesNotExist:
+        return None
+
+
+def get_namespace_reject_limit(name):
+    try:
+        quota = get_namespace_quota(name)
+
+        if quota is None:
+            raise InvalidUsernameException("Quota for this namespace does not exist")
+
+        quota = quota.get()
+
+        # QuotaType
+        query = (
+            QuotaLimits.select()
+            .join(QuotaType)
+            .where(QuotaType.name == 'Reject')
+            .where(QuotaLimits.quota_id == quota.id)
+        )
+
+        return query.get()
+
+    except QuotaLimits.DoesNotExist:
+        return None
+
+
 def get_namespace_limit_types():
-    # return [qtype.name for qtype in QuotaType.select()]
-    return [{'id': qtype.id, 'name': qtype.name} for qtype in QuotaType.select()]
+    return [{'quota_type_id': qtype.id, 'name': qtype.name} for qtype in QuotaType.select()]
 
 
 def get_namespace_limit_types_for_id(quota_limit_type_id):
@@ -184,8 +229,8 @@ def change_namespace_quota_limit(name, percent_of_limit, quota_type_id, new_perc
     return quota_limit
 
 
-def delete_namespace_quota_limit(name, quota_type_id, percent_of_limit):
-    quota_limit = get_namespace_limit(name, quota_type_id, percent_of_limit)
+def delete_namespace_quota_limit(name, quota_limit_id):
+    quota_limit = get_namespace_limit_from_id(name, quota_limit_id)
 
     if quota_limit is not None:
         quota_limit.delete_instance()

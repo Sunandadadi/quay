@@ -26,7 +26,7 @@ from endpoints.api.repository_models_interface import (
     Count,
 )
 
-import humanize
+import humanfriendly
 
 
 MAX_DAYS_IN_3_MONTHS = 92
@@ -116,7 +116,7 @@ class PreOCIModel(RepositoryDataInterface):
             # get_visible_repositories will return if there is a logged-in user (for performance reasons).
             #
             # Also note the +1 on the limit, as paginate_query uses the extra result to determine whether
-            # there is a next page.
+            # there is a next page.endpoints/api/namespacequota.py
             start_id = model.modelutil.pagination_start(page_token)
             repo_query = model.repository.get_visible_repositories(
                 username=username,
@@ -157,7 +157,7 @@ class PreOCIModel(RepositoryDataInterface):
 
         if features.QUOTA_MANAGEMENT and quota:
             for repo_id in repository_ids:
-                quota_map[repo_id] = humanize.naturalsize(model.repository.get_repository_size_and_cache(repo_id).get('repository_size', 0))
+                quota_map[repo_id] = humanfriendly.format_size(model.repository.get_repository_size_and_cache(repo_id).get('repository_size', 0))
 
         # Collect the IDs of the repositories that are starred for the user, so we can mark them
         # in the returned results.

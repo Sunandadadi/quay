@@ -58,8 +58,8 @@
           <div class="repo-list-view" namespaces="[organization]" in-read-only-mode="inReadOnlyMode"
                quota-management-enabled="quotaManagementEnabled">
             <h3>Repositories</h3>
-              <span ng-show="quotaManagementEnabled">
-
+              <span ng-show="Features.QUOTA_MANAGEMENT">
+                  <h4>Total Quota Consumed: {{ organization.quota }}</h4>
               </span>
           </div>
         </cor-tab-pane>
