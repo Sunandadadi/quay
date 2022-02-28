@@ -117,6 +117,7 @@ class ImageRepositoryRepository(
     :type badge_token: string
     :type trust_enabled: boolean
     """
+
     # TODO: Add quota stuff here?
 
     def to_dict(self):

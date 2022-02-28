@@ -23,7 +23,8 @@ from data.model import (
     notification,
 )
 
-HUMANIZED_QUOTA_UNITS = [i.decimal.symbol for i in humanfriendly.disk_size_units] + ['bytes']
+HUMANIZED_QUOTA_UNITS = [i.decimal.symbol for i in humanfriendly.disk_size_units] + ["bytes"]
+
 
 def verify_namespace_quota(namespace_name, repository_ref):
     repository.get_repository_size_and_cache(repository_ref._db_id)
@@ -188,7 +189,7 @@ def get_namespace_reject_limit(name):
         query = (
             QuotaLimits.select()
             .join(QuotaType)
-            .where(QuotaType.name == 'Reject')
+            .where(QuotaType.name == "Reject")
             .where(QuotaLimits.quota_id == quota.id)
         )
 
@@ -199,7 +200,7 @@ def get_namespace_reject_limit(name):
 
 
 def get_namespace_limit_types():
-    return [{'quota_type_id': qtype.id, 'name': qtype.name} for qtype in QuotaType.select()]
+    return [{"quota_type_id": qtype.id, "name": qtype.name} for qtype in QuotaType.select()]
 
 
 def get_namespace_limit_types_for_id(quota_limit_type_id):
@@ -337,7 +338,7 @@ def get_namespace_size(namespace_name):
 
 
 def get_repo_quota_for_view(repo_id, namespace):
-    repo_quota = repository.get_repository_size_and_cache(repo_id).get('repository_size', 0)
+    repo_quota = repository.get_repository_size_and_cache(repo_id).get("repository_size", 0)
     namespace_quota = get_namespace_quota(namespace)
     namespace_quota = namespace_quota.get() if namespace_quota else None
     percent_consumed = None
@@ -345,22 +346,26 @@ def get_repo_quota_for_view(repo_id, namespace):
         percent_consumed = str(round((repo_quota / namespace_quota.limit_bytes) * 100, 2))
 
     return {
-        'quota_consumed': humanfriendly.format_size(repo_quota),
-        'percent_consumed': percent_consumed,
-        'quota_bytes': repo_quota,
+        "quota_consumed": humanfriendly.format_size(repo_quota),
+        "percent_consumed": percent_consumed,
+        "quota_bytes": repo_quota,
     }
 
 
 def get_org_quota_for_view(namespace):
     namespace_quota_consumed = get_namespace_size(namespace) or 0
     configured_namespace_quota = get_namespace_quota(namespace)
-    configured_namespace_quota = configured_namespace_quota.get() if configured_namespace_quota else None
+    configured_namespace_quota = (
+        configured_namespace_quota.get() if configured_namespace_quota else None
+    )
     percent_consumed = None
     if configured_namespace_quota:
-        percent_consumed = str(round((namespace_quota_consumed / configured_namespace_quota.limit_bytes) * 100, 2))
+        percent_consumed = str(
+            round((namespace_quota_consumed / configured_namespace_quota.limit_bytes) * 100, 2)
+        )
 
     return {
-        'quota_consumed': humanfriendly.format_size(namespace_quota_consumed),
-        'percent_consumed': percent_consumed,
-        'quota_bytes': str(namespace_quota_consumed),
+        "quota_consumed": humanfriendly.format_size(namespace_quota_consumed),
+        "percent_consumed": percent_consumed,
+        "quota_bytes": str(namespace_quota_consumed),
     }

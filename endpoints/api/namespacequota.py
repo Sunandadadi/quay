@@ -32,14 +32,17 @@ logger = logging.getLogger(__name__)
 
 
 def quota_view(orgname: str, quota, quota_limit_types):
-    limit_bytes, bytes_unit = humanfriendly.format_size(quota.limit_bytes).split(' ') if \
-                              quota and quota.limit_bytes else [None, None]
+    limit_bytes, bytes_unit = (
+        humanfriendly.format_size(quota.limit_bytes).split(" ")
+        if quota and quota.limit_bytes
+        else [None, None]
+    )
     return {
         "orgname": orgname,
         "limit_bytes": int(limit_bytes) if limit_bytes else limit_bytes,
         "bytes_unit": bytes_unit,
         "quota_limit_types": quota_limit_types,
-        "quota_units": HUMANIZED_QUOTA_UNITS
+        "quota_units": HUMANIZED_QUOTA_UNITS,
     }
 
 
@@ -49,8 +52,8 @@ def quota_limit_view(orgname: str, quota_limit):
         "limit_type": {
             "name": quota_limit["name"],
             "quota_limit_id": quota_limit["id"],
-            "quota_type_id": quota_limit["type_id"]
-        }
+            "quota_type_id": quota_limit["type_id"],
+        },
     }
 
 
@@ -124,11 +127,9 @@ class OrganizationQuota(ApiResource):
             raise request_error(message=msg)
 
         try:
-            limit_bytes = str(quota_data["limit_bytes"]) + ' ' + quota_data["bytes_unit"]
+            limit_bytes = str(quota_data["limit_bytes"]) + " " + quota_data["bytes_unit"]
             limit_bytes = humanfriendly.parse_size(limit_bytes)
-            model.namespacequota.create_namespace_quota(
-                name=namespace, limit_bytes=limit_bytes
-            )
+            model.namespacequota.create_namespace_quota(name=namespace, limit_bytes=limit_bytes)
             return "Created", 201
         except model.DataModelException as ex:
             raise request_error(exception=ex)
@@ -151,7 +152,7 @@ class OrganizationQuota(ApiResource):
             raise request_error(message=msg)
 
         try:
-            limit_bytes = str(quota_data["limit_bytes"]) + ' ' + quota_data["bytes_unit"]
+            limit_bytes = str(quota_data["limit_bytes"]) + " " + quota_data["bytes_unit"]
             limit_bytes = humanfriendly.parse_size(limit_bytes)
             model.namespacequota.change_namespace_quota(namespace, limit_bytes)
 
@@ -219,7 +220,7 @@ class OrganizationQuotaLimits(ApiResource):
 
         quota_limits = list(model.namespacequota.get_namespace_limits(namespace))
 
-        return {'quota_limits': [quota_limit_view(namespace, limit) for limit in quota_limits]}, 200
+        return {"quota_limits": [quota_limit_view(namespace, limit) for limit in quota_limits]}, 200
 
     @nickname("createOrganizationQuotaLimit")
     @validate_json_request("NewOrgQuotaLimit")
@@ -311,23 +312,19 @@ class OrganizationQuotaLimits(ApiResource):
         if not superperm.can():
             raise Unauthorized()
 
-        quota_limit_id = request.args.get('quota_limit_id', None)
+        quota_limit_id = request.args.get("quota_limit_id", None)
         if quota_limit_id is None:
             msg = "Bad request to delete quota limit. Missing quota limit identifier."
             raise request_error(message=msg)
 
-        quota = model.namespacequota.get_namespace_limit_from_id(
-            namespace, quota_limit_id
-        )
+        quota = model.namespacequota.get_namespace_limit_from_id(namespace, quota_limit_id)
 
         if quota is None:
             msg = "quota does not exist"
             raise request_error(message=msg)
 
         try:
-            success = model.namespacequota.delete_namespace_quota_limit(
-                namespace, quota_limit_id
-            )
+            success = model.namespacequota.delete_namespace_quota_limit(namespace, quota_limit_id)
             if success == 1:
                 return "Deleted", 201
 
@@ -348,4 +345,6 @@ class OrganizationQuotaReport(ApiResource):
         if not orgperm.can() and not userperm.can():
             raise Unauthorized()
 
-        return {"response": model.namespacequota.get_namespace_repository_sizes_and_cache(namespace)}, 200
+        return {
+            "response": model.namespacequota.get_namespace_repository_sizes_and_cache(namespace)
+        }, 200

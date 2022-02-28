@@ -156,7 +156,9 @@ class PreOCIModel(RepositoryDataInterface):
 
         if features.QUOTA_MANAGEMENT and quota:
             for repo_id in repository_ids:
-                quota_map[repo_id] = model.namespacequota.get_repo_quota_for_view(repo_id, namespace)
+                quota_map[repo_id] = model.namespacequota.get_repo_quota_for_view(
+                    repo_id, namespace
+                )
 
         # Collect the IDs of the repositories that are starred for the user, so we can mark them
         # in the returned results.
@@ -183,7 +185,7 @@ class PreOCIModel(RepositoryDataInterface):
                     username,
                     None,
                     repo.state,
-                    quota_map.get(repo.rid)
+                    quota_map.get(repo.rid),
                 )
                 for repo in repos
             ],
