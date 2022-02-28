@@ -99,7 +99,6 @@ class PreOCIModel(RepositoryDataInterface):
 
         # Lookup the requested repositories (either starred or non-starred.)
         if starred:
-            # TODO: Add Quota stuff here
             # Return the full list of repos starred by the current user that are still visible to them.
             def can_view_repo(repo):
                 assert repo.state != RepositoryState.MARKED_FOR_DELETION
