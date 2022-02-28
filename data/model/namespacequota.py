@@ -352,7 +352,7 @@ def get_repo_quota_for_view(repo_id, namespace):
 
 
 def get_org_quota_for_view(namespace):
-    namespace_quota_consumed = get_namespace_size(namespace)
+    namespace_quota_consumed = get_namespace_size(namespace) or 0
     configured_namespace_quota = get_namespace_quota(namespace)
     configured_namespace_quota = configured_namespace_quota.get() if configured_namespace_quota else None
     percent_consumed = None
