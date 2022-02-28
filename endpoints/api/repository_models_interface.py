@@ -45,7 +45,7 @@ class RepositoryBaseElement(
     :type should_last_modified: boolean
     :type should_popularity: boolean
     :type should_is_starred: boolean
-    :type: quota: string
+    :type: quota: dictionary
     """
 
     def to_dict(self):

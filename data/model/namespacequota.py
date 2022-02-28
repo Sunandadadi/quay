@@ -334,3 +334,18 @@ def get_namespace_size(namespace_name):
     ).scalar()
 
     return namespace_size
+
+
+def get_repo_quota_for_view(repo_id, namespace):
+    repo_quota = repository.get_repository_size_and_cache(repo_id).get('repository_size', 0)
+    namespace_quota = get_namespace_quota(namespace)
+    namespace_quota = namespace_quota.get() if namespace_quota else None
+    percent_consumed = None
+    if namespace_quota:
+        percent_consumed = str(round((repo_quota / namespace_quota.limit_bytes) * 100, 2))
+
+    return {
+        'quota_consumed': humanfriendly.format_size(repo_quota),
+        'percent_consumed': percent_consumed,
+        'quota_bytes': repo_quota,
+    }

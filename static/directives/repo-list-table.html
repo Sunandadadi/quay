@@ -68,7 +68,7 @@
             <span class="namespace">{{ ::repository.namespace }}</span>
             <span class="name">{{ ::repository.name }}</span>
           </a>
-        </td>
+       </td>
        <td class="last-modified">
          <span ng-if="::repository.last_modified">
            {{ ::repository.last_modified * 1000 | amCalendar }}
@@ -81,8 +81,11 @@
         </span>
       </td>
        <td class="repo-quota hidden-xs" ng-show="quotaManagementEnabled">
-        <span>
-          {{ ::repository.quota }}
+         <span ng-if="::repository.quota.percent_consumed != null">
+             {{ ::repository.quota.quota_consumed }} ({{::repository.quota.percent_consumed}}%)
+        </span>
+        <span ng-if="::repository.quota.percent_consumed == null">
+            {{ ::repository.quota.quota_consumed }}
         </span>
       </td>
        <td class="popularity hidden-xs">
