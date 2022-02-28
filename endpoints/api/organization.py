@@ -223,8 +223,7 @@ class Organization(ApiResource):
             teams = model.team.get_teams_within_org(org, has_syncing)
 
         if features.QUOTA_MANAGEMENT:
-            quota = model.namespacequota.get_namespace_size(org.username)
-            quota = humanfriendly.format_size(quota) if quota else None
+            quota = model.namespacequota.get_org_quota_for_view(org.username)
 
         return org_view(org, teams, quota)
 

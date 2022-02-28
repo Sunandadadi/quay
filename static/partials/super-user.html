@@ -93,7 +93,7 @@
               </td>
               <td ng-class="tablePredicateClass('quota', options.predicate, options.reverse)"
                   ng-if="Features.QUOTA_MANAGEMENT">
-                <a ng-click="orderBy('quota')">Quota Consumed</a>
+                <a ng-click="orderBy('quota.quota_bytes')">Quota Consumed</a>
               </td>
               <td style="width: 24px;"></td>
               </thead>
@@ -112,7 +112,7 @@
                   <a href="mailto:{{ current_org.email }}">{{ current_org.email }}</a>
                 </td>
                 <td ng-if="Features.QUOTA_MANAGEMENT">
-                  {{ current_org.quota }}
+                  {{ current_org.quota.percent_consumed ? (current_org.quota.quota_consumed + "(" + current_org.quota.percent_consumed + "%)") : current_org.quota.quota_consumed }}
                 </td>
                 <td style="text-align: center;">
                   <span class="cor-options-menu" ng-show="!inReadOnlyMode">

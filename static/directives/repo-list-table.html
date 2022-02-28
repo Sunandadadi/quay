@@ -41,7 +41,7 @@
         ng-class="tablePredicateClass('quota', options.predicate, options.reverse)"
         style="min-width: 20px;"
         ng-if="quotaManagementEnabled">
-      <a ng-click="orderBy('quota')">Quota Consumed</a>
+      <a ng-click="orderBy('quota.quota_bytes')">Quota Consumed</a>
     </td>
     <td class="hidden-xs"
         ng-class="tablePredicateClass('popularity', options.predicate, options.reverse)"

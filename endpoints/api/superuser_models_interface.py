@@ -248,7 +248,7 @@ class Organization(namedtuple("Organization", ["username", "email"])):
             "name": self.username,
             "email": self.email,
             "avatar": avatar.get_data_for_org(self),
-            "quota": humanfriendly.format_size(model.namespacequota.get_namespace_size(self.username)) if features.QUOTA_MANAGEMENT else None,
+            "quota": model.namespacequota.get_org_quota_for_view(self.username) if features.QUOTA_MANAGEMENT else None,
         }
 
 
