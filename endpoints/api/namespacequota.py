@@ -161,7 +161,6 @@ class OrganizationQuota(ApiResource):
 
     @nickname("deleteOrganizationQuota")
     def delete(self, namespace):
-
         superperm = SuperUserPermission()
 
         if not superperm.can():
@@ -312,7 +311,10 @@ class OrganizationQuotaLimits(ApiResource):
         if not superperm.can():
             raise Unauthorized()
 
-        quota_limit_id = request.args.get('quota_limit_id')
+        quota_limit_id = request.args.get('quota_limit_id', None)
+        if quota_limit_id is None:
+            msg = "Bad request to delete quota limit. Missing quota limit identifier."
+            raise request_error(message=msg)
 
         quota = model.namespacequota.get_namespace_limit_from_id(
             namespace, quota_limit_id
