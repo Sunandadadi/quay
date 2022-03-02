@@ -73,13 +73,17 @@ angular.module('quay').directive('quotaManagementView', function () {
             var loadQuotaLimits = function (fresh) {
                 $scope.nameSpaceQuotaLimitsResource = ApiService.getOrganizationQuotaLimit(null,
                     {'namespace': $scope.organization.name}).then((resp) => {
-                    $scope.prevQuotaConfig['limits'] = [...resp['quota_limits']];
-                    $scope.currentQuotaConfig['limits'] = [...resp['quota_limits']];
+                    $scope.prevQuotaConfig['limits'] = [];
+                    $scope.currentQuotaConfig['limits'] = [];
+                    for (let i = 0; i < resp['quota_limits'].length; i ++) {
+                        $scope.prevQuotaConfig['limits'].push({...resp['quota_limits'][i]});
+                        $scope.currentQuotaConfig['limits'].push({...resp['quota_limits'][i]});
+                    }
 
                     if (fresh) {
                       if ($scope.currentQuotaConfig['limits']) {
                         for (let i = 0; i < $scope.currentQuotaConfig['limits'].length; i++) {
-                          populateQuotaLimit($scope.currentQuotaConfig['limits'][i]);
+                          populateQuotaLimit();
                         }
                       }
                     }
@@ -157,8 +161,8 @@ angular.module('quay').directive('quotaManagementView', function () {
                 let currentQuotaConfig = $scope.currentQuotaConfig['limits'];
                 let prevQuotaConfig = $scope.prevQuotaConfig['limits'];
                 return prevQuotaConfig.filter(function(obj1) {
-                    return !currentQuotaConfig.some(function(obj2) {
-                        return obj1.percent_of_limit === obj2.percent_of_limit && obj1.limit_type.name === obj2.limit_type.name;
+                    return obj1.limit_type.quota_limit_id != null && !currentQuotaConfig.some(function(obj2) {
+                        return obj1.limit_type.quota_limit_id === obj2.limit_type.quota_limit_id;
                     });
                 });
             }
@@ -168,7 +172,7 @@ angular.module('quay').directive('quotaManagementView', function () {
                 let currentQuotaConfig = $scope.currentQuotaConfig['limits'];
                 let prevQuotaConfig = $scope.prevQuotaConfig['limits'];
                 return currentQuotaConfig.filter(function(obj1) {
-                    return !prevQuotaConfig.some(function(obj2) {
+                    return obj1.limit_type.quota_limit_id == null && !prevQuotaConfig.some(function(obj2) {
                         return obj1.limit_type.name === obj2.limit_type.name && obj1.percent_of_limit === obj2.percent_of_limit;
                     });
                 });
@@ -178,7 +182,6 @@ angular.module('quay').directive('quotaManagementView', function () {
                 // In current and prev but different values
                 let currentQuotaConfig = $scope.currentQuotaConfig['limits'];
                 let prevQuotaConfig = $scope.prevQuotaConfig['limits'];
-
                 return currentQuotaConfig.filter(function(obj1) {
                     return prevQuotaConfig.some(function(obj2) {
                         return obj1.limit_type.quota_limit_id == obj2.limit_type.quota_limit_id &&
@@ -188,14 +191,6 @@ angular.module('quay').directive('quotaManagementView', function () {
 
             }
 
-            var filterDelFromUpdateItems = function(deletedItems, updatedItems) {
-                return updatedItems.filter(function(obj1) {
-                    return !deletedItems.find(function(obj2) {
-                        return obj1.limit_type.name === obj2.limit_type.name && obj1.percent_of_limit === obj2.percent_of_limit;
-                    });
-                });
-            }
-
             var updateQuotaLimits = function(params) {
                 if (similarLimits()) {
                     return;
@@ -203,7 +198,7 @@ angular.module('quay').directive('quotaManagementView', function () {
 
                 let toDelete = fetchLimitsToDelete();
                 let toAdd = fetchLimitsToAdd();
-                let toUpdate = filterDelFromUpdateItems(toDelete, fetchLimitsToUpdate());
+                let toUpdate = fetchLimitsToUpdate();
 
                 createOrgQuotaLimit(toAdd, params);
                 updateOrgQuotaLimit(toUpdate, params);

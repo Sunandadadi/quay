@@ -184,10 +184,6 @@ class OrganizationQuotaLimits(ApiResource):
                     "type": "integer",
                     "description": "Quota type Id",
                 },
-                "new_percent_of_limit": {
-                    "type": "integer",
-                    "description": "new Percentage of quota at which to do something",
-                },
             },
         },
     }
@@ -231,7 +227,7 @@ class OrganizationQuotaLimits(ApiResource):
             raise request_error(message=msg)
 
         reject_quota = model.namespacequota.get_namespace_reject_limit(namespace)
-        if reject_quota is not None:
+        if reject_quota is not None and model.namespacequota.is_reject_limit_type(quota_limit_data["quota_type_id"]):
             msg = "You can only have one Reject type of quota limit"
             raise request_error(message=msg)
 
@@ -257,22 +253,17 @@ class OrganizationQuotaLimits(ApiResource):
         quota_limit_data = request.get_json()
 
         try:
-            new_limit = quota_limit_data["new_percent_of_limit"]
+            quota_limit_id = quota_limit_data["quota_limit_id"]
         except KeyError:
-            msg = "Must supply new_percent_of_limit for updates"
+            msg = "Must supply quota_limit_id for updates"
             raise request_error(message=msg)
 
-        quota = model.namespacequota.get_namespace_limit(
-            namespace, quota_limit_data["name"], quota_limit_data["percent_of_limit"]
+        quota = model.namespacequota.get_namespace_limit_from_id(
+            namespace, quota_limit_id
         )
 
         if quota is None:
             msg = "quota limit does not exist"
-            raise request_error(message=msg)
-
-        reject_quota = model.namespacequota.get_namespace_reject_limit(namespace)
-        if reject_quota is not None:
-            msg = "You can only have one Reject type of quota limit"
             raise request_error(message=msg)
 
         try:
@@ -280,7 +271,7 @@ class OrganizationQuotaLimits(ApiResource):
                 namespace,
                 quota_limit_data["percent_of_limit"],
                 quota_limit_data["quota_type_id"],
-                quota_limit_data["new_percent_of_limit"],
+                quota_limit_data["quota_limit_id"],
             )
             return "Updated", 201
         except model.DataModelException as ex:
