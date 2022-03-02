@@ -114,7 +114,9 @@ class OrganizationQuota(ApiResource):
             raise request_error(message=msg)
 
         try:
-            model.namespacequota.create_namespace_quota(name=namespace, limit_bytes=quota_data["limit_bytes"])
+            model.namespacequota.create_namespace_quota(
+                name=namespace, limit_bytes=quota_data["limit_bytes"]
+            )
             return "Created", 201
         except model.DataModelException as ex:
             raise request_error(exception=ex)
@@ -227,7 +229,9 @@ class OrganizationQuotaLimits(ApiResource):
             raise request_error(message=msg)
 
         reject_quota = model.namespacequota.get_namespace_reject_limit(namespace)
-        if reject_quota is not None and model.namespacequota.is_reject_limit_type(quota_limit_data["quota_type_id"]):
+        if reject_quota is not None and model.namespacequota.is_reject_limit_type(
+            quota_limit_data["quota_type_id"]
+        ):
             msg = "You can only have one Reject type of quota limit"
             raise request_error(message=msg)
 
@@ -258,9 +262,7 @@ class OrganizationQuotaLimits(ApiResource):
             msg = "Must supply quota_limit_id for updates"
             raise request_error(message=msg)
 
-        quota = model.namespacequota.get_namespace_limit_from_id(
-            namespace, quota_limit_id
-        )
+        quota = model.namespacequota.get_namespace_limit_from_id(namespace, quota_limit_id)
 
         if quota is None:
             msg = "quota limit does not exist"

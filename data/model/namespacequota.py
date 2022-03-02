@@ -208,7 +208,7 @@ def fetch_limit_id_from_name(name):
 
 
 def is_reject_limit_type(quota_type_id):
-    if quota_type_id == fetch_limit_id_from_name('Reject'):
+    if quota_type_id == fetch_limit_id_from_name("Reject"):
         return True
     return False
 
