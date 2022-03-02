@@ -1,5 +1,4 @@
 import json
-import humanfriendly
 
 from peewee import fn, JOIN
 
@@ -22,8 +21,6 @@ from data.model import (
     repository,
     notification,
 )
-
-HUMANIZED_QUOTA_UNITS = [i.decimal.symbol for i in humanfriendly.disk_size_units] + ["bytes"]
 
 
 def verify_namespace_quota(namespace_name, repository_ref):
@@ -346,7 +343,6 @@ def get_repo_quota_for_view(repo_id, namespace):
         percent_consumed = str(round((repo_quota / namespace_quota.limit_bytes) * 100, 2))
 
     return {
-        "quota_consumed": humanfriendly.format_size(repo_quota),
         "percent_consumed": percent_consumed,
         "quota_bytes": repo_quota,
     }
@@ -365,7 +361,6 @@ def get_org_quota_for_view(namespace):
         )
 
     return {
-        "quota_consumed": humanfriendly.format_size(namespace_quota_consumed),
         "percent_consumed": percent_consumed,
         "quota_bytes": str(namespace_quota_consumed),
     }
