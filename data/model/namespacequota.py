@@ -96,8 +96,6 @@ def create_namespace_limit(orgname, quota_type_id, percent_of_limit):
     if quota is None:
         raise InvalidUsernameException("Quota Does Not Exist for : " + orgname)
 
-    quota = quota.get()
-
     new_limit = QuotaLimits.create(
         quota_id=quota.id,
         percent_of_limit=percent_of_limit,
