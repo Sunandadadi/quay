@@ -5,12 +5,12 @@
              Quota Management:
          </td>
          <td>
-             <div class="width-50">
+             <div>
                  <div class="row-alignment">
 
-                     <label class="margin-2 width-350">Set Organization quota: </label>
+                     <label class="margin-2 width-100">Set Quota: </label>
 
-                     <input class="margin-2 form-control width-50 width-440" type="number" name="quota-limit" ng-model="currentQuotaConfig['quota']">
+                     <input class="margin-2 form-control width-440" type="number" name="quota-limit" ng-model="currentQuotaConfig['quota']">
                      <select class="form-control"
                      ng-model="currentQuotaConfig['bytes_unit']"
                      ng-options="val for val in quotaUnits">

@@ -18,8 +18,6 @@ angular.module('quay').directive('quotaManagementView', function () {
             $scope.currentQuotaConfig = {'limit_bytes': null, 'quota': null, 'limits': [], 'bytes_unit': null};
             $scope.defer = null;
             $scope.disk_size_units = {
-                'Bytes': 1,
-                'KB': 1024**1,
                 'MB': 1024**2,
                 'GB': 1024**3,
                 'TB': 1024**4,
@@ -49,10 +47,6 @@ angular.module('quay').directive('quotaManagementView', function () {
             }
 
             var human_readable_string_to_bytes = function(quota, bytes_unit) {
-                if (bytes_unit == 'Bytes') {
-                    return quota;
-                }
-
                 return Number(quota*$scope.disk_size_units[bytes_unit]);
             };
 
