@@ -6,7 +6,8 @@ angular.module('quay').directive('quotaManagementView', function () {
         templateUrl: '/static/directives/quota-management-view.html',
         restrict: 'AEC',
         scope: {
-            'organization': '=organization'
+            'organization': '=organization',
+            'disabled': '=disabled'
         },
         controller: function ($scope, $timeout, $location, $element, ApiService, UserService,
                           TableService, Features, StateService, $q) {
@@ -23,6 +24,8 @@ angular.module('quay').directive('quotaManagementView', function () {
                 'TB': 1024**4,
             };
             $scope.quotaUnits = Object.keys($scope.disk_size_units);
+            $scope.rejectLimitType = 'Reject';
+            $scope.isUpdateable = false;
 
             var loadOrgQuota = function (fresh) {
                 $scope.nameSpaceResource = ApiService.getNamespaceQuota(null,
@@ -234,13 +237,9 @@ angular.module('quay').directive('quotaManagementView', function () {
             }
 
             var updateQuotaDetails = function() {
-                // If current state is same as previous do nothing
-                if ($scope.disableSave()) {
-                  return;
-                }
-
                 // Validate correctness
                 if (!validLimits()) {
+                  $scope.defer.resolve();
                   return;
                 }
 
@@ -251,15 +250,19 @@ angular.module('quay').directive('quotaManagementView', function () {
                 updateOrganizationQuota(params);
                 updateQuotaLimits(params);
                 $scope.defer.resolve();
+                $scope.isUpdateable = true;
             }
 
             $scope.updateQuotaDetailsOnSave = function() {
                 $scope.defer = $q.defer();
                 updateQuotaDetails();
-                 $scope.defer.promise.then(function() {
-                    loadOrgQuota(false);
-                    loadQuotaLimits(false);
-                });
+                if ($scope.isUpdateable) {
+                    $scope.defer.promise.then(function() {
+                        loadOrgQuota(false);
+                        loadQuotaLimits(false);
+                    });
+                }
+                $scope.isUpdateable = false;
             }
 
             $scope.addQuotaLimit = function($event) {

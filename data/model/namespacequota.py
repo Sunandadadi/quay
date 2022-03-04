@@ -183,8 +183,6 @@ def get_namespace_limit(name, quota_type_id, percent_of_limit):
         if quota is None:
             raise InvalidUsernameException("Quota for this namespace does not exist")
 
-        quota = quota.get()
-
         query = (
             QuotaLimits.select()
             .join(QuotaType)
@@ -206,8 +204,6 @@ def get_namespace_limit_from_id(name, quota_limit_id):
         if quota is None:
             raise InvalidUsernameException("Quota for this namespace does not exist")
 
-        quota = quota.get()
-
         query = (
             QuotaLimits.select()
             .join(QuotaType)
@@ -227,8 +223,6 @@ def get_namespace_reject_limit(name):
 
         if quota is None:
             raise InvalidUsernameException("Quota for this namespace does not exist")
-
-        quota = quota.get()
 
         # QuotaType
         query = (
@@ -399,7 +393,6 @@ def get_namespace_size(namespace_name):
 def get_repo_quota_for_view(repo_id, namespace):
     repo_quota = model.repository.get_repository_size_and_cache(repo_id).get("repository_size", 0)
     namespace_quota = get_namespace_quota(namespace)
-    namespace_quota = namespace_quota.get() if namespace_quota else None
     percent_consumed = None
     if namespace_quota:
         percent_consumed = str(round((repo_quota / namespace_quota.limit_bytes) * 100, 2))
@@ -414,7 +407,7 @@ def get_org_quota_for_view(namespace):
     namespace_quota_consumed = get_namespace_size(namespace) or 0
     configured_namespace_quota = get_namespace_quota(namespace)
     configured_namespace_quota = (
-        configured_namespace_quota.get().limit_bytes if configured_namespace_quota else None
+        configured_namespace_quota.limit_bytes if configured_namespace_quota else None
     )
     percent_consumed = None
     if configured_namespace_quota:
