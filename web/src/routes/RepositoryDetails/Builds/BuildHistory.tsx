@@ -241,11 +241,11 @@ export default function BuildHistory(props: BuildHistoryProps) {
 }
 
 export function BuildPhase({
-  phase,
-  hideText = false,
-}: {
-  phase: RepositoryBuildPhase;
-  hideText?: boolean;
+     phase,
+     hideText = false,
+   }: {
+    phase: RepositoryBuildPhase;
+    hideText?: boolean;
 }) {
   switch (phase) {
     case RepositoryBuildPhase.ERROR:
