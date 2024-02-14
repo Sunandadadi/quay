@@ -569,3 +569,20 @@ def delete_members_not_present(team, member_id_set):
             return query.execute()
 
     return 0
+
+
+def get_federated_user_teams(user_obj):
+    """
+    Returns an iterator of all the *users* found in a team.
+
+    Does not include robots.
+    """
+    query = (
+        Team.select(Team, TeamSync)
+        .join(TeamMember)
+        .switch(Team)
+        .join(TeamSync)
+        .join(LoginService)
+        .where(TeamMember.user == user_obj)
+    )
+    return query
