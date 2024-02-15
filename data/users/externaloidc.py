@@ -35,7 +35,7 @@ class OIDCUsers(FederatedUsers):
 
     def verify_credentials(self, username_or_email, password):
         """
-        Verify the credentials with OIDC: To Implement
+        TODO: Verify the credentials with OIDC: To Implement
         """
         pass
 
@@ -64,6 +64,7 @@ class OIDCUsers(FederatedUsers):
         """
         try:
             org_name, group_name = oidc_group.split(":")
+            # TODO: verify that org_name and group_name exist here
             return org_name, group_name
         except ValueError:
             logger.exception(
@@ -77,7 +78,6 @@ class OIDCUsers(FederatedUsers):
         Adds user to quay teams that have team sync enabled with an OIDC group
         """
         for oidc_group in user_groups:
-            print("oidc_group is", oidc_group)
             org_name, group_name = self.fetch_org_team_from_oidc_group(oidc_group)
             if not org_name or not group_name:
                 continue
