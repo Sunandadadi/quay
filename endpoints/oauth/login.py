@@ -171,7 +171,7 @@ def _register_service(login_service):
         # Exchange the OAuth code for login information.
         code = request.values.get("code")
         try:
-            lid, lusername, _ = login_service.exchange_code_for_login(
+            lid, lusername, _, _ = login_service.exchange_code_for_login(
                 app.config, client, code, "/attach"
             )
         except OAuthLoginException as ole:

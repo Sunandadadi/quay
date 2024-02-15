@@ -136,6 +136,7 @@ def sync_oidc_groups(additional_login_info, user_obj, auth_system, config):
     if (
         config.get("AUTHENTICATION_TYPE", "oidc")
         and config.get("FEATURE_TEAM_SYNCING", False)
+        and additional_login_info
         and additional_login_info.get("groups", None)
     ):
         auth_system.sync_user_groups(additional_login_info["groups"], user_obj)

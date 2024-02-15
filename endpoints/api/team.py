@@ -8,7 +8,7 @@ from functools import wraps
 from flask import request
 
 import features
-from app import authentication, avatar, app
+from app import app, authentication, avatar
 from auth import scopes
 from auth.auth_context import get_authenticated_user
 from auth.permissions import (
