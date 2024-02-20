@@ -571,7 +571,7 @@ def delete_members_not_present(team, member_id_set):
     return 0
 
 
-def get_federated_user_teams(user_obj):
+def get_federated_user_teams(user_obj, login_service_name):
     """
     Return all user's teams that are synced with the login service
     """
@@ -581,7 +581,7 @@ def get_federated_user_teams(user_obj):
         .switch(Team)
         .join(TeamSync)
         .join(LoginService)
-        .where(TeamMember.user == user_obj)
+        .where(TeamMember.user == user_obj, LoginService.name == login_service_name)
     )
     return query
 

@@ -1,7 +1,6 @@
-from test.fixtures import *
-
 import pytest
 
+from data.database import TeamMember
 from data.model import DataModelException
 from data.model.organization import create_organization
 from data.model.team import (
@@ -10,12 +9,14 @@ from data.model.team import (
     add_user_to_team,
     confirm_team_invite,
     create_team,
+    delete_all_team_members,
     list_team_users,
     remove_team,
     remove_user_from_team,
     validate_team_name,
 )
 from data.model.user import create_user_noverify, get_user
+from test.fixtures import *
 
 
 @pytest.mark.parametrize(
@@ -115,3 +116,27 @@ def test_remove_user_from_team(initialized_db):
 
     # Another admin should be able to
     remove_user_from_team("testorg", "testteam", "randomuser", "devtable")
+
+
+def test_delete_all_team_members(initialized_db):
+    dev_user = get_user("devtable")
+    random_user = get_user("randomuser")
+    public_user = get_user("public")
+    fresh_user = get_user("freshuser")
+    reader_user = get_user("reader")
+
+    new_org = create_organization("testorg", "testorg" + "@example.com", dev_user)
+
+    team_1 = create_team("team_1", new_org, "member")
+    assert add_user_to_team(dev_user, team_1)
+    assert add_user_to_team(random_user, team_1)
+    assert add_user_to_team(public_user, team_1)
+    assert add_user_to_team(fresh_user, team_1)
+    assert add_user_to_team(reader_user, team_1)
+
+    before_deletion_count = TeamMember.select().where(TeamMember.team == team_1).count()
+    assert before_deletion_count == 5
+    delete_all_team_members(team_1)
+
+    after_deletion_count = TeamMember.select().where(TeamMember.team == team_1).count()
+    assert after_deletion_count == 0

@@ -132,14 +132,14 @@ def _attach_service(config, login_service, user_obj, lid, lusername):
         return _oauthresult(service_name=login_service.service_name(), error_message=err)
 
 
-def sync_oidc_groups(additional_login_info, user_obj, auth_system, config):
+def sync_oidc_groups(additional_login_info, user_obj, auth_system, login_service, config):
     if (
         config.get("AUTHENTICATION_TYPE", "oidc")
         and config.get("FEATURE_TEAM_SYNCING", False)
         and additional_login_info
         and additional_login_info.get("groups", None)
     ):
-        auth_system.sync_user_groups(additional_login_info["groups"], user_obj)
+        auth_system.sync_user_groups(additional_login_info["groups"], user_obj, login_service)
     return
 
 
@@ -166,7 +166,7 @@ def _conduct_oauth_login(
     # and redirect.
     user_obj = model.user.verify_federated_login(service_id, lid)
     if user_obj is not None:
-        sync_oidc_groups(additional_login_info, user_obj, auth_system, config)
+        sync_oidc_groups(additional_login_info, user_obj, auth_system, login_service, config)
         return _oauthresult(user_obj=user_obj, service_name=service_name)
 
     # If the login service has a bound field name, and we have a defined internal auth type that is
@@ -201,7 +201,7 @@ def _conduct_oauth_login(
         if result.error_message is not None:
             return result
 
-        sync_oidc_groups(additional_login_info, user_obj, auth_system, config)
+        sync_oidc_groups(additional_login_info, user_obj, auth_system, login_service, config)
         return _oauthresult(user_obj=user_obj, service_name=service_name)
 
     # Otherwise, we need to create a new user account.
@@ -240,7 +240,7 @@ def _conduct_oauth_login(
 
         # Success, tell analytics
         analytics.track(user_obj.username, "register", {"service": service_name.lower()})
-        sync_oidc_groups(additional_login_info, user_obj, auth_system, config)
+        sync_oidc_groups(additional_login_info, user_obj, auth_system, login_service, config)
         return _oauthresult(user_obj=user_obj, service_name=service_name)
 
     except model.InvalidEmailAddressException:

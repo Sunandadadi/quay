@@ -362,3 +362,29 @@ def test_teamsync_existing_email(
 
         team_members = list(model.team.list_team_users(sync_team_info.team))
         assert len(team_members) > 0
+
+
+@pytest.mark.parametrize("login_service_name", [("oidc", "ldap")])
+def test_get_federated_user_teams(login_service_name, initialized_db):
+    dev_user = model.user.get_user("devtable")
+    new_org = model.organization.create_organization(
+        "testorg", "testorg" + "@example.com", dev_user
+    )
+
+    team_1 = model.team.create_team("team_1", new_org, "member")
+    assert model.team.add_user_to_team(dev_user, team_1)
+    assert model.team.set_team_syncing(team_1, "oidc", None)
+
+    team_2 = model.team.create_team("team_2", new_org, "member")
+    assert model.team.add_user_to_team(dev_user, team_2)
+    assert model.team.set_team_syncing(team_2, "oidc", None)
+
+    team_3 = model.team.create_team("team_3", new_org, "member")
+    assert model.team.add_user_to_team(dev_user, team_3)
+    assert model.team.set_team_syncing(team_3, "ldap", None)
+
+    user_teams = model.team.get_federated_user_teams(dev_user, login_service_name)
+    if login_service_name == "oidc":
+        assert len(user_teams) == 2
+    elif login_service_name == "ldap":
+        assert len(user_teams) == 1
