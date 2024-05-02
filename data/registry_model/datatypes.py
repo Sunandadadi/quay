@@ -307,13 +307,13 @@ class Manifest(
     def for_manifest(cls, manifest, legacy_id_handler, legacy_image_row=None):
         if manifest is None:
             return None
-
+        
         # NOTE: `manifest_bytes` will be None if not selected by certain join queries.
-        manifest_bytes = (
-            Bytes.for_string_or_unicode(manifest.manifest_bytes)
-            if manifest.manifest_bytes is not None
-            else None
-        )
+        if manifest.manifest_bytes is not None:
+            manifest_bytes = Bytes.for_string_or_unicode(manifest.manifest_bytes)
+        else:
+            manifest_bytes = None
+
         return Manifest(
             db_id=manifest.id,
             digest=manifest.digest,

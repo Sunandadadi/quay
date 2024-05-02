@@ -350,10 +350,7 @@ def write_manifest_by_digest(namespace_name, repo_name, manifest_ref):
 
 
 def _parse_manifest(content_type, request_data):
-    content_type = content_type or DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE
-    if content_type == "application/json":
-        # For back-compat.
-        content_type = DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE
+    content_type = DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE if content_type == "application/json" else None
 
     try:
         return parse_manifest_from_bytes(
@@ -405,7 +402,7 @@ def delete_manifest_by_digest(namespace_name, repo_name, manifest_ref):
 def _write_manifest_and_log(namespace_name, repo_name, tag_name, manifest_impl):
     _validate_schema1_manifest(namespace_name, repo_name, manifest_impl)
     with db_disallow_replica_use():
-        repository_ref, manifest, tag = _write_manifest(
+        repository_ref, manifest, _ = _write_manifest(
             namespace_name, repo_name, tag_name, manifest_impl
         )
 
@@ -417,17 +414,19 @@ def _write_manifest_and_log(namespace_name, repo_name, tag_name, manifest_impl):
         spawn_notification(repository_ref, "repo_push", {"updated_tags": [tag_name]})
         image_pushes.labels("v2", 201, manifest.media_type).inc()
 
-        return Response(
-            "OK",
-            status=201,
-            headers={
+        headers = {
                 "Docker-Content-Digest": manifest.digest,
                 "Location": url_for(
                     "v2.fetch_manifest_by_digest",
                     repository="%s/%s" % (namespace_name, repo_name),
                     manifest_ref=manifest.digest,
                 ),
-            },
+            }
+
+        return Response(
+            "OK",
+            status=201,
+            headers=headers,
         )
 
 
