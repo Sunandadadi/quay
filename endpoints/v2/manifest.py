@@ -350,7 +350,10 @@ def write_manifest_by_digest(namespace_name, repo_name, manifest_ref):
 
 
 def _parse_manifest(content_type, request_data):
-    content_type = DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE if content_type == "application/json" else None
+    content_type = content_type or DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE
+    if content_type == "application/json":
+        # For back-compat.
+        content_type = DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE
 
     try:
         return parse_manifest_from_bytes(
