@@ -10,8 +10,6 @@ Create Date: 2024-05-13 14:28:58.794953
 revision = "66147b81aad2"
 down_revision = "36cd2b747a08"
 
-import sqlalchemy as sa
-
 
 def upgrade(op, tables, tester):
     op.bulk_insert(
