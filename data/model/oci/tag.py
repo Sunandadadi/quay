@@ -1,3 +1,4 @@
+import datetime
 import logging
 import uuid
 from calendar import timegm
@@ -804,4 +805,27 @@ def fetch_paginated_autoprune_repo_tags_older_than_ms(repo_id, tag_lifetime_ms: 
     except Exception as err:
         raise Exception(
             f"Error fetching repository tags by creation date for repository id: {repo_id} with error as: {str(err)}"
+        )
+
+
+def fetch_repo_tags_expiring_within_days(repo_id, days):
+    """
+    Return query to fetch repository's distinct active tags that are expiring in x number days
+    """
+    try:
+        future_ms = (datetime.datetime.now() + datetime.timedelta(days=days)).timestamp() * 1000
+        query = (
+            Tag.select(Tag.name)
+            .where(
+                Tag.repository_id == repo_id,
+                (~(Tag.lifetime_end_ms >> None)),
+                Tag.lifetime_end_ms <= future_ms,
+                Tag.hidden == False,
+            )
+            .distinct()
+        )
+        return list(query)
+    except Exception as err:
+        raise Exception(
+            f"Error fetching repository tags repository id: {repo_id} with error as: {str(err)}"
         )
