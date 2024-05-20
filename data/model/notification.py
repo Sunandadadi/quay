@@ -1,4 +1,5 @@
 import json
+import logging
 
 from peewee import SQL
 
@@ -15,8 +16,12 @@ from data.database import (
     TeamRole,
     User,
     db_for_update,
+    get_epoch_timestamp_ms,
 )
-from data.model import InvalidNotificationException, db_transaction
+from data.model import InvalidNotificationException, db_transaction, oci
+
+logger = logging.getLogger(__name__)
+BATCH_SIZE = 10
 
 
 def create_notification(kind_name, target, metadata={}, lookup_path=None):
@@ -260,3 +265,49 @@ def list_repo_notifications(namespace_name, repository_name, event_name=None):
         )
 
     return query
+
+
+def scan_for_image_expiry_notifications(event_name, batch_size=BATCH_SIZE):
+    """
+    Get the repository notification prioritized by last_ran_ms = None followed by asc order of last_ran_ms.
+    """
+    event = ExternalNotificationEvent.get(ExternalNotificationEvent.name == event_name)
+    for _ in batch_size:
+        with db_transaction:
+            try:
+                # Fetch active notifications that match the event_name
+                query = (
+                    RepositoryNotification.select(RepositoryNotification.id)
+                    .where(
+                        (RepositoryNotification.event == event.id)
+                        & (RepositoryNotification.number_of_failures < 3)
+                    )
+                    .order_by(RepositoryNotification.last_ran_ms.asc(nulls="first"))
+                )
+                notification = db_for_update(query, skip_locked=True).get()
+
+                RepositoryNotification.update(last_ran_ms=get_epoch_timestamp_ms()).where(
+                    RepositoryNotification.id == notification.id
+                ).execute()
+
+            except RepositoryNotification.DoesNotExist:
+                return
+
+        repo_id = notification.repository.id
+        config = json.loads(notification.event_config_json)
+
+        if not config.get("days", None):
+            logger.error(
+                f"Missing key days in config for notification_id:{notification.id} created for repository_id:{repo_id}"
+            )
+            return
+
+        # Fetch tags matching notification's config
+        tags = oci.tag.fetch_repo_tags_expiring_within_days(repo_id, config["days"])
+
+        if not len(tags):
+            return
+
+        # push to notification queue
+
+    return
