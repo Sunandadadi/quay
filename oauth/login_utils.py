@@ -6,7 +6,6 @@ from peewee import IntegrityError
 
 import features
 from data import model
-from data.users.shared import can_create_user
 from oauth.login import OAuthLoginException
 from util.validation import generate_valid_usernames
 
@@ -48,8 +47,11 @@ def get_username_from_userinfo(user_info, config={}):
 
 
 def get_sub_username_email_from_token(
-    decoded_id_token, user_info=None, config={}, mailing=False, fetch_groups=False
+    decoded_id_token, user_info=None, login_service=None, mailing=False, fetch_groups=False
 ):
+    # Get config from service if available
+    config = login_service.config if login_service else {}
+
     if not user_info:
         user_info = decoded_id_token
 
@@ -93,7 +95,13 @@ def get_sub_username_email_from_token(
                 config.get("PREFERRED_GROUP_CLAIM_NAME", None)
             )
 
-    return decoded_id_token["sub"], lusername, email_address, additional_info
+    # Call the login service's get_user_id() method to extract user ID from token
+    if login_service:
+        user_id = login_service.get_user_id(decoded_id_token)
+    else:
+        user_id = decoded_id_token["sub"]
+
+    return user_id, lusername, email_address, additional_info
 
 
 def _oauthresult(
@@ -141,6 +149,16 @@ def sync_oidc_groups(additional_login_info, user_obj, auth_system, login_service
     return
 
 
+def sync_oidc_superusers(additional_login_info, user_obj, auth_system, config):
+    if (
+        config.get("AUTHENTICATION_TYPE") == "OIDC"
+        and additional_login_info
+        and additional_login_info.get("groups") is not None
+    ):
+        auth_system.sync_superuser_status(additional_login_info.get("groups"), user_obj)
+    return
+
+
 def _conduct_oauth_login(
     config,
     analytics,
@@ -165,6 +183,7 @@ def _conduct_oauth_login(
     user_obj = model.user.verify_federated_login(service_id, lid)
     if user_obj is not None:
         sync_oidc_groups(additional_login_info, user_obj, auth_system, login_service, config)
+        sync_oidc_superusers(additional_login_info, user_obj, auth_system, config)
         return _oauthresult(user_obj=user_obj, service_name=service_name)
 
     # If the login service has a bound field name, and we have a defined internal auth type that is
@@ -200,10 +219,13 @@ def _conduct_oauth_login(
             return result
 
         sync_oidc_groups(additional_login_info, user_obj, auth_system, login_service, config)
+        sync_oidc_superusers(additional_login_info, user_obj, auth_system, config)
         return _oauthresult(user_obj=user_obj, service_name=service_name)
 
     # Otherwise, we need to create a new user account.
     blacklisted_domains = config.get("BLACKLISTED_EMAIL_DOMAINS", [])
+    from data.users.shared import can_create_user
+
     if not can_create_user(lemail, blacklisted_domains=blacklisted_domains):
         error_message = "User creation is disabled. Please contact your administrator"
         return _oauthresult(service_name=service_name, error_message=error_message)
@@ -239,6 +261,7 @@ def _conduct_oauth_login(
         # Success, tell analytics
         analytics.track(user_obj.username, "register", {"service": service_name.lower()})
         sync_oidc_groups(additional_login_info, user_obj, auth_system, login_service, config)
+        sync_oidc_superusers(additional_login_info, user_obj, auth_system, config)
         return _oauthresult(user_obj=user_obj, service_name=service_name)
 
     except model.InvalidEmailAddressException:

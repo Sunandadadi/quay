@@ -1,6 +1,7 @@
 """
 Create, list, cancel and get status/logs of repository builds.
 """
+
 import datetime
 import hashlib
 import json
@@ -27,10 +28,11 @@ from endpoints.api import (
     ApiResource,
     RepositoryParamResource,
     abort,
+    allow_if_any_superuser,
     allow_if_global_readonly_superuser,
     allow_if_superuser,
+    allow_if_superuser_with_full_access,
     api,
-    disallow_for_app_repositories,
     disallow_for_non_normal_repositories,
     disallow_for_user_namespace,
     format_date,
@@ -238,14 +240,13 @@ class RepositoryBuildList(RepositoryParamResource):
         },
     }
 
-    @require_repo_read(allow_for_superuser=True)
+    @require_repo_read(allow_for_superuser=True, allow_for_global_readonly_superuser=True)
     @parse_args()
     @query_param("limit", "The maximum number of builds to return", type=int, default=5)
     @query_param(
         "since", "Returns all builds since the given unix timecode", type=int, default=None
     )
     @nickname("getRepoBuilds")
-    @disallow_for_app_repositories
     def get(self, namespace, repository, parsed_args):
         """
         Get the list of repository builds.
@@ -261,7 +262,6 @@ class RepositoryBuildList(RepositoryParamResource):
 
     @require_repo_write(allow_for_superuser=True)
     @nickname("requestRepoBuild")
-    @disallow_for_app_repositories
     @disallow_for_non_normal_repositories
     @disallow_for_user_namespace
     @validate_json_request("RepositoryBuildRequest")
@@ -309,7 +309,7 @@ class RepositoryBuildList(RepositoryParamResource):
                 (robot_namespace, _) = result
                 if (
                     not AdministerOrganizationPermission(robot_namespace).can()
-                    and not allow_if_superuser()
+                    and not allow_if_superuser_with_full_access()
                 ):
                     raise Unauthorized()
             else:
@@ -325,7 +325,7 @@ class RepositoryBuildList(RepositoryParamResource):
                     not ModifyRepositoryPermission(
                         associated_repository.namespace_user.username, associated_repository.name
                     )
-                    and not allow_if_superuser()
+                    and not allow_if_superuser_with_full_access()
                 ):
                     raise Unauthorized()
 
@@ -401,9 +401,8 @@ class RepositoryBuildResource(RepositoryParamResource):
     Resource for dealing with repository builds.
     """
 
-    @require_repo_read(allow_for_superuser=True)
+    @require_repo_read(allow_for_superuser=True, allow_for_global_readonly_superuser=True)
     @nickname("getRepoBuild")
-    @disallow_for_app_repositories
     def get(self, namespace, repository, build_uuid):
         """
         Returns information about a build.
@@ -423,7 +422,6 @@ class RepositoryBuildResource(RepositoryParamResource):
 
     @require_repo_admin(allow_for_superuser=True)
     @nickname("cancelRepoBuild")
-    @disallow_for_app_repositories
     @disallow_for_non_normal_repositories
     @disallow_for_user_namespace
     def delete(self, namespace, repository, build_uuid):
@@ -456,9 +454,8 @@ class RepositoryBuildStatus(RepositoryParamResource):
     Resource for dealing with repository build status.
     """
 
-    @require_repo_read(allow_for_superuser=True)
+    @require_repo_read(allow_for_superuser=True, allow_for_global_readonly_superuser=True)
     @nickname("getRepoBuildStatus")
-    @disallow_for_app_repositories
     def get(self, namespace, repository, build_uuid):
         """
         Return the status for the builds specified by the build uuids.
@@ -507,19 +504,19 @@ class RepositoryBuildLogs(RepositoryParamResource):
     Resource for loading repository build logs.
     """
 
-    @require_repo_read(allow_for_superuser=True)
+    @require_repo_read(allow_for_superuser=True, allow_for_global_readonly_superuser=True)
     @nickname("getRepoBuildLogs")
-    @disallow_for_app_repositories
     def get(self, namespace, repository, build_uuid):
         """
         Return the build logs for the build specified by the build uuid.
         """
         can_write = ModifyRepositoryPermission(namespace, repository).can()
+        # Global readonly superusers can always view build logs, regular superusers need FULL_ACCESS
         if (
             not features.READER_BUILD_LOGS
             and not can_write
-            and not allow_if_superuser()
             and not allow_if_global_readonly_superuser()
+            and not (features.SUPERUSERS_FULL_ACCESS and allow_if_superuser())
         ):
             raise Unauthorized()
 

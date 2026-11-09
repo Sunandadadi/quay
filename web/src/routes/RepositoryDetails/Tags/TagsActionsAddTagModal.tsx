@@ -1,23 +1,45 @@
 import {
   Button,
+  FormHelperText,
+  HelperText,
+  HelperTextItem,
   Modal,
+  ModalBody,
+  ModalFooter,
+  ModalHeader,
   ModalVariant,
   TextInput,
   Title,
 } from '@patternfly/react-core';
+import {ExclamationCircleIcon} from '@patternfly/react-icons';
 import {useEffect, useState} from 'react';
-import {AlertVariant} from 'src/atoms/AlertState';
-import {useAlerts} from 'src/hooks/UseAlerts';
+import {AlertVariant, useUI} from 'src/contexts/UIContext';
 import {useCreateTag} from 'src/hooks/UseTags';
-import {isNullOrUndefined} from 'src/libs/utils';
+import {isNullOrUndefined, validateTagName} from 'src/libs/utils';
+
+type validate = 'success' | 'error' | 'default';
 
 export default function AddTagModal(props: AddTagModalProps) {
   const [value, setValue] = useState('');
-  const {addAlert} = useAlerts();
+  const {addAlert} = useUI();
   const {createTag, successCreateTag, errorCreateTag} = useCreateTag(
     props.org,
     props.repo,
   );
+
+  // determine tag validity
+  const isValid = value !== '' ? validateTagName(value) : false;
+  const validatedState =
+    value === '' ? 'default' : isValid ? 'success' : 'error';
+
+  // centrallized closing handle
+  const handleClose = () => {
+    setValue('');
+    props.setIsOpen(false);
+    if (!isNullOrUndefined(props.onComplete)) {
+      props.onComplete();
+    }
+  };
 
   useEffect(() => {
     if (successCreateTag) {
@@ -25,12 +47,8 @@ export default function AddTagModal(props: AddTagModalProps) {
         variant: AlertVariant.Success,
         title: `Successfully created tag ${value}`,
       });
-      setValue('');
       props.loadTags();
-      props.setIsOpen(false);
-      if (!isNullOrUndefined(props.onComplete)) {
-        props.onComplete();
-      }
+      handleClose();
     }
   }, [successCreateTag]);
 
@@ -40,11 +58,7 @@ export default function AddTagModal(props: AddTagModalProps) {
         variant: AlertVariant.Failure,
         title: `Could not create tag ${value}`,
       });
-      setValue('');
-      props.setIsOpen(false);
-      if (!isNullOrUndefined(props.onComplete)) {
-        props.onComplete();
-      }
+      handleClose();
     }
   }, [errorCreateTag]);
 
@@ -52,41 +66,59 @@ export default function AddTagModal(props: AddTagModalProps) {
     <>
       <Modal
         id="add-tag-modal"
-        header={
-          <Title headingLevel="h2">
-            Add tag to manifest {props.manifest.substring(0, 19)}
-          </Title>
-        }
         aria-label="Add tag modal"
         isOpen={props.isOpen}
-        onClose={() => props.setIsOpen(false)}
+        onClose={handleClose}
         variant={ModalVariant.small}
-        actions={[
-          <Button
-            key="cancel"
-            variant="primary"
-            onClick={() => props.setIsOpen(false)}
-          >
-            Cancel
-          </Button>,
+      >
+        <ModalHeader
+          title={`Add tag to manifest ${props.manifest.substring(0, 19)}`}
+        />
+        <ModalBody>
+          <TextInput
+            id="tag-form-name"
+            value={value}
+            type="text"
+            validated={validatedState}
+            onChange={(_event, value) => {
+              setValue(value);
+            }}
+            aria-label="new tag name"
+            placeholder="New tag name"
+            aria-describedby="tag-name-helper"
+            aria-invalid={validatedState === 'error'}
+          />
+          <FormHelperText>
+            <HelperText>
+              <HelperTextItem
+                id="tag-name-helper"
+                variant={validatedState}
+                {...(validatedState === 'error' && {
+                  icon: <ExclamationCircleIcon />,
+                })}
+              >
+                {validatedState === 'error'
+                  ? 'Must start with a letter, digit or underscore. Only letters, digits, underscores, hyphens and periods allowed. Max 128 characters.'
+                  : 'Enter a tag name'}
+              </HelperTextItem>
+            </HelperText>
+          </FormHelperText>
+        </ModalBody>
+        <ModalFooter>
           <Button
             key="modal-action-button"
+            isDisabled={!isValid}
             variant="primary"
             onClick={() => {
               createTag({tag: value, manifest: props.manifest});
             }}
           >
             Create tag
-          </Button>,
-        ]}
-      >
-        <TextInput
-          value={value}
-          type="text"
-          onChange={(_event, value) => setValue(value)}
-          aria-label="new tag name"
-          placeholder="New tag name"
-        />
+          </Button>
+          <Button key="cancel" variant="link" onClick={handleClose}>
+            Cancel
+          </Button>
+        </ModalFooter>
       </Modal>
     </>
   );

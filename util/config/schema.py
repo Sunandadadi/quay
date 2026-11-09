@@ -24,6 +24,9 @@ INTERNAL_ONLY_PROPERTIES = {
     "DISABLED_FOR_PULL_LOGS",
     "FEATURE_DISABLE_PULL_LOGS_FOR_FREE_NAMESPACES",
     "FEATURE_CLEAR_EXPIRED_RAC_ENTRIES",
+    "FEATURE_IMAGE_PULL_STATS",
+    "PULL_METRICS_WORKER_COUNT",
+    "REDIS_FLUSH_INTERVAL_SECONDS",
     "ACTION_LOG_MAX_PAGE",
     "NON_RATE_LIMITED_NAMESPACES",
     "REPLICATION_QUEUE_NAME",
@@ -34,6 +37,7 @@ INTERNAL_ONLY_PROPERTIES = {
     "NAMESPACE_GC_QUEUE_NAME",
     "EXPORT_ACTION_LOGS_QUEUE_NAME",
     "SECSCAN_V4_NOTIFICATION_QUEUE_NAME",
+    "PROXY_CACHE_BLOB_QUEUE_NAME",
     "FEATURE_BILLING",
     "BILLING_TYPE",
     "INSTANCE_SERVICE_KEY_LOCATION",
@@ -41,6 +45,7 @@ INTERNAL_ONLY_PROPERTIES = {
     "INSTANCE_SERVICE_KEY_SERVICE",
     "INSTANCE_SERVICE_KEY_KID_LOCATION",
     "INSTANCE_SERVICE_KEY_EXPIRATION",
+    "INSTANCE_SERVICE_KEY_IMPORT_FROM_FILES",
     "UNAPPROVED_SERVICE_KEY_TTL_SEC",
     "EXPIRED_SERVICE_KEY_TTL_SEC",
     "REGISTRY_JWT_AUTH_MAX_FRESH_S",
@@ -51,6 +56,8 @@ INTERNAL_ONLY_PROPERTIES = {
     "QUEUE_WORKER_METRICS_REFRESH_SECONDS",
     "PUSH_TEMP_TAG_EXPIRATION_SEC",
     "GARBAGE_COLLECTION_FREQUENCY",
+    "NAMESPACE_GC_GRACE_PERIOD_SECONDS",
+    "NAMESPACE_GC_GRACE_PERIOD_ALLOWLIST",
     "PAGE_TOKEN_KEY",
     "BUILD_MANAGER",
     "SECURITY_SCANNER_V4_REINDEX_THRESHOLD",
@@ -70,10 +77,14 @@ INTERNAL_ONLY_PROPERTIES = {
     "USE_CDN",
     "ANALYTICS_TYPE",
     "LAST_ACCESSED_UPDATE_THRESHOLD_S",
+    "OAUTH_TOKEN_LAST_ACCESSED_UPDATE_THRESHOLD_S",
     "GREENLET_TRACING",
     "EXCEPTION_LOG_TYPE",
     "SENTRY_DSN",
     "SENTRY_PUBLIC_DSN",
+    "PROFILING_TYPE",
+    "PYROSCOPE_SERVER_ADDRESS",
+    "PYROSCOPE_APPLICATION_NAME",
     "BILLED_NAMESPACE_MAXIMUM_BUILD_COUNT",
     "THREAT_NAMESPACE_MAXIMUM_BUILD_COUNT",
     "IP_DATA_API_KEY",
@@ -94,7 +105,9 @@ INTERNAL_ONLY_PROPERTIES = {
     "PERMANENTLY_DELETE_TAGS",
     "FEATURE_RH_MARKETPLACE",
     "CDN_SPECIFIC_NAMESPACES",
+    "DEFAULT_UI",
 }
+
 
 CONFIG_SCHEMA = {
     "type": "object",
@@ -110,6 +123,28 @@ CONFIG_SCHEMA = {
         "DISTRIBUTED_STORAGE_PREFERENCE",
         "DEFAULT_TAG_EXPIRATION",
         "TAG_EXPIRATION_OPTIONS",
+    ],
+    "allOf": [
+        {
+            "if": {
+                "properties": {"FEATURE_PROGRAMMATIC_BOOTSTRAP": {"const": True}},
+                "required": ["FEATURE_PROGRAMMATIC_BOOTSTRAP"],
+            },
+            "then": {
+                "required": ["BOOTSTRAP_TOKEN_OWNER"],
+                "properties": {"BOOTSTRAP_TOKEN_OWNER": {"type": "string", "minLength": 1}},
+            },
+        },
+        {
+            "if": {
+                "properties": {"FEATURE_ROBOT_API_TOKEN_EXCHANGE": {"const": True}},
+                "required": ["FEATURE_ROBOT_API_TOKEN_EXCHANGE"],
+            },
+            "then": {
+                "required": ["FEATURE_ROBOT_API_TOKENS"],
+                "properties": {"FEATURE_ROBOT_API_TOKENS": {"const": True}},
+            },
+        },
     ],
     "properties": {
         "REGISTRY_STATE": {
@@ -148,6 +183,13 @@ CONFIG_SCHEMA = {
             "x-example": ["TLSv1.1", "TLSv1.2"],
             "x-reference": "http://nginx.org/en/docs/http/ngx_http_ssl_module.html#ssl_protocols",
         },
+        "SSL_ECDH_CURVES": {
+            "type": "array",
+            "description": "If specified, the nginx-defined list of elliptic curves and post-quantum key exchange groups",
+            "x-example": ["X25519MLKEM768", "X25519", "prime256v1"],
+            "items": {"type": "string", "minLength": 1},
+            "x-reference": "http://nginx.org/en/docs/http/ngx_http_ssl_module.html#ssl_ecdh_curve",
+        },
         # User-visible configuration.
         "REGISTRY_TITLE": {
             "type": "string",
@@ -162,8 +204,7 @@ CONFIG_SCHEMA = {
         "CONTACT_INFO": {
             "type": "array",
             "uniqueItems": True,
-            "description": "If specified, contact information to display on the contact page. "
-            + "If only a single piece of contact information is specified, the contact footer will link directly.",
+            "description": "If specified, contact information to display on the contact page. If only a single piece of contact information is specified, the contact footer will link directly.",
             "items": [
                 {
                     "type": "string",
@@ -206,6 +247,11 @@ CONFIG_SCHEMA = {
             "type": "boolean",
             "description": "Whether emails are enabled. Defaults to True",
             "x-example": True,
+        },
+        "FEATURE_ORG_SHARED_EMAIL": {
+            "type": "boolean",
+            "description": "Whether organizations can share email addresses with existing user accounts. Defaults to False",
+            "x-example": False,
         },
         "MAIL_SERVER": {
             "type": "string",
@@ -264,26 +310,25 @@ CONFIG_SCHEMA = {
                             "type": "string",
                             "description": "*Absolute container path* to the CA certificate to use for SSL connections",
                             "x-example": "conf/stack/ssl-ca-cert.pem",
-                        },
+                        }
                     },
                     "required": ["ca"],
                 },
             },
             "required": ["threadlocals", "autorollback"],
         },
-        "DB_CONNECTION_POOLING": {"type": "boolean", "description": "Allow pooling for DB"},
+        "DB_CONNECTION_POOLING": {
+            "type": "boolean",
+            "description": "Allow pooling for DB",
+        },
         "ALLOW_PULLS_WITHOUT_STRICT_LOGGING": {
             "type": "boolean",
-            "description": "If true, pulls in which the pull audit log entry cannot be written will "
-            + "still succeed. Useful if the database can fallback into a read-only state "
-            + "and it is desired for pulls to continue during that time. Defaults to False.",
+            "description": "If true, pulls in which the pull audit log entry cannot be written will still succeed. Useful if the database can fallback into a read-only state and it is desired for pulls to continue during that time. Defaults to False.",
             "x-example": True,
         },
         "ALLOW_WITHOUT_STRICT_LOGGING": {
             "type": "boolean",
-            "description": "If true, any action in which the audit log entry cannot be written will "
-            + "still succeed. Useful if using an external logging service that may be down "
-            + "intermittently and the registry should continue to work. Defaults to False.",
+            "description": "If true, any action in which the audit log entry cannot be written will still succeed. Useful if using an external logging service that may be down intermittently and the registry should continue to work. Defaults to False.",
             "x-example": False,
         },
         # Storage.
@@ -302,6 +347,30 @@ CONFIG_SCHEMA = {
             "description": "Whether pull through proxy cache feature is enabled. Defaults to False",
             "x-example": False,
         },
+        "FEATURE_EXTENDED_ACTION_LOGGING": {
+            "type": "boolean",
+            "description": "Whether extended action logging is enabled for ESS Events of Interest compliance. When enabled, logs include request URL, HTTP method, auth type, user agent, and other request context. Increases log volume by ~2.5-3x. Defaults to False",
+            "x-example": False,
+        },
+        "FEATURE_PROXY_CACHE_BLOB_DOWNLOAD": {
+            "type": "boolean",
+            "description": "Whether to enable a background worker to download placeholder blobs. Defaults to True",
+            "x-example": True,
+        },
+        "GUNICORN_REGISTRY_TIMEOUT": {
+            "type": "integer",
+            "minimum": 30,
+            "maximum": 300,
+            "description": "Timeout in seconds for gunicorn-registry workers. Workers that do not respond within this window are killed and restarted. Must be between 30 and 300 (5 minutes). Defaults to 30",
+            "x-example": 300,
+        },
+        "GUNICORN_WEB_TIMEOUT": {
+            "type": "integer",
+            "minimum": 30,
+            "maximum": 300,
+            "description": "Timeout in seconds for gunicorn-web workers. Workers that do not respond within this window are killed and restarted. Must be between 30 and 300 (5 minutes). Defaults to 30",
+            "x-example": 60,
+        },
         "MAXIMUM_LAYER_SIZE": {
             "type": "string",
             "description": "Maximum allowed size of an image layer. Defaults to 20G",
@@ -310,35 +379,20 @@ CONFIG_SCHEMA = {
         },
         "DISTRIBUTED_STORAGE_CONFIG": {
             "type": "object",
-            "description": "Configuration for storage engine(s) to use in Quay. Each key is a unique ID"
-            + " for a storage engine, with the value being a tuple of the type and "
-            + " configuration for that engine.",
-            "x-example": {
-                "local_storage": ["LocalStorage", {"storage_path": "some/path/"}],
-            },
-            "items": {
-                "type": "array",
-            },
+            "description": "Configuration for storage engine(s) to use in Quay. Each key is a unique ID for a storage engine, with the value being a tuple of the type and configuration for that engine.",
+            "x-example": {"local_storage": ["LocalStorage", {"storage_path": "some/path/"}]},
+            "items": {"type": "array"},
         },
         "DISTRIBUTED_STORAGE_PREFERENCE": {
             "type": "array",
-            "description": "The preferred storage engine(s) (by ID in DISTRIBUTED_STORAGE_CONFIG) to "
-            + "use. A preferred engine means it is first checked for pullig and images are "
-            + "pushed to it.",
-            "items": {
-                "type": "string",
-                "uniqueItems": True,
-            },
+            "description": "The preferred storage engine(s) (by ID in DISTRIBUTED_STORAGE_CONFIG) to use. A preferred engine means it is first checked for pullig and images are pushed to it.",
+            "items": {"type": "string", "uniqueItems": True},
             "x-example": ["s3_us_east", "s3_us_west"],
         },
         "DISTRIBUTED_STORAGE_DEFAULT_LOCATIONS": {
             "type": "array",
-            "description": "The list of storage engine(s) (by ID in DISTRIBUTED_STORAGE_CONFIG) whose "
-            + "images should be fully replicated, by default, to all other storage engines.",
-            "items": {
-                "type": "string",
-                "uniqueItems": True,
-            },
+            "description": "The list of storage engine(s) (by ID in DISTRIBUTED_STORAGE_CONFIG) whose images should be fully replicated, by default, to all other storage engines.",
+            "items": {"type": "string", "uniqueItems": True},
             "x-example": ["s3_us_east", "s3_us_west"],
         },
         "USERFILES_LOCATION": {
@@ -378,32 +432,27 @@ CONFIG_SCHEMA = {
         },
         "ACTION_LOG_ARCHIVE_LOCATION": {
             "type": "string",
-            "description": "If action log archiving is enabled, the storage engine in which to place the "
-            + "archived data.",
+            "description": "If action log archiving is enabled, the storage engine in which to place the archived data.",
             "x-example": "s3_us_east",
         },
         "ACTION_LOG_ARCHIVE_PATH": {
             "type": "string",
-            "description": "If action log archiving is enabled, the path in storage in which to place the "
-            + "archived data.",
+            "description": "If action log archiving is enabled, the path in storage in which to place the archived data.",
             "x-example": "archives/actionlogs",
         },
         "ACTION_LOG_ROTATION_THRESHOLD": {
             "type": "string",
-            "description": "If action log archiving is enabled, the time interval after which to "
-            + "archive data.",
+            "description": "If action log archiving is enabled, the time interval after which to archive data.",
             "x-example": "30d",
         },
         "LOG_ARCHIVE_LOCATION": {
             "type": "string",
-            "description": "If builds are enabled, the storage engine in which to place the "
-            + "archived build logs.",
+            "description": "If builds are enabled, the storage engine in which to place the archived build logs.",
             "x-example": "s3_us_east",
         },
         "LOG_ARCHIVE_PATH": {
             "type": "string",
-            "description": "If builds are enabled, the path in storage in which to place the "
-            + "archived build logs.",
+            "description": "If builds are enabled, the path in storage in which to place the archived build logs.",
             "x-example": "archives/buildlogs",
         },
         # Authentication.
@@ -417,19 +466,27 @@ CONFIG_SCHEMA = {
             "type": "array",
             "description": "Quay usernames of those users to be granted superuser privileges",
             "uniqueItems": True,
-            "items": {
-                "type": "string",
-            },
+            "items": {"type": "string"},
         },
         "DIRECT_OAUTH_CLIENTID_WHITELIST": {
             "type": "array",
-            "description": "A list of client IDs of *Quay-managed* applications that are allowed "
-            + "to perform direct OAuth approval without user approval.",
+            "description": "A list of client IDs of *Quay-managed* applications that are allowed to perform direct OAuth approval without user approval.",
             "x-reference": "https://coreos.com/quay-enterprise/docs/latest/direct-oauth.html",
             "uniqueItems": True,
-            "items": {
-                "type": "string",
-            },
+            "items": {"type": "string"},
+        },
+        "OAUTH_APPLICATION_MAXIMUM_TOKEN_COUNT": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "description": "Optional maximum number of non-expired OAuth access tokens allowed per OAuth application. If omitted or null, no cap is enforced.",
+            "x-example": 1000,
+        },
+        "API_TOKEN_MAXIMUM_TOKEN_COUNT": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "description": "Maximum number of active Quay-issued API tokens allowed per user or robot. Defaults to 20; set null to disable the cap.",
+            "default": 20,
+            "x-example": 20,
         },
         # Redis.
         "BUILDLOGS_REDIS": {
@@ -454,6 +511,11 @@ CONFIG_SCHEMA = {
                 },
             },
         },
+        "FEATURE_USER_EVENTS": {
+            "type": "boolean",
+            "description": "Whether user events are enabled. Defaults to True",
+            "x-example": True,
+        },
         "USER_EVENTS_REDIS": {
             "type": "object",
             "description": "Connection information for Redis for user event handling",
@@ -473,6 +535,33 @@ CONFIG_SCHEMA = {
                     "type": "string",
                     "description": "The password to connect to the Redis instance",
                     "x-example": "mypassword",
+                },
+            },
+        },
+        "PULL_METRICS_REDIS": {
+            "type": "object",
+            "description": "Connection information for Redis for pull metrics storage",
+            "required": ["host"],
+            "properties": {
+                "host": {
+                    "type": "string",
+                    "description": "The hostname at which Redis is accessible",
+                    "x-example": "my.redis.cluster",
+                },
+                "port": {
+                    "type": "number",
+                    "description": "The port at which Redis is accessible",
+                    "x-example": 1234,
+                },
+                "password": {
+                    "type": "string",
+                    "description": "The password to connect to the Redis instance",
+                    "x-example": "mypassword",
+                },
+                "db": {
+                    "type": "number",
+                    "description": "The Redis database number to use for pull metrics",
+                    "x-example": 1,
                 },
             },
         },
@@ -514,9 +603,7 @@ CONFIG_SCHEMA = {
                     "type": "array",
                     "description": "The names of the GitHub (Enterprise) organizations whitelisted to work with the ORG_RESTRICT option",
                     "uniqueItems": True,
-                    "items": {
-                        "type": "string",
-                    },
+                    "items": {"type": "string"},
                 },
             },
         },
@@ -617,6 +704,11 @@ CONFIG_SCHEMA = {
                     "description": "Main logo image URL",
                     "x-example": "/static/img/quay-horizontal-color.svg",
                 },
+                "logo_dark": {
+                    "type": "string",
+                    "description": "Dark theme variant of main logo (for dark backgrounds)",
+                    "x-example": "/static/img/quay-horizontal-white.svg",
+                },
                 "footer_img": {
                     "type": "string",
                     "description": "Logo for UI footer",
@@ -629,17 +721,49 @@ CONFIG_SCHEMA = {
                 },
             },
         },
-        "DOCUMENTATION_ROOT": {"type": "string", "description": "Root URL for documentation links"},
+        "DOCUMENTATION_ROOT": {
+            "type": "string",
+            "description": "Root URL for documentation links",
+        },
         # Health.
         "HEALTH_CHECKER": {
             "description": "The configured health check.",
-            "x-example": ("RDSAwareHealthCheck", {"access_key": "foo", "secret_key": "bar"}),
+            "x-example": (
+                "RDSAwareHealthCheck",
+                {"access_key": "foo", "secret_key": "bar"},
+            ),
         },
         # Metrics.
         "PROMETHEUS_NAMESPACE": {
             "type": "string",
             "description": "The prefix applied to all exposed Prometheus metrics. Defaults to `quay`",
             "x-example": "myregistry",
+        },
+        "TRACKED_NAMESPACES": {
+            "oneOf": [
+                {
+                    "type": "array",
+                    "description": "List of namespace names to track in metrics. Each namespace gets its own label.",
+                    "items": {"type": "string"},
+                    "x-example": ["redhat", "internal"],
+                },
+                {
+                    "type": "object",
+                    "description": "Mapping of bucket names to namespace lists. Multiple namespaces can share the same bucket label.",
+                    "additionalProperties": {
+                        "oneOf": [
+                            {"type": "array", "items": {"type": "string"}},
+                            {"type": "string"},
+                        ]
+                    },
+                    "x-example": {
+                        "critical": ["redhat", "internal"],
+                        "customers": ["customer1", "customer2"],
+                    },
+                },
+            ],
+            "description": "Namespaces to track in Prometheus metrics. Supports two formats: list (each namespace gets its own label) or dict (multiple namespaces share a bucket).",
+            "x-example": ["redhat"],
         },
         # Misc configuration.
         "BLACKLIST_V2_SPEC": {
@@ -656,21 +780,15 @@ CONFIG_SCHEMA = {
         },
         "SESSION_COOKIE_SECURE": {
             "type": "boolean",
-            "description": "Whether the `secure` property should be set on session cookies. "
-            + "Defaults to False. Recommended to be True for all installations using SSL.",
+            "description": "Whether the `secure` property should be set on session cookies. Defaults to False. Recommended to be True for all installations using SSL.",
             "x-example": True,
             "x-reference": "https://en.wikipedia.org/wiki/Secure_cookies",
         },
         "PUBLIC_NAMESPACES": {
             "type": "array",
-            "description": "If a namespace is defined in the public namespace list, then it will appear on *all*"
-            + " user's repository list pages, regardless of whether that user is a member of the namespace."
-            + ' Typically, this is used by an enterprise customer in configuring a set of "well-known"'
-            + " namespaces.",
+            "description": 'If a namespace is defined in the public namespace list, then it will appear on *all* user\'s repository list pages, regardless of whether that user is a member of the namespace. Typically, this is used by an enterprise customer in configuring a set of "well-known" namespaces.',
             "uniqueItems": True,
-            "items": {
-                "type": "string",
-            },
+            "items": {"type": "string"},
         },
         "AVATAR_KIND": {
             "type": "string",
@@ -684,8 +802,7 @@ CONFIG_SCHEMA = {
         },
         "ENABLE_HEALTH_DEBUG_SECRET": {
             "type": ["string", "null"],
-            "description": "If specified, a secret that can be given to health endpoints to see full debug info when"
-            + "not authenticated as a superuser",
+            "description": "If specified, a secret that can be given to health endpoints to see full debug info when not authenticated as a superuser",
             "x-example": "somesecrethere",
         },
         "BROWSER_API_CALLS_XHR_ONLY": {
@@ -699,6 +816,16 @@ CONFIG_SCHEMA = {
             "description": "Whether users and organizations are allowed to change the tag expiration for tags in their namespace. Defaults to True.",
             "x-example": False,
         },
+        "FEATURE_IMMUTABLE_TAGS": {
+            "type": "boolean",
+            "description": "Whether tag immutability enforcement is enabled. When enabled, immutable tags cannot be deleted or overwritten. Defaults to False.",
+            "x-example": True,
+        },
+        "FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE": {
+            "type": "boolean",
+            "description": "Whether immutable tags can have expiration dates set. When False (default), setting expiration on immutable tags is blocked, and tags with expiration cannot be made immutable.",
+            "x-example": False,
+        },
         "DEFAULT_TAG_EXPIRATION": {
             "type": "string",
             "description": "The default, configurable tag expiration time for time machine. Defaults to `2w`.",
@@ -707,10 +834,7 @@ CONFIG_SCHEMA = {
         "TAG_EXPIRATION_OPTIONS": {
             "type": "array",
             "description": "The options that users can select for expiration of tags in their namespace (if enabled)",
-            "items": {
-                "type": "string",
-                "pattern": "^[0-9]+(w|m|d|h|s)$",
-            },
+            "items": {"type": "string", "pattern": "^[0-9]+(w|m|d|h|s)$"},
         },
         # Team syncing.
         "FEATURE_TEAM_SYNCING": {
@@ -766,6 +890,32 @@ CONFIG_SCHEMA = {
             "type": "string",
             "description": "A base64 encoded string used to sign JWT(s) on Clair V4 requests. If 'None' jwt signing will not occur.",
             "x-example": "PSK",
+        },
+        "SECURITY_SCANNER_V4_INDEXING": {
+            "type": "boolean",
+            "description": "Whether to enable the legacy V4 security scanner indexing operations. When set to False, the old indexing paths are disabled while the V2 indexer and security scan query APIs remain functional. Defaults to True",
+            "x-example": True,
+        },
+        "FEATURE_SECURITY_SCANNER_V2": {
+            "type": "boolean",
+            "description": "Whether to enable the V2 lock-free security scanner indexer using PostgreSQL FOR UPDATE SKIP LOCKED for work distribution. Defaults to False",
+            "x-example": False,
+        },
+        "SECURITY_SCANNER_V2_BATCH_SIZE": {
+            "type": "number",
+            "description": "The number of manifests to claim per indexing cycle in the V2 security scanner. Defaults to 50.",
+            "x-example": 50,
+        },
+        "SECURITY_SCANNER_V2_INDEXING_INTERVAL": {
+            "type": "number",
+            "description": "The number of seconds between indexing cycles in the V2 security scanner. Defaults to 30.",
+            "x-example": 30,
+        },
+        "SECURITY_SCANNER_MAX_SCAN_RETRIES": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The maximum number of scan retries per indexer hash before a manifest is skipped. Defaults to 5.",
+            "x-example": 5,
         },
         # Repository mirroring
         "REPO_MIRROR_INTERVAL": {
@@ -846,9 +996,7 @@ CONFIG_SCHEMA = {
             "type": "array",
             "description": "Quay usernames of those users allowed to create org/user via API bypassing recaptcha security check",
             "uniqueItems": True,
-            "items": {
-                "type": "string",
-            },
+            "items": {"type": "string"},
         },
         # External application tokens.
         "FEATURE_APP_SPECIFIC_TOKENS": {
@@ -876,6 +1024,12 @@ CONFIG_SCHEMA = {
         "FEATURE_RATE_LIMITS": {
             "type": "boolean",
             "description": "Whether to enable rate limits on API and registry endpoints. Defaults to False",
+            "x-example": True,
+        },
+        # Feature Flag: ALB health check with drain file support.
+        "FEATURE_ALB_HEALTH_CHECK": {
+            "type": "boolean",
+            "description": "Whether to enable the /health/alb endpoint for ALB health checks with drain file support. Defaults to False",
             "x-example": True,
         },
         # Feature Flag: Aggregated log retrieval.
@@ -1022,6 +1176,29 @@ CONFIG_SCHEMA = {
             "description": "Whether to enable support for repository mirroring. Defaults to False",
             "x-example": False,
         },
+        # Feature Flag: Support Organization-Level Repository Mirroring.
+        "FEATURE_ORG_MIRROR": {
+            "type": "boolean",
+            "description": "Whether to enable support for organization-level repository mirroring. Defaults to False",
+            "x-example": False,
+        },
+        "ORG_MIRROR_INTERVAL": {
+            "type": "number",
+            "description": "The number of seconds between organization mirror worker iterations. Defaults to 30.",
+            "x-example": 30,
+        },
+        "ORG_MIRROR_MAX_DISCOVERY_DURATION": {
+            "type": "number",
+            "description": "Maximum time in seconds allowed for the tag discovery phase of organization mirror sync. Configs that exceed this duration during discovery are released so other workers can process them. Defaults to 1800 (30 minutes).",
+            "x-example": 1800,
+        },
+        "SSRF_ALLOWED_HOSTS": {
+            "type": "array",
+            "description": "List of hostnames or CIDR ranges allowed to bypass SSRF protection for repository and organization mirror source registries, proxy cache registries, and export log callback URLs. Use for enterprise deployments where endpoints are on private networks.",
+            "uniqueItems": True,
+            "items": {"type": "string"},
+            "x-example": ["internal-harbor.corp.example.com", "10.0.0.0/8"],
+        },
         "REPO_MIRROR_TLS_VERIFY": {
             "type": "boolean",
             "description": "Require HTTPS and verify certificates of Quay registry during mirror. Defaults to True",
@@ -1037,6 +1214,18 @@ CONFIG_SCHEMA = {
             "description": "Enables rolling repository back to previous state in the event the mirror fails. Defaults to false",
             "x-example": "true",
         },
+        "REPO_MIRROR_MAX_MANIFEST_LIST_SIZE": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Maximum size in bytes of manifest list JSON to parse during mirroring. Prevents DoS via oversized manifests. Defaults to 10485760 (10MB).",
+            "x-example": 10485760,
+        },
+        "REPO_MIRROR_MAX_MANIFEST_ENTRIES": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Maximum number of manifest entries to process during architecture-filtered mirroring. Prevents DoS via manifest lists with excessive entries. Defaults to 1000.",
+            "x-example": 1000,
+        },
         # Feature Flag: V1 push restriction.
         "V1_PUSH_WHITELIST": {
             "type": "array",
@@ -1047,7 +1236,12 @@ CONFIG_SCHEMA = {
         "LOGS_MODEL": {
             "type": "string",
             "description": "Logs model for action logs",
-            "enum": ["database", "transition_reads_both_writes_es", "elasticsearch", "splunk"],
+            "enum": [
+                "database",
+                "transition_reads_both_writes_es",
+                "elasticsearch",
+                "splunk",
+            ],
             "x-example": "database",
         },
         "LOGS_MODEL_CONFIG": {
@@ -1057,7 +1251,13 @@ CONFIG_SCHEMA = {
                 "producer": {
                     "type": "string",
                     "description": "Logs producer",
-                    "enum": ["kafka", "elasticsearch", "kinesis_stream", "splunk", "splunk_hec"],
+                    "enum": [
+                        "kafka",
+                        "elasticsearch",
+                        "kinesis_stream",
+                        "splunk",
+                        "splunk_hec",
+                    ],
                     "x-example": "kafka",
                 },
                 "elasticsearch_config": {
@@ -1113,9 +1313,7 @@ CONFIG_SCHEMA = {
                             "type": "array",
                             "description": "List of Kafka brokers to bootstrap the client from",
                             "uniqueItems": True,
-                            "items": {
-                                "type": "string",
-                            },
+                            "items": {"type": "string"},
                         },
                         "topic": {
                             "type": "string",
@@ -1178,8 +1376,7 @@ CONFIG_SCHEMA = {
                 "splunk_config": {
                     "type": "object",
                     "description": "Logs model config for splunk action logs/ splunk cluster configuration",
-                    "x-reference": "https://dev.splunk.com/enterprise/docs/devtools/python/sdk-python"
-                    "/howtousesplunkpython/howtogetdatapython#To-add-data-directly-to-an-index",
+                    "x-reference": "https://dev.splunk.com/enterprise/docs/devtools/python/sdk-python/howtousesplunkpython/howtogetdatapython#To-add-data-directly-to-an-index",
                     "properties": {
                         "host": {
                             "type": "string",
@@ -1193,22 +1390,18 @@ CONFIG_SCHEMA = {
                         },
                         "bearer_token": {
                             "type": "string",
-                            "description": "Bearer_Token for splunk.See: "
-                            "https://dev.splunk.com/enterprise/docs/devtools/python/sdk-python"
-                            "/howtousesplunkpython/howtoconnectpython/#Log-in-using-a-bearer-token",
+                            "description": "Bearer_Token for splunk.See: https://dev.splunk.com/enterprise/docs/devtools/python/sdk-python/howtousesplunkpython/howtoconnectpython/#Log-in-using-a-bearer-token",
                             "x-example": "us-east-1",
                         },
                         "url_scheme": {
                             "type": "string",
-                            "description": "The url scheme for accessing the splunk service. If Splunk is behind SSL"
-                            "*at all*, this *must* be `https`",
+                            "description": "The url scheme for accessing the splunk service. If Splunk is behind SSL *at all*, this *must* be `https`",
                             "enum": ["http", "https"],
                             "x-example": "https",
                         },
                         "verify_ssl": {
                             "type": "boolean",
-                            "description": "Enable (True) or disable (False) SSL verification for https connections."
-                            "Defaults to True",
+                            "description": "Enable (True) or disable (False) SSL verification for https connections.Defaults to True",
                             "x-example": True,
                         },
                         "index_prefix": {
@@ -1218,9 +1411,32 @@ CONFIG_SCHEMA = {
                         },
                         "ssl_ca_path": {
                             "type": "string",
-                            "description": "*Relative container path* to a single .pem file containing a CA "
-                            "certificate for SSL verification",
+                            "description": "*Relative container path* to a single .pem file containing a CA certificate for SSL verification",
                             "x-example": "conf/stack/ssl-ca-cert.pem",
+                        },
+                        "search_timeout": {
+                            "type": "number",
+                            "description": "Timeout in seconds for Splunk search queries. Increase for slow Splunk clusters or complex queries.",
+                            "x-example": 60,
+                            "default": 60,
+                            "minimum": 5,
+                            "maximum": 300,
+                        },
+                        "max_results": {
+                            "type": "number",
+                            "description": "Maximum number of results to return per search query. Larger values require more memory.",
+                            "x-example": 10000,
+                            "default": 10000,
+                            "minimum": 100,
+                            "maximum": 50000,
+                        },
+                        "export_batch_size": {
+                            "type": "number",
+                            "description": "Batch size for log export operations.",
+                            "x-example": 5000,
+                            "default": 5000,
+                            "minimum": 100,
+                            "maximum": 10000,
                         },
                     },
                 },
@@ -1247,23 +1463,20 @@ CONFIG_SCHEMA = {
                         },
                         "url_scheme": {
                             "type": "string",
-                            "description": "The url scheme for accessing the splunk service. If Splunk is behind SSL"
-                            "*at all*, this *must* be `https`",
+                            "description": "The url scheme for accessing the splunk service. If Splunk is behind SSL *at all*, this *must* be `https`",
                             "enum": ["http", "https"],
                             "x-example": "https",
                             "default": "https",
                         },
                         "verify_ssl": {
                             "type": "boolean",
-                            "description": "Enable (True) or disable (False) SSL verification for https connections."
-                            "Defaults to True",
+                            "description": "Enable (True) or disable (False) SSL verification for https connections.Defaults to True",
                             "x-example": True,
                             "default": True,
                         },
                         "ssl_ca_path": {
                             "type": "string",
-                            "description": "*Relative container path* to a single .pem file containing a CA "
-                            "certificate for SSL verification",
+                            "description": "*Relative container path* to a single .pem file containing a CA certificate for SSL verification",
                             "x-example": "conf/stack/ssl-ca-cert.pem",
                         },
                         "index": {
@@ -1282,6 +1495,54 @@ CONFIG_SCHEMA = {
                             "description": "The name of the Splunk sourcetype to use.",
                             "x-example": "quay-sourcetype",
                             "default": "access_combined",
+                        },
+                        "timeout": {
+                            "type": "number",
+                            "description": "Timeout in seconds for HTTP requests to Splunk HEC endpoint. Prevents requests from hanging indefinitely when Splunk is unresponsive.",
+                            "x-example": 10,
+                            "default": 10,
+                            "minimum": 1,
+                            "maximum": 15,
+                        },
+                        "search_timeout": {
+                            "type": "number",
+                            "description": "Timeout in seconds for Splunk search queries. Increase for slow Splunk clusters or complex queries.",
+                            "x-example": 60,
+                            "default": 60,
+                            "minimum": 5,
+                            "maximum": 300,
+                        },
+                        "max_results": {
+                            "type": "number",
+                            "description": "Maximum number of results to return per search query. Larger values require more memory.",
+                            "x-example": 10000,
+                            "default": 10000,
+                            "minimum": 100,
+                            "maximum": 50000,
+                        },
+                        "export_batch_size": {
+                            "type": "number",
+                            "description": "Batch size for log export operations.",
+                            "x-example": 5000,
+                            "default": 5000,
+                            "minimum": 100,
+                            "maximum": 10000,
+                        },
+                        "search_host": {
+                            "type": "string",
+                            "description": "Splunk management host for search API. Defaults to HEC host if not specified.",
+                            "x-example": "splunk-mgmt.example.com",
+                        },
+                        "search_port": {
+                            "type": "number",
+                            "description": "Splunk management port for search API.",
+                            "x-example": 8089,
+                            "default": 8089,
+                        },
+                        "search_token": {
+                            "type": "string",
+                            "description": "Bearer token for Splunk search API. Optional. HEC tokens are ingest-only and cannot search, so a separate token is needed for reading logs. When not configured, audit log viewing in the UI is unavailable but log forwarding still works. See: https://docs.splunk.com/Documentation/SplunkCloud/latest/Config/ManageHECtokens",
+                            "x-example": "your-search-bearer-token",
                         },
                     },
                     "required": ["host", "hec_token"],
@@ -1305,6 +1566,12 @@ CONFIG_SCHEMA = {
             "description": "The time after which a fresh login requires users to reenter their password",
             "x-example": "5m",
         },
+        "SESSION_TIMEOUT": {
+            "type": "string",
+            "description": "The lifetime for permanent browser sessions. Used when FEATURE_PERMANENT_SESSIONS is enabled.",
+            "pattern": "^[0-9]+(w|m|d|h|s)$",
+            "x-example": "24h",
+        },
         # Webhook blacklist.
         "WEBHOOK_HOSTNAME_BLACKLIST": {
             "type": "array",
@@ -1326,6 +1593,78 @@ CONFIG_SCHEMA = {
             "type": "boolean",
             "description": "If set to true, the first User account may be created via API /api/v1/user/initialize",
             "x-example": False,
+        },
+        "FEATURE_PROGRAMMATIC_BOOTSTRAP": {
+            "type": "boolean",
+            "description": "Feature flag for programmatic bootstrap token provisioning. Defaults to False.",
+            "x-example": False,
+        },
+        "FEATURE_ROBOT_API_TOKENS": {
+            "type": "boolean",
+            "description": "Feature flag for scoped robot Management API tokens. Defaults to False.",
+            "x-example": False,
+        },
+        "FEATURE_ROBOT_API_TOKEN_EXCHANGE": {
+            "type": "boolean",
+            "description": "Feature flag for federated robot API token exchange. Requires FEATURE_ROBOT_API_TOKENS. Defaults to False.",
+            "x-example": False,
+        },
+        "BOOTSTRAP_TOKEN_OWNER": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "Username that owns the programmatic bootstrap OAuth application and tokens. Required when FEATURE_PROGRAMMATIC_BOOTSTRAP is enabled, and the user must also be listed in SUPER_USERS.",
+            "x-example": "admin",
+        },
+        "BOOTSTRAP_TOKEN_PATH": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": r"^/[^\x00]*$",
+            "description": "Filesystem path where the bootstrap token JSON is written.",
+            "x-example": "/var/lib/quay/quay-machine-token.json",
+        },
+        "PROGRAMMATIC_TOKEN_PATH": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "pattern": r"^/[^\x00]*$",
+            "description": "Operator-rendered mounted programmatic bootstrap token path accepted for config compatibility.",
+            "x-example": "/var/lib/quay/bootstrap-token/token.json",
+        },
+        "PROGRAMMATIC_TOKEN_K8S_SECRET": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "maxLength": 253,
+            "pattern": r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$",
+            "description": "Kubernetes Secret name used to store the programmatic bootstrap token when Quay is running in Kubernetes.",
+            "x-example": "quay-bootstrap-token",
+        },
+        "PROGRAMMATIC_TOKEN_K8S_KEY": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": r"^[A-Za-z0-9._-]+$",
+            "description": "Kubernetes Secret data key used to store the programmatic bootstrap token JSON.",
+            "x-example": "token.json",
+        },
+        "PROGRAMMATIC_TOKEN_K8S_NAMESPACE": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "maxLength": 63,
+            "pattern": r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+            "description": "Kubernetes namespace containing the programmatic bootstrap token Secret. If unset, Quay uses the pod service account namespace.",
+            "x-example": "quay-enterprise",
+        },
+        "BOOTSTRAP_TOKEN_EXPIRATION": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Bootstrap token lifetime in seconds. Defaults to 3600 (60 minutes).",
+            "x-example": 3600,
+        },
+        "BOOTSTRAP_TOKEN_SCOPE": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "description": "Space-separated OAuth scopes for the bootstrap token.",
+            "x-example": "org:admin repo:admin repo:create repo:read repo:write super:user user:admin user:read",
         },
         # OCI artifact types
         "ALLOWED_OCI_ARTIFACT_TYPES": {
@@ -1353,6 +1692,11 @@ CONFIG_SCHEMA = {
         "FEATURE_QUOTA_MANAGEMENT": {
             "type": "boolean",
             "description": "Enables configuration, caching, and validation for quota management feature",
+            "x-example": False,
+        },
+        "FEATURE_QUOTA_NOTIFICATIONS": {
+            "type": "boolean",
+            "description": "Enables quota threshold notifications via namespace notification channels",
             "x-example": False,
         },
         "FEATURE_QUOTA_SUPPRESS_FAILURES": {
@@ -1385,6 +1729,11 @@ CONFIG_SCHEMA = {
             "description": "The amount of namespaces that will be calculated for quota backfill on wakeup of the backfill worker.",
             "x-example": 100,
         },
+        "QUOTA_NOTIFICATION_COOLDOWN_SECONDS": {
+            "type": "int",
+            "description": "Minimum seconds between duplicate quota notifications for the same namespace and threshold",
+            "x-example": 86400,
+        },
         "QUOTA_INVALIDATE_TOTALS": {
             "type": "boolean",
             "description": "Invalidates totals when a write happens to a namespace and repository when FEATURE_QUOTA_MANAGEMENT is not enabled",
@@ -1394,6 +1743,25 @@ CONFIG_SCHEMA = {
             "type": "int",
             "description": "The amount of time between runs of the quota registry size worker in seconds",
             "x-example": 30,
+        },
+        "QUOTA_METRICS": {
+            "type": "boolean",
+            "description": "Whether quota metrics are exposed about total registry storage consumption, organization and repository usage and organization quota limits and attainment. Defaults to False. Beware of high cardinality if there are many organizations and repositories. Metrics use mutable namespace/repository names as labels for dashboard readability; renames create new Prometheus series until stale ones expire. Use QUOTA_METRICS_*_LIMIT to cap cardinality.",
+            "x-example": False,
+        },
+        "QUOTA_METRICS_REPOS_LIMIT": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100000,
+            "description": "Maximum number of repositories to report per-repository quota metrics for in each collection cycle. Limits metric cardinality and worker resource usage on large registries. Defaults to 10000. Hard ceiling is 100000.",
+            "x-example": 10000,
+        },
+        "QUOTA_METRICS_NAMESPACES_LIMIT": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100000,
+            "description": "Maximum number of namespaces to report per-namespace quota metrics for in each collection cycle. Limits metric cardinality and worker resource usage on large registries. Defaults to 10000. Hard ceiling is 100000.",
+            "x-example": 10000,
         },
         "FEATURE_EDIT_QUOTA": {
             "type": "boolean",
@@ -1420,10 +1788,35 @@ CONFIG_SCHEMA = {
             "description": "User feedback form for UI-V2",
             "x-example": "http://url-for-user-feedback-form.com",
         },
+        "DISABLE_ANGULAR_UI": {
+            "type": "boolean",
+            "description": "Disable legacy Angular UI pages and redirects. Defaults to False",
+            "x-example": False,
+        },
         "FEATURE_UI_V2": {
             "type": "boolean",
             "description": "Enables user to try the beta UI Environment",
             "x-example": False,
+        },
+        "FEATURE_UI_MODELCARD": {
+            "type": "boolean",
+            "description": "Enables modelcard image tab in UI",
+            "x-example": False,
+        },
+        "UI_MODELCARD_ARTIFACT_TYPE": {
+            "type": "str",
+            "description": "Defines the modelcard artifact type",
+            "x-example": "application/x-mlmodel",
+        },
+        "UI_MODELCARD_ANNOTATION": {
+            "type": "object",
+            "description": "Defines the layer annotation of the modelcard stored in an OCI image",
+            "x-example": {},
+        },
+        "UI_MODELCARD_LAYER_ANNOTATION": {
+            "type": "object",
+            "description": "Defines the layer annotation of the modelcard stored in an OCI image",
+            "x-example": {"org.opencontainers.image.title": "README.md"},
         },
         "EXPORT_COMPLIANCE_ENDPOINT": {
             "type": "string",
@@ -1444,9 +1837,7 @@ CONFIG_SCHEMA = {
             "type": "array",
             "description": "Quay usernames of those super users to be granted global readonly privileges",
             "uniqueItems": True,
-            "items": {
-                "type": "string",
-            },
+            "items": {"type": "string"},
         },
         "FEATURE_SUPERUSERS_FULL_ACCESS": {
             "type": "boolean",
@@ -1498,11 +1889,32 @@ CONFIG_SCHEMA = {
             "description": "Endpoint for internal RH marketplace API",
             "x-example": "https://internal-rh-marketplace-endpoint",
         },
-        # Custom terms of service
-        "TERMS_OF_SERVICE_URL": {
-            "type": "string",
-            "description": "Enable customizing of terms of service for on-prem installations",
-            "x-example": "https://quay.io/tos",
+        # Custom footer links
+        "FOOTER_LINKS": {
+            "type": "object",
+            "description": "Enable customization of footer links in Quay's UI for on-prem installations",
+            "properties": {
+                "TERMS_OF_SERVICE_URL": {
+                    "type": "string",
+                    "description": "Custom terms of service for on-prem installations",
+                    "x-example": "https://www.openshift.com/legal/terms",
+                },
+                "PRIVACY_POLICY_URL": {
+                    "type": "string",
+                    "description": "Custom privacy policy for on-prem installations",
+                    "x-example": "https://www.redhat.com/en/about/privacy-policy",
+                },
+                "SECURITY_URL": {
+                    "type": "string",
+                    "description": "Custom security page for on-prem installations",
+                    "x-example": "https://quay.io/security/",
+                },
+                "ABOUT_URL": {
+                    "type": "string",
+                    "description": "Custom about page for on-prem installations",
+                    "x-example": "https://quay.io/about/",
+                },
+            },
         },
         "ROBOTS_DISALLOW": {
             "type": "boolean",
@@ -1569,10 +1981,898 @@ CONFIG_SCHEMA = {
             "description": "Only disables pushes of new content to the registry, while retaining all other functionality. Differs from read only mode because database is not set as read-only.",
             "x-example": False,
         },
+        "FEATURE_SPAM_DETECTION": {
+            "type": "boolean",
+            "description": "Enables repository-description spam detection at API ingress. Defaults to False.",
+            "x-example": False,
+        },
+        "SPAM_DETECTION_DRY_RUN": {
+            "type": "boolean",
+            "description": "Evaluates repository descriptions without rejecting create or update requests. Defaults to True.",
+            "x-example": True,
+        },
+        "SPAM_DETECTION_FAIL_OPEN": {
+            "type": "boolean",
+            "description": "Allows repository create and update requests if the local spam classifier cannot be evaluated. Defaults to True.",
+            "x-example": True,
+        },
+        "SPAM_DETECTION_CLASSIFIER_PATH": {
+            "type": ["string", "null"],
+            "description": "Path to the in-image Bayesian spam classifier JSON artifact used for repository-description ingress evaluation. Defaults to /conf/spam-detection/classifier.json.",
+            "x-example": "/conf/spam-detection/classifier.json",
+        },
+        "SPAM_DETECTION_CLASSIFIER_VERSION": {
+            "type": ["string", "null"],
+            "description": "Expected version of the local spam classifier artifact. If set, Quay rejects or fail-opens classifier evaluation when the artifact version differs.",
+            "x-example": "2026-06-20.1",
+        },
+        "SPAM_DETECTION_CLASSIFIER_SHA256": {
+            "type": ["string", "null"],
+            "description": "Optional SHA-256 checksum for the local spam classifier artifact.",
+            "x-example": "a3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        },
         "MANIFESTS_ENDPOINT_READ_TIMEOUT": {
             "type": "string",
             "description": "Nginx read timeout for manifests endpoints used by pulls and pushes",
             "x-example": "5m",
         },
+        "BLOB_UPLOAD_CLIENT_BODY_TIMEOUT": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Nginx client body timeout in seconds for blob upload endpoints. Set this to match or exceed the load balancer idle timeout to prevent 408/502 errors during large uploads. Defaults to nginx's 60s when not set.",
+            "x-example": "3600",
+        },
+        "BLOB_UPLOAD_LINGERING_CLOSE": {
+            "type": "string",
+            "enum": ["on", "off", "always"],
+            "description": "Nginx lingering_close mode for blob upload endpoints. Set to 'always' to ensure clean connection close after timeouts, allowing load balancers to receive error responses instead of returning 502. Defaults to nginx's 'on' when not set.",
+            "x-example": "always",
+        },
+        "BLOB_UPLOAD_LINGERING_TIME": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Maximum time in seconds nginx will drain remaining request body after closing a blob upload. Defaults to nginx's 30s when not set.",
+            "x-example": "60",
+        },
+        "BLOB_UPLOAD_LINGERING_TIMEOUT": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Maximum wait time in seconds between successive reads while draining a blob upload request body. Defaults to nginx's 5s when not set.",
+            "x-example": "30",
+        },
+        "FEATURE_SUPERUSER_CONFIGDUMP": {
+            "type": "boolean",
+            "description": "Enables a full config dump of the running Framework, environment and schema for validation",
+            "x-example": False,
+        },
+        "FEATURE_OTEL_TRACING": {
+            "type": "boolean",
+            "description": "Whether to enable open telemetry tracing on quay",
+            "x-example": False,
+        },
+        "FEATURE_SPARSE_INDEX": {
+            "type": "boolean",
+            "description": "Whether to allow sparse manifest indexes where not all architectures are required to be present. When enabled, manifests for missing architectures will be skipped instead of raising errors. Defaults to False",
+            "x-example": False,
+        },
+        "OTEL_CONFIG": {
+            "type": "object",
+            "description": "open telemetry config options",
+            "properties": {
+                "service_name": {
+                    "type": "string",
+                    "description": "name of service in otel spans",
+                    "x-example": "quay",
+                },
+                "dt_api_url": {
+                    "type": "string",
+                    "description": "url for dynatrace api",
+                    "x-example": "https://dynatrace-api.example",
+                },
+                "dt_api_token": {
+                    "type": "string",
+                    "description": "token for dynatrace api",
+                    "x-example": "sometoken",
+                },
+                "endpoint": {
+                    "type": "string",
+                    "description": "OTLP collector endpoint. Defaults to http://jaeger:4318/v1/traces.",
+                    "x-example": "http://jaeger:4318/v1/traces",
+                },
+                "sample_rate": {
+                    "type": "number",
+                    "description": "Fraction of traces to sample (0.0–1.0). Defaults to 0.001.",
+                    "x-example": 1.0,
+                },
+            },
+        },
+        "OTEL_TRACING_EXCLUDED_URLS": {
+            "type": "string",
+            "description": "Comma separated list of urls to exclude from tracing",
+            "x-example": "api/v1/.*,v2/([^/]+(/[^/]+)+)/(tags|blobs),v2/_catalog,v2/auth",
+        },
+        "FEATURE_ENABLE_STALE_MPU_CLEANUP": {
+            "type": "boolean",
+            "description": "Enables cleanup of stale multipart uploads on the backend bucket. This feature flag is only applicable to S3 storage engines.",
+            "x-example": True,
+        },
+    },
+    "DEBUG": {
+        "type": "boolean",
+        "description": "Debug setting for engineering. Defaults to False.",
+        "x-example": False,
+        "x-reference": None,
+    },
+    "TESTING": {
+        "type": "boolean",
+        "description": "Test setting for engineering. Defaults to False.",
+        "x-example": False,
+        "x-reference": None,
+    },
+    "PROPAGATE_EXCEPTIONS": {
+        "type": "boolean",
+        "description": "Unittest Exception handling. Defaults to True",
+        "x-example": True,
+        "x-reference": None,
+    },
+    "SECRET_KEY": {
+        "type": "string",
+        "description": "Key used to encrypt the session cookie and the CSRF token needed for correct interpretation of the user session.",
+        "x-example": "",
+        "x-reference": "https://uuidgen.org/v/4",
+    },
+    "USE_X_SENDFILE": {
+        "type": "boolean",
+        "description": "When serving files, set the X-Sendfile header instead of serving the data with Flask. Defaults to False",
+        "x-example": False,
+        "x-reference": "https://flask.palletsprojects.com/en/2.3.x/config/",
+    },
+    "APPLICATION_ROOT": {
+        "type": "string",
+        "description": "Inform the application what path it is mounted under by the application / web server.",
+        "x-example": "/",
+        "x-reference": "https://flask.palletsprojects.com/en/2.3.x/config/",
+    },
+    "SESSION_COOKIE_NAME": {
+        "type": "string",
+        "description": "The name of the session cookie. Defaults to _csrf_token",
+        "x-example": "_csrf_token",
+        "x-reference": "https://flask.palletsprojects.com/en/2.3.x/config/",
+    },
+    "SESSION_COOKIE_HTTPONLY": {
+        "type": "boolean",
+        "description": "Browsers will not allow JavaScript access to cookies marked as 'HTTP only' for security. Defaults to True",
+        "x-example": True,
+        "x-reference": "https://flask.palletsprojects.com/en/2.3.x/config/",
+    },
+    "SESSION_COOKIE_SAMESITE": {
+        "type": "string",
+        "description": "Restrict how cookies are sent with requests from external sites.",
+        "x-example": "Lax",
+        "x-reference": "https://flask.palletsprojects.com/en/2.3.x/config/",
+    },
+    "SESSION_REFRESH_EACH_REQUEST": {
+        "type": "boolean",
+        "description": "Control whether the cookie is sent with every response when session.permanent is true. Defaults to True",
+        "x-example": True,
+        "x-reference": "https://flask.palletsprojects.com/en/2.3.x/config/",
+    },
+    "SEND_FILE_MAX_AGE_DEFAULT": {
+        "type": "number",
+        "description": "When serving files, set the cache control max age to this number of seconds. Defaults to 0",
+        "x-example": 0,
+        "x-reference": "https://flask.palletsprojects.com/en/2.3.x/config/",
+    },
+    "TRAP_HTTP_EXCEPTIONS": {
+        "type": "boolean",
+        "description": "If there is no handler for an HTTPException-type exception, re-raise it to be handled by the interactive debugger instead of returning it as a simple error response. Defaults to False",
+        "x-example": False,
+        "x-reference": "https://flask.palletsprojects.com/en/2.3.x/config/",
+    },
+    "EXPLAIN_TEMPLATE_LOADING": {
+        "type": "boolean",
+        "description": "Log debugging information tracing how a template file was loaded. Defaults to False",
+        "x-example": False,
+        "x-reference": "https://flask.palletsprojects.com/en/2.3.x/config/",
+    },
+    "MAX_COOKIE_SIZE": {
+        "type": "number",
+        "description": "Warn if cookie headers are larger than this many bytes. Defaults to 4093",
+        "x-example": 4093,
+        "x-reference": "https://flask.palletsprojects.com/en/2.3.x/config/",
+    },
+    "ACCOUNT_RECOVERY_MODE": {
+        "type": "boolean",
+        "description": "Put Quay into Account recovery mode. Defaults to False",
+        "x-example": False,
+        "x-reference": None,
+    },
+    "ANALYTICS_TYPE": {
+        "type": "string",
+        "description": "[QUAY.IO] ANALYTICS_TYPE.",
+        "x-example": "FakeAnalytics",
+        "x-reference": None,
+    },
+    "AVATAR_COLORS": {
+        "type": "array",
+        "description": "Avatar colors.",
+        "x-example": [
+            "#969696",
+            "#aec7e8",
+            "#ff7f0e",
+            "#ffbb78",
+            "#2ca02c",
+            "#98df8a",
+            "#d62728",
+            "#ff9896",
+            "#9467bd",
+            "#c5b0d5",
+            "#8c564b",
+            "#c49c94",
+            "#e377c2",
+            "#f7b6d2",
+            "#7f7f7f",
+            "#c7c7c7",
+            "#bcbd22",
+            "#1f77b4",
+            "#17becf",
+            "#9edae5",
+            "#393b79",
+            "#5254a3",
+            "#6b6ecf",
+            "#9c9ede",
+            "#9ecae1",
+            "#31a354",
+            "#b5cf6b",
+            "#a1d99b",
+            "#8c6d31",
+            "#ad494a",
+            "#e7ba52",
+            "#a55194",
+        ],
+        "x-reference": None,
+    },
+    "BILLING_TYPE": {
+        "type": "string",
+        "description": "[QUAY.IO] BILLING_TYPE.",
+        "x-example": "FakeStripe",
+        "x-reference": None,
+    },
+    "BUILDLOGS_OPTIONS": {
+        "type": "array",
+        "description": "[QUAY.IO] BUILDLOGS_OPTIONS.",
+        "x-example": [],
+        "x-reference": None,
+    },
+    "CHANNEL_COLORS": {
+        "type": "array",
+        "description": "Channel colors.",
+        "x-example": [
+            "#969696",
+            "#aec7e8",
+            "#ff7f0e",
+            "#ffbb78",
+            "#2ca02c",
+            "#98df8a",
+            "#d62728",
+            "#ff9896",
+            "#9467bd",
+            "#c5b0d5",
+            "#8c564b",
+            "#c49c94",
+            "#e377c2",
+            "#f7b6d2",
+            "#7f7f7f",
+            "#c7c7c7",
+            "#bcbd22",
+            "#1f77b4",
+            "#17becf",
+            "#9edae5",
+            "#393b79",
+            "#5254a3",
+            "#6b6ecf",
+            "#9c9ede",
+            "#9ecae1",
+            "#31a354",
+            "#b5cf6b",
+            "#a1d99b",
+            "#8c6d31",
+            "#ad494a",
+            "#e7ba52",
+            "#a55194",
+        ],
+        "x-reference": None,
+    },
+    "CHUNK_CLEANUP_QUEUE_NAME": {
+        "type": "string",
+        "description": "[QUAY.IO] CHUNK_CLEANUP_QUEUE_NAME.",
+        "x-example": "chunk_cleanup",
+        "x-reference": None,
+    },
+    "DATA_MODEL_CACHE_CONFIG": {
+        "type": "object",
+        "description": "Configure Data model cache.",
+        "properties": {
+            "engine": {
+                "type": "string",
+                "description": "Cache engine redis/memcache.",
+                "x-example": "redis",
+                "x-reference": None,
+            },
+            "redis_config": {
+                "type": "object",
+                "description": "Redis primary/replica configuration settings.",
+                "properties": [
+                    {
+                        "primary": {
+                            "type": "object",
+                            "description": "Primary redis configuration",
+                            "properties": [
+                                {
+                                    "host": "string",
+                                    "description": "hostname or ip address",
+                                    "pattern": "RFC822",
+                                },
+                                {
+                                    "port": "number",
+                                    "description": "port number between 1024 and 65535, defaults to 6379.",
+                                },
+                                {"password": "string", "description": "redis password to connect"},
+                                {
+                                    "ssl": "boolean",
+                                    "description": "utilize TLS based communication with Redis",
+                                },
+                            ],
+                        }
+                    },
+                    {
+                        "replica": {
+                            "type": "object",
+                            "description": "Replica redis configuration",
+                            "properties": [
+                                {
+                                    "host": "string",
+                                    "description": "hostname or ip address",
+                                    "pattern": "RFC822",
+                                },
+                                {
+                                    "port": "number",
+                                    "description": "port number between 1024 and 65535, defaults to 6379.",
+                                },
+                                {"password": "string", "description": "redis password to connect"},
+                                {
+                                    "ssl": "boolean",
+                                    "description": "utilize TLS based communication with Redis",
+                                },
+                            ],
+                        }
+                    },
+                ],
+            },
+        },
+        "required": ["engine", "redis_config"],
+        "x-reference": "https://docs.redhat.com/en/documentation/red_hat_quay/3.12/html/configure_red_hat_quay/config-fields-intro#config-fields-modelcache-single-redis",
+    },
+    "DEFAULT_LABEL_KEY_RESERVED_PREFIXES": {
+        "type": "array",
+        "description": "[QUAY.IO] DEFAULT_LABEL_KEY_RESERVED_PREFIXES.",
+        "x-example": [
+            "com.docker.",
+            "io.docker.",
+            "org.dockerproject.",
+            "org.opencontainers.",
+            "io.cncf.",
+            "io.kubernetes.",
+            "io.k8s.",
+            "io.quay",
+            "com.coreos",
+            "com.tectonic",
+            "internal",
+            "quay",
+        ],
+        "x-reference": None,
+    },
+    "DISABLED_FOR_AUDIT_LOGS": {
+        "type": "array",
+        "description": "Namespace based disabling of audit logs.",
+        "x-example": [],
+        "x-reference": None,
+    },
+    "DISABLED_FOR_PULL_LOGS": {
+        "type": "array",
+        "description": "Namespace based disabling of pull logs.",
+        "x-example": [],
+        "x-reference": None,
+    },
+    "DOCKERFILE_BUILD_QUEUE_NAME": {
+        "type": "string",
+        "description": "[QUAY.IO] DOCKERFILE_BUILD_QUEUE_NAME.",
+        "x-example": "dockerfilebuild",
+        "x-reference": None,
+    },
+    "EXCEPTION_LOG_TYPE": {
+        "type": "string",
+        "description": "[QUAY.IO] EXCEPTION_LOG_TYPE.",
+        "x-example": "FakeSentry",
+        "x-reference": None,
+    },
+    "EXPIRED_SERVICE_KEY_TTL_SEC": {
+        "type": "number",
+        "description": "Time to expire service keys. Defaults to 604800",
+        "x-example": 604800,
+        "x-reference": None,
+    },
+    "EXPORT_ACTION_LOGS_QUEUE_NAME": {
+        "type": "string",
+        "description": "[QUAY.IO] EXPORT_ACTION_LOGS_QUEUE_NAME.",
+        "x-example": "exportactionlogs",
+        "x-reference": None,
+    },
+    "FEATURE_BILLING": {
+        "type": "boolean",
+        "description": "[QUAY.IO] FEATURE_BILLING. Defaults to False",
+        "x-example": False,
+        "x-reference": None,
+    },
+    "FEATURE_CLEAR_EXPIRED_RAC_ENTRIES": {
+        "type": "boolean",
+        "description": "[QUAY.IO] FEATURE_CLEAR_EXPIRED_RAC_ENTRIES. Defaults to False",
+        "x-example": False,
+        "x-reference": None,
+    },
+    "FEATURE_DISABLE_PULL_LOGS_FOR_FREE_NAMESPACES": {
+        "type": "boolean",
+        "description": "Namespace based disabling of pull logs. Defaults to False",
+        "x-example": False,
+        "x-reference": None,
+    },
+    "FEATURE_GENERAL_OCI_SUPPORT": {
+        "type": "boolean",
+        "description": "Enable support for OCI artifacts.. Defaults to True",
+        "x-example": True,
+        "x-reference": "https://docs.redhat.com/en/documentation/red_hat_quay/3.12/html/configure_red_hat_quay/config-fields-intro#config-fields-helm-oci",
+    },
+    "FEATURE_HELM_OCI_SUPPORT": {
+        "type": "boolean",
+        "description": "Enable support for Helm artifacts. Defaults to True",
+        "x-example": True,
+        "x-reference": "https://docs.redhat.com/en/documentation/red_hat_quay/3.12/html/configure_red_hat_quay/config-fields-intro#config-fields-legacy",
+    },
+    "FEATURE_MANIFEST_SIZE_BACKFILL": {
+        "type": "boolean",
+        "description": "[QUAY.IO] FEATURE_MANIFEST_SIZE_BACKFILL. Defaults to True",
+        "x-example": True,
+        "x-reference": None,
+    },
+    "FEATURE_NAMESPACE_GARBAGE_COLLECTION": {
+        "type": "boolean",
+        "description": "[QUAY.IO] FEATURE_NAMESPACE_GARBAGE_COLLECTION. Defaults to True",
+        "x-example": True,
+        "x-reference": None,
+    },
+    "FEATURE_REPOSITORY_ACTION_COUNTER": {
+        "type": "boolean",
+        "description": "[QUAY.IO] FEATURE_REPOSITORY_ACTION_COUNTER. Defaults to True",
+        "x-example": True,
+        "x-reference": None,
+    },
+    "FEATURE_REPOSITORY_GARBAGE_COLLECTION": {
+        "type": "boolean",
+        "description": "[QUAY.IO] FEATURE_REPOSITORY_GARBAGE_COLLECTION. Defaults to True",
+        "x-example": True,
+        "x-reference": None,
+    },
+    "FEATURE_RH_MARKETPLACE": {
+        "type": "boolean",
+        "description": "[QUAY.IO] FEATURE_RH_MARKETPLACE. Defaults to False",
+        "x-example": False,
+        "x-reference": None,
+    },
+    "FEATURE_SIGNING": {
+        "type": "boolean",
+        "description": "Trusted Platform signing. Defaults to False",
+        "x-example": False,
+        "x-reference": None,
+    },
+    "GARBAGE_COLLECTION_FREQUENCY": {
+        "type": "number",
+        "description": "[QUAY.IO] GARBAGE_COLLECTION_FREQUENCY. Defaults to 30",
+        "x-example": 30,
+        "x-reference": None,
+    },
+    "NAMESPACE_GC_GRACE_PERIOD_SECONDS": {
+        "type": "number",
+        "description": "Grace period in seconds before deleted namespaces (orgs/users) are permanently purged by GC. Only applies to namespaces listed in NAMESPACE_GC_GRACE_PERIOD_ALLOWLIST. Defaults to 0 (immediate).",
+        "x-example": 1209600,
+        "x-reference": None,
+        "minimum": 0,
+    },
+    "NAMESPACE_GC_GRACE_PERIOD_ALLOWLIST": {
+        "type": "array",
+        "description": "Allowlist of namespace names that receive the GC grace period. When empty, no namespaces are protected.",
+        "x-example": ["important-org"],
+        "x-reference": None,
+        "items": {
+            "type": "string",
+        },
+    },
+    "GREENLET_TRACING": {
+        "type": "boolean",
+        "description": "[QUAY.IO] GREENLET_TRACING. Defaults to True",
+        "x-example": True,
+        "x-reference": None,
+    },
+    "INSTANCE_SERVICE_KEY_EXPIRATION": {
+        "type": "number",
+        "description": "Defineexpiration for instance service keys, in minutes. Defaults to 120",
+        "x-example": 120,
+        "x-reference": None,
+    },
+    "INSTANCE_SERVICE_KEY_IMPORT_FROM_FILES": {
+        "type": "boolean",
+        "description": "When true, import the instance service key from mounted files instead of generating a new one. Defaults to False",
+        "x-example": False,
+        "x-reference": None,
+    },
+    "INSTANCE_SERVICE_KEY_KID_LOCATION": {
+        "type": "string",
+        "description": "ID of the local instance service key.",
+        "x-example": "/quay-registry/conf/quay.kid",
+        "x-reference": None,
+    },
+    "INSTANCE_SERVICE_KEY_LOCATION": {
+        "type": "string",
+        "description": "The private key of the local instance service key.",
+        "x-example": "/quay-registry/conf/quay.pem",
+        "x-reference": None,
+    },
+    "INSTANCE_SERVICE_KEY_REFRESH": {
+        "type": "number",
+        "description": "Refreshes the instance's active service key in minutes. Defaults to 55",
+        "x-example": 55,
+        "x-reference": None,
+    },
+    "INSTANCE_SERVICE_KEY_SERVICE": {
+        "type": "string",
+        "description": "The name of the instance key's service.",
+        "x-example": "quay",
+        "x-reference": None,
+    },
+    "JSONIFY_PRETTYPRINT_REGULAR": {
+        "type": "boolean",
+        "description": "[OBSOLETE] The default app.json provider has equivalent attributes instead. Defaults to False",
+        "x-example": False,
+        "x-reference": "https://flask.palletsprojects.com/en/2.3.x/config/",
+    },
+    "LABEL_KEY_RESERVED_PREFIXES": {
+        "type": "array",
+        "description": "Reserved Label prefixes, must end in a dot.",
+        "x-example": [],
+        "x-reference": None,
+    },
+    "LAST_ACCESSED_UPDATE_THRESHOLD_S": {
+        "type": "number",
+        "description": "Update the LAST_ACCESSED database column. Defaults to 60 in seconds",
+        "x-example": 60,
+        "x-reference": None,
+    },
+    "OAUTH_TOKEN_LAST_ACCESSED_UPDATE_THRESHOLD_S": {
+        "type": "number",
+        "description": (
+            "Update the OAuth token LAST_ACCESSED database column. Defaults to 60 seconds"
+        ),
+        "x-example": 60,
+        "x-reference": None,
+    },
+    "LIBRARY_NAMESPACE": {
+        "type": "string",
+        "description": "[QUAY.IO] LIBRARY_NAMESPACE.",
+        "x-example": "library",
+        "x-reference": None,
+    },
+    "LOCAL_OAUTH_HANDLER": {
+        "type": "string",
+        "description": "[QUAY.IO] Endpoint for local OAUTH handling.",
+        "x-example": "/oauth/localapp",
+        "x-reference": None,
+    },
+    "LOGGING_LEVEL": {
+        "type": "string",
+        "description": "Application wide Log level setting.",
+        "x-example": "DEBUG",
+        "x-reference": None,
+    },
+    "MAIL_FAIL_SILENTLY": {
+        "type": "boolean",
+        "description": "[QUAY.IO] MAIL_FAIL_SILENTLY. Defaults to False",
+        "x-example": False,
+        "x-reference": None,
+    },
+    "NAMESPACE_GC_QUEUE_NAME": {
+        "type": "string",
+        "description": "[QUAY.IO] NAMESPACE_GC_QUEUE_NAME.",
+        "x-example": "namespacegc",
+        "x-reference": None,
+    },
+    "NOTIFICATION_QUEUE_NAME": {
+        "type": "string",
+        "description": "[QUAY.IO] NOTIFICATION_QUEUE_NAME.",
+        "x-example": "notification",
+        "x-reference": None,
+    },
+    "NOTIFICATION_SEND_TIMEOUT": {
+        "type": "number",
+        "description": "Notifications timeout independent of the method configured. Defaults to 10",
+        "x-example": 10,
+        "x-reference": None,
+    },
+    "PAGE_TOKEN_KEY": {
+        "type": "string",
+        "description": "PAGE_TOKEN_KEY. Defaults to <Random>",
+        "x-example": "",
+        "x-reference": None,
+    },
+    "PROMETHEUS_PUSHGATEWAY_URL": {
+        "type": "string",
+        "description": "Prometheus PushGateway URL. Defaults to http://localhost:9091",
+        "x-example": "http://localhost:9091",
+        "x-reference": None,
+    },
+    "PROFILING_TYPE": {
+        "type": "string",
+        "description": "Continuous profiling type. Use 'Pyroscope' to enable; default is empty (disabled).",
+        "x-example": "",
+        "x-reference": None,
+    },
+    "PYROSCOPE_SERVER_ADDRESS": {
+        "type": ["string", "null"],
+        "description": "Pyroscope server URL when PROFILING_TYPE is Pyroscope.",
+        "x-example": "http://localhost:4040",
+        "x-reference": None,
+    },
+    "PYROSCOPE_APPLICATION_NAME": {
+        "type": "string",
+        "description": "Application name sent to Pyroscope. Defaults to 'quay'.",
+        "x-example": "quay",
+        "x-reference": None,
+    },
+    "PUSH_TEMP_TAG_EXPIRATION_SEC": {
+        "type": "number",
+        "description": "Temporary Tag expiration time in seconds. Defaults to 6 hours",
+        "x-example": 21600,
+        "x-reference": None,
+    },
+    "QUEUE_METRICS_TYPE": {
+        "type": "string",
+        "description": "[QUAY.IO] QUEUE_METRICS_TYPE.",
+        "x-example": "Null",
+        "x-reference": None,
+    },
+    "QUEUE_WORKER_METRICS_REFRESH_SECONDS": {
+        "type": "number",
+        "description": "Watchdog refresh time in seconds for Queue workers . Defaults to 30",
+        "x-example": 30,
+        "x-reference": None,
+    },
+    "REGISTRY_JWT_AUTH_MAX_FRESH_S": {
+        "type": "number",
+        "description": "JWT Authentication fresh time in seconds. Defaults to 3660",
+        "x-example": 3660,
+        "x-reference": None,
+    },
+    "REPLICATION_QUEUE_NAME": {
+        "type": "string",
+        "description": "[QUAY.IO] REPLICATION_QUEUE_NAME.",
+        "x-example": "imagestoragereplication",
+        "x-reference": None,
+    },
+    "REPOSITORY_GC_QUEUE_NAME": {
+        "type": "string",
+        "description": "[QUAY.IO] REPOSITORY_GC_QUEUE_NAME.",
+        "x-example": "repositorygc",
+        "x-reference": None,
+    },
+    "SECSCAN_V4_NOTIFICATION_QUEUE_NAME": {
+        "type": "string",
+        "description": "[QUAY.IO] SECSCAN_V4_NOTIFICATION_QUEUE_NAME.",
+        "x-example": "secscanv4",
+        "x-reference": None,
+    },
+    "SECURITY_SCANNER_V4_REINDEX_THRESHOLD": {
+        "type": "number",
+        "description": "Security Scanner reindexing threshold. Defaults to 86400 seconds",
+        "x-example": 86400,
+        "x-reference": None,
+    },
+    "SIGNED_GRANT_EXPIRATION_SEC": {
+        "type": "number",
+        "description": "Authentication header signatureexpiraton. Defaults to 86400 seconds",
+        "x-example": 86400,
+        "x-reference": None,
+    },
+    "STAGGER_WORKERS": {
+        "type": "boolean",
+        "description": "Stagger workers. Defaults to True",
+        "x-example": True,
+        "x-reference": None,
+    },
+    "STATUS_TAGS": {
+        "type": "object",
+        "description": "[QUAY.IO] STATUS_TAGS.",
+        "properties": {},
+        "required": [],
+        "x-reference": None,
+    },
+    "TEAM_SYNC_WORKER_FREQUENCY": {
+        "type": "number",
+        "description": "Team syncing worker frequency. Defaults to 60 seconds",
+        "x-example": 60,
+        "x-reference": None,
+    },
+    "UNAPPROVED_SERVICE_KEY_TTL_SEC": {
+        "type": "number",
+        "description": "Time to expire unapproved service keys in seconds. Defaults to 86400",
+        "x-example": 86400,
+        "x-reference": None,
+    },
+    "USE_CDN": {
+        "type": "boolean",
+        "description": "[QUAY.IO] USE_CDN. Defaults to False",
+        "x-example": False,
+        "x-reference": None,
+    },
+    "DATABASE_SECRET_KEY": {
+        "type": "string",
+        "description": "Key used to encrypt sensitive fields within the database.",
+        "x-example": "",
+        "x-reference": "https://docs.redhat.com/en/documentation/red_hat_quay/3.12/html/configure_red_hat_quay/config-fields-intro#config-fields-required-general",
+    },
+    "DB_CONNECTION_POOLING": {
+        "type": "boolean",
+        "description": "Use connection pooling for Database access. Defaults to False",
+        "x-example": False,
+        "x-reference": None,
+    },
+    "FEATURE_ACI_CONVERSION": {
+        "type": "boolean",
+        "description": "Whether to enable conversion to ACIs. Defaults to False",
+        "x-example": False,
+        "x-reference": "https://docs.redhat.com/en/documentation/red_hat_quay/3.12/html/configure_red_hat_quay/config-fields-intro#config-fields-aci",
+    },
+    "GITLAB_TRIGGER_KIND": {
+        "type": "object",
+        "description": "[QUAY.IO] GITLAB_TRIGGER_KIND.",
+        "properties": {},
+        "required": [],
+        "x-reference": None,
+    },
+    "MAIL_USE_AUTH": {
+        "type": "boolean",
+        "description": "[QUAY.IO] MAIL_USE_AUTH. Defaults to False",
+        "x-example": False,
+        "x-reference": None,
+    },
+    "SETUP_COMPLETE": {
+        "type": "boolean",
+        "description": "[QUAY.IO] SETUP_COMPLETE. Defaults to True",
+        "x-example": True,
+        "x-reference": None,
+    },
+    "LDAP_ADMIN_DN": {
+        "type": "string",
+        "description": "LDAP_ADMIN_DN.",
+        "x-example": "cn=quay,ou=people,dc=example,dc=com",
+        "x-reference": None,
+    },
+    "LDAP_ADMIN_PASSWD": {
+        "type": "string",
+        "description": "LDAP_ADMIN_PASSWD.",
+        "x-example": "",
+        "x-reference": None,
+    },
+    "LDAP_ALLOW_INSECURE_FALLBACK": {
+        "type": "boolean",
+        "description": "LDAP_ALLOW_INSECURE_FALLBACK. Defaults to False",
+        "x-example": False,
+        "x-reference": None,
+    },
+    "LDAP_BASE_DN": {
+        "type": "array",
+        "description": "LDAP_BASE_DN.",
+        "x-example": ["dc=example", "dc=com"],
+        "x-reference": None,
+    },
+    "LDAP_EMAIL_ATTR": {
+        "type": "string",
+        "description": "LDAP_EMAIL_ATTR.",
+        "x-example": "mail",
+        "x-reference": None,
+    },
+    "LDAP_SECONDARY_USER_RDNS": {
+        "type": "array",
+        "description": "LDAP_SECONDARY_USER_RDNS.",
+        "x-example": ["ou=People,ou=Sales", "ou=People,ou=Engineering"],
+        "x-reference": None,
+    },
+    "LDAP_UID_ATTR": {
+        "type": "string",
+        "description": "LDAP_UID_ATTR.",
+        "x-example": "uid",
+        "x-reference": None,
+    },
+    "LDAP_URI": {
+        "type": "string",
+        "description": "LDAP_URI.",
+        "x-example": "ldaps://ldap.example.com:636",
+        "x-reference": None,
+    },
+    "LDAP_USER_RDN": {
+        "type": "array",
+        "description": "LDAP_USER_RDN.",
+        "x-example": ["ou=team", "ou=people"],
+        "x-reference": None,
+    },
+    "LDAP_SUPERUSER_FILTER": {
+        "type": "string",
+        "description": "LDAP_SUPERUSER_FILTER.",
+        "x-example": "(|(memberOf=cn=quay-superusers,ou=Groups,dc=example,dc=com)(memberOf=cn=quay-readonly-superuser,ou=Groups,dc=example,dc=com))",
+        "x-reference": None,
+    },
+    "LDAP_RESTRICTED_USER_FILTER": {
+        "type": "string",
+        "description": "LDAP_RESTRICTED_USER_FILTER.",
+        "x-example": "(&(memberOf=cn=allusers,ou=Groups,dc=example,dc=com)(!(memberOf=cn=quay-superusers,ou=Groups,dc=example,dc=com)))",
+        "x-reference": None,
+    },
+    "LDAP_FOLLOW_REFERRALS": {
+        "type": "number",
+        "description": "LDAP_FOLLOW_REFERRALS. Defaults to 0",
+        "x-example": 1,
+        "x-reference": None,
+    },
+    "FEATURE_LDAP_CACHING": {
+        "type": "boolean",
+        "description": "Enable in-memory caching for LDAP permission check results (superuser, restricted user). Reduces LDAP server load. Defaults to False.",
+        "x-example": True,
+        "x-reference": None,
+    },
+    "LDAP_CACHE_TTL": {
+        "type": "number",
+        "description": "Time-to-live in seconds for cached LDAP permission results. Defaults to 5.",
+        "x-example": 10,
+        "x-reference": None,
+    },
+    "LDAP_CONNECTION_POOLING": {
+        "type": "boolean",
+        "description": "Enable admin LDAP connection pooling to reuse connections across requests. Set false to fall back to per-request connections. Defaults to True.",
+        "x-example": True,
+        "x-reference": None,
+    },
+    "LDAP_POOL_SIZE": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "Maximum number of pooled admin LDAP connections per worker process. Defaults to 10.",
+        "x-example": 10,
+        "x-reference": None,
+    },
+    "LDAP_POOL_MAX_WAIT": {
+        "type": "number",
+        "minimum": 0,
+        "description": "Seconds to wait for a pooled LDAP connection before creating an overflow connection. Defaults to 5.0.",
+        "x-example": 5.0,
+        "x-reference": None,
+    },
+    "LDAP_POOL_CONNECTION_LIFETIME": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "description": "Maximum age in seconds of a pooled LDAP connection before it is rotated. Defaults to 300.",
+        "x-example": 300,
+        "x-reference": None,
+    },
+    "GLOBAL_PROMETHEUS_STATS_FREQUENCY": {
+        "type": "number",
+        "description": "Frequency to report metrics to Push gateway. Defaults to 3600 seconds",
+        "x-example": 3600,
+        "x-reference": None,
     },
 }

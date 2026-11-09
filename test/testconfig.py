@@ -20,7 +20,7 @@ TEST_DB_FILE = NamedTemporaryFile(delete=True)
 class TestConfig(DefaultConfig):
     TESTING = True
     SECRET_KEY = "superdupersecret!!!1"
-    DATABASE_SECRET_KEY = "anothercrazykey!"
+    DATABASE_SECRET_KEY = "QUAY_FIXTURE_ONLY-anothercrazykey!"
     BILLING_TYPE = "FakeStripe"
 
     TEST_DB_FILE = TEST_DB_FILE
@@ -46,6 +46,12 @@ class TestConfig(DefaultConfig):
     USERFILES_PATH = "userfiles/"
 
     FEATURE_SUPER_USERS = True
+    FEATURE_SUPERUSERS_FULL_ACCESS = True
+    FEATURE_PROGRAMMATIC_BOOTSTRAP = True
+    FEATURE_ROBOT_API_TOKENS = True
+    FEATURE_ROBOT_API_TOKEN_EXCHANGE = True
+    BOOTSTRAP_TOKEN_OWNER = "devtable"
+    BOOTSTRAP_TOKEN_PATH = f"{TEST_DB_FILE.name}-bootstrap-token.json"
     FEATURE_BILLING = True
     FEATURE_MAILING = True
     SUPER_USERS = ["devtable"]
@@ -56,6 +62,7 @@ class TestConfig(DefaultConfig):
     LICENSE_EXPIRATION_WARNING = datetime.now() + timedelta(weeks=520)
 
     FEATURE_GITHUB_BUILD = True
+    FEATURE_BUILD_SUPPORT = True
 
     CLOUDWATCH_NAMESPACE = None
 
@@ -97,12 +104,11 @@ class TestConfig(DefaultConfig):
 
     DATA_MODEL_CACHE_CONFIG = {
         "engine": "inmemory",
-        # OCI Conformance tests don't expect results to be cached.
-        # If we implement cache invalidation, we can enable it back.
-        "active_repo_tags_cache_ttl": "0s",
     }
 
     FEATURE_REPO_MIRROR = True
+    FEATURE_ORG_MIRROR = True
+    FEATURE_IMMUTABLE_TAGS = True
     FEATURE_GENERAL_OCI_SUPPORT = True
     OCI_NAMESPACE_WHITELIST: List[str] = []
 
@@ -112,6 +118,7 @@ class TestConfig(DefaultConfig):
     FEATURE_EDIT_QUOTA = True
     FEATURE_VERIFY_QUOTA = True
     FEATURE_QUOTA_SUPPRESS_FAILURES = False
+    FEATURE_QUOTA_NOTIFICATIONS = True
     DEFAULT_SYSTEM_REJECT_QUOTA_BYTES = 0
     FEATURE_PROXY_CACHE = True
     PERMANENTLY_DELETE_TAGS = True
@@ -128,5 +135,11 @@ class TestConfig(DefaultConfig):
     AUTOPRUNE_FETCH_TAGS_PAGE_LIMIT = 2
     AUTOPRUNE_FETCH_REPOSITORIES_PAGE_LIMIT = 2
     FEATURE_IMAGE_EXPIRY_TRIGGER = True
+    FEATURE_IMAGE_PULL_STATS = True
+    PULL_METRICS_REDIS = {"host": "localhost", "port": 6379, "db": 1}
 
     CDN_SPECIFIC_NAMESPACES = ["redhat"]
+
+    DEFAULT_UI = "angular"
+
+    FEATURE_OTEL_TRACING = True

@@ -1,14 +1,22 @@
-import {useEffect, useState} from 'react';
+import {useEffect, useMemo, useState} from 'react';
 import {
   Vulnerability,
   Feature,
   VulnerabilitySeverity,
   VulnerabilityOrder,
+  Layer,
 } from 'src/resources/TagResource';
-import {Table, Thead, Tr, Th, Tbody, Td} from '@patternfly/react-table';
+import {
+  Table,
+  Tbody,
+  Td,
+  Th,
+  ThProps,
+  Thead,
+  Tr,
+} from '@patternfly/react-table';
 import {
   PageSection,
-  PageSectionVariants,
   Spinner,
   Title,
   Toolbar,
@@ -23,13 +31,26 @@ import {getSeverityColor} from 'src/libs/utils';
 import {VulnerabilityStats} from '../SecurityReport/SecurityReportChart';
 import {ToolbarPagination} from 'src/components/toolbar/ToolbarPagination';
 import {PackagesListItem} from './Types';
+import {usePaginatedSortableTable} from '../../../hooks/usePaginatedSortableTable';
 
 const columnNames = {
   PackageName: 'Package Name',
   PackageVersion: 'Package Version',
   Vulnerabilities: 'Vulnerabilities',
   RemainingAfterUpgrade: 'Remaining After Upgrade',
+  IntroducedInLayer: 'Introduced In Layer',
 };
+
+function getLayerCommand(
+  feature: Feature,
+  layerMap: Map<string, string | null>,
+): string | null {
+  if (!feature.AddedBy) {
+    return null;
+  }
+  const addedByDigest = feature.AddedBy.split('.')[0];
+  return layerMap.get(addedByDigest) ?? null;
+}
 
 function sortPackages(packagesList: PackagesListItem[]) {
   return packagesList.sort((p1, p2) => {
@@ -58,6 +79,7 @@ function getVulnerabilitiesCount(
     [VulnerabilitySeverity.Negligible]: 0,
     [VulnerabilitySeverity.Unknown]: 0,
     [VulnerabilitySeverity.None]: 0,
+    Pending: 0,
   };
 
   for (let i = 0; i < vulnerabilities.length; i++) {
@@ -93,14 +115,19 @@ function TableTitle() {
   return <Title headingLevel={'h1'}> Packages </Title>;
 }
 
-function TableHead() {
+function TableHead({
+  getSortableSort,
+}: {
+  getSortableSort: (columnIndex: number) => ThProps['sort'];
+}) {
   return (
     <Thead>
       <Tr>
-        <Th>{columnNames.PackageName}</Th>
-        <Th>{columnNames.PackageVersion}</Th>
-        <Th>{columnNames.Vulnerabilities}</Th>
-        <Th>{columnNames.RemainingAfterUpgrade}</Th>
+        <Th sort={getSortableSort(0)}>{columnNames.PackageName}</Th>
+        <Th sort={getSortableSort(1)}>{columnNames.PackageVersion}</Th>
+        <Th sort={getSortableSort(2)}>{columnNames.Vulnerabilities}</Th>
+        <Th sort={getSortableSort(3)}>{columnNames.RemainingAfterUpgrade}</Th>
+        <Th sort={getSortableSort(4)}>{columnNames.IntroducedInLayer}</Th>
       </Tr>
     </Thead>
   );
@@ -132,20 +159,42 @@ function VulnerabilitiesEntry(props: VulnerabilitiesEntryProps) {
   );
 }
 
-export default function PackagesTable({features}: PackagesProps) {
+export default function PackagesTable({features, layers}: PackagesProps) {
+  const layerCommandByDigest = useMemo(
+    () =>
+      new Map(
+        (layers ?? []).map((layer) => [
+          layer.blob_digest,
+          layer.command?.join(' ') || null,
+        ]),
+      ),
+    [layers],
+  );
+
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [packagesList, setPackagesList] = useState<PackagesListItem[]>([]);
   const [filteredPackagesList, setFilteredPackagesList] = useState<
     PackagesListItem[]
   >([]);
 
-  // Pagination state
-  const [page, setPage] = useState<number>(1);
-  const [perPage, setPerPage] = useState<number>(20);
-  const paginatedPackagList: PackagesListItem[] = filteredPackagesList.slice(
-    (page - 1) * perPage,
-    page * perPage,
-  );
+  // Use our sortable table hook for sorting and pagination
+  const {
+    paginatedData: paginatedPackageList,
+    getSortableSort,
+    paginationProps,
+  } = usePaginatedSortableTable(filteredPackagesList || [], {
+    columns: {
+      0: (item: PackagesListItem) => item.PackageName, // Package Name
+      1: (item: PackagesListItem) => item.CurrentVersion, // Package Version
+      2: (item: PackagesListItem) =>
+        VulnerabilityOrder[item.HighestVulnerabilitySeverity], // Vulnerabilities (by severity order)
+      3: (item: PackagesListItem) =>
+        VulnerabilityOrder[item.HighestVulnerabilitySeverityAfterFix], // Remaining After Upgrade (by severity order)
+      4: (item: PackagesListItem) => item.IntroducedInLayer || '', // Introduced In Layer
+    },
+    initialPerPage: 20,
+    initialSort: {columnIndex: 2, direction: 'asc'}, // Default sort: Vulnerabilities by severity (most severe first)
+  });
 
   useEffect(() => {
     if (features) {
@@ -155,6 +204,7 @@ export default function PackagesTable({features}: PackagesProps) {
           PackageName: feature.Name,
           CurrentVersion: feature.Version,
           Vulnerabilities: feature.Vulnerabilities,
+          IntroducedInLayer: getLayerCommand(feature, layerCommandByDigest),
 
           VulnerabilityCounts: getVulnerabilitiesCount(feature.Vulnerabilities),
           HighestVulnerabilitySeverity: getHighestVulnerabilitySeverity(
@@ -179,24 +229,24 @@ export default function PackagesTable({features}: PackagesProps) {
       setPackagesList([]);
       setFilteredPackagesList([]);
     }
-  }, [features]);
+  }, [features, layerCommandByDigest]);
 
   return (
-    <PageSection variant={PageSectionVariants.light}>
+    <PageSection hasBodyWrapper={false}>
       <TableTitle />
       <Toolbar>
         <ToolbarContent>
           <PackagesFilter
-            setPage={setPage}
+            setPage={paginationProps.setPage}
             packagesList={packagesList}
             setFilteredPackageList={setFilteredPackagesList}
           />
           <ToolbarPagination
             itemsList={filteredPackagesList}
-            perPage={perPage}
-            page={page}
-            setPage={setPage}
-            setPerPage={setPerPage}
+            perPage={paginationProps.perPage}
+            page={paginationProps.page}
+            setPage={paginationProps.setPage}
+            setPerPage={paginationProps.setPerPage}
             id="packages-table-pagination"
           />
         </ToolbarContent>
@@ -206,9 +256,9 @@ export default function PackagesTable({features}: PackagesProps) {
         data-testid="packages-table"
         variant="compact"
       >
-        <TableHead />
-        {paginatedPackagList.length !== 0 ? (
-          paginatedPackagList.map((pkg: PackagesListItem) => {
+        <TableHead getSortableSort={getSortableSort} />
+        {paginatedPackageList.length !== 0 ? (
+          paginatedPackageList.map((pkg: PackagesListItem) => {
             return (
               <Tbody key={pkg.PackageName + pkg.CurrentVersion}>
                 <Tr>
@@ -229,6 +279,9 @@ export default function PackagesTable({features}: PackagesProps) {
                       counts={pkg.VulnerabilityCountsAfterFix}
                       highestSeverity={pkg.HighestVulnerabilitySeverityAfterFix}
                     />
+                  </Td>
+                  <Td dataLabel={columnNames.IntroducedInLayer}>
+                    <span>{pkg.IntroducedInLayer || '(No Command)'}</span>
                   </Td>
                 </Tr>
               </Tbody>
@@ -251,10 +304,10 @@ export default function PackagesTable({features}: PackagesProps) {
       <Toolbar>
         <ToolbarPagination
           itemsList={filteredPackagesList}
-          perPage={perPage}
-          page={page}
-          setPage={setPage}
-          setPerPage={setPerPage}
+          perPage={paginationProps.perPage}
+          page={paginationProps.page}
+          setPage={paginationProps.setPage}
+          setPerPage={paginationProps.setPerPage}
         />
       </Toolbar>
     </PageSection>
@@ -263,6 +316,7 @@ export default function PackagesTable({features}: PackagesProps) {
 
 export interface PackagesProps {
   features: Feature[];
+  layers?: Layer[];
 }
 
 export interface VulnerabilitiesEntryProps {

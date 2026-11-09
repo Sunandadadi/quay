@@ -2,15 +2,17 @@ from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 
 import pytest
-from rediscluster.nodemanager import NodeManager
+from redis import RedisError
+from redis.cluster import ClusterNode, RedisCluster
 
 from data.cache import (
     InMemoryDataModelCache,
     MemcachedModelCache,
     NoopDataModelCache,
     RedisDataModelCache,
+    cache_key,
 )
-from data.cache.cache_key import CacheKey
+from data.cache.cache_key import CacheKey, for_manifest_referrers
 from data.cache.redis_cache import (
     REDIS_DRIVERS,
     ReadEndpointSupportedRedis,
@@ -22,10 +24,7 @@ DATA: Dict[str, Any] = {}
 TEST_CACHE_CONFIG = {
     "repository_blob_cache_ttl": "240s",
     "catalog_page_cache_ttl": "240s",
-    "namespace_geo_restrictions_cache_ttl": "240s",
     "active_repo_tags_cache_ttl": "240s",
-    "appr_applications_list_cache_ttl": "3600s",
-    "appr_show_package_cache_ttl": "3600s",
 }
 
 
@@ -57,6 +56,25 @@ def test_caching(cache_type):
     # Perform two retrievals, and make sure both return.
     assert cache.retrieve(key, lambda: {"a": 1234}) == {"a": 1234}
     assert cache.retrieve(key, lambda: {"a": 1234}) == {"a": 1234}
+
+
+@pytest.mark.parametrize(
+    "page_ttl, expected_gen_ttl",
+    [
+        ("120s", "240s"),
+        ("5m", "600s"),
+        ("1h", "7200s"),
+        ("1d", "172800s"),
+    ],
+)
+def test_generation_cache_handles_proper_time_inputs(page_ttl, expected_gen_ttl):
+    """
+    Verifies that gen_ttl cache is properly set for different values of page_ttl.
+    """
+    cache_config = {"active_repo_tags_cache_ttl": page_ttl}
+
+    gen_key = cache_key.for_active_repo_tags_gen("42", cache_config)
+    assert gen_key.expiration == expected_gen_ttl
 
 
 def test_memcache():
@@ -138,6 +156,18 @@ def test_memcache_should_cache():
         assert cache.retrieve(key, lambda: {"a": 2345}, should_cache=sc) == {"a": 2345}
 
 
+def test_manifest_referrers_cache_key_scopes_and_sanitizes_artifact_type():
+    unfiltered = for_manifest_referrers(14, "sha256:subject", TEST_CACHE_CONFIG)
+    filtered = for_manifest_referrers(
+        14, "sha256:subject", TEST_CACHE_CONFIG, artifact_type="application/example"
+    )
+
+    assert unfiltered.key == "manifest_referrers__14_sha256:subject"
+    assert filtered.key.startswith("manifest_referrers__14_sha256:subject_artifact_type_")
+    assert "application/example" not in filtered.key
+    assert len(filtered.key.rsplit("_", 1)[-1]) == 64
+
+
 def test_redis_cache():
     global DATA
     DATA = {}
@@ -147,6 +177,16 @@ def test_redis_cache():
 
     assert cache.retrieve(key, lambda: {"a": 1234}) == {"a": 1234}
     assert cache.retrieve(key, lambda: {"a": 1234}) == {"a": 1234}
+
+
+def test_redis_cache_invalidation_ignores_redis_errors():
+    client = MagicMock()
+    client.delete.side_effect = RedisError("connection lost")
+    cache = RedisDataModelCache(TEST_CACHE_CONFIG, client)
+
+    cache.invalidate(CacheKey("foo", "60m"))
+
+    client.delete.assert_called_once_with("foo")
 
 
 @pytest.mark.parametrize(
@@ -192,11 +232,35 @@ def test_redis_cache():
     ],
 )
 def test_redis_cache_config(cache_config, expected_exception):
-    with patch("rediscluster.nodemanager.NodeManager.initialize", MagicMock):
+    mock_cluster = MagicMock(spec=RedisCluster)
+    with patch.dict(REDIS_DRIVERS, {"rediscluster": mock_cluster}):
         if expected_exception is not None:
             with pytest.raises(expected_exception[0]) as e:
                 rc = redis_cache_from_config(cache_config)
             assert str(e.value) == expected_exception[1]
         else:
             rc = redis_cache_from_config(cache_config)
-            assert isinstance(rc, REDIS_DRIVERS[cache_config["engine"]])
+            if cache_config["engine"] == "rediscluster":
+                mock_cluster.assert_called_once()
+                call_kwargs = mock_cluster.call_args[1]
+                assert all(isinstance(n, ClusterNode) for n in call_kwargs["startup_nodes"])
+            else:
+                assert isinstance(rc, REDIS_DRIVERS[cache_config["engine"]])
+
+
+def test_redis_cluster_readonly_mode_backwards_compat():
+    """Test that legacy readonly_mode is converted to read_from_replicas."""
+    cache_config = {
+        "engine": "rediscluster",
+        "redis_config": {
+            "startup_nodes": [{"host": "127.0.0.1", "port": "6379"}],
+            "readonly_mode": True,
+        },
+    }
+    mock_cluster = MagicMock(spec=RedisCluster)
+    with patch.dict(REDIS_DRIVERS, {"rediscluster": mock_cluster}):
+        redis_cache_from_config(cache_config)
+        mock_cluster.assert_called_once()
+        call_kwargs = mock_cluster.call_args[1]
+        assert "readonly_mode" not in call_kwargs
+        assert call_kwargs["read_from_replicas"] is True

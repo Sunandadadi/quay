@@ -27,8 +27,9 @@ type DistributedStorageArgs struct {
 	AccessKey   string `default:"" validate:"" json:"access_key,omitempty" yaml:"access_key,omitempty"`
 	SecretKey   string `default:"" validate:"" json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
 	BucketName  string `default:"" validate:"" json:"bucket_name,omitempty" yaml:"bucket_name,omitempty"`
+	RegionName  string `default:"" validate:"" json:"region_name,omitempty" yaml:"region_name,omitempty"`
 
-	Signature string `default:"s3v2" validate: "" json:"signature_version,omitempty" yaml:"signature_version,omitempty"`
+	Signature string `default:"s3v2" validate:"" json:"signature_version,omitempty" yaml:"signature_version,omitempty"`
 	// Args for S3Storage
 	S3Bucket    string `default:"" validate:"" json:"s3_bucket,omitempty" yaml:"s3_bucket,omitempty"`
 	S3AccessKey string `default:"" validate:"" json:"s3_access_key,omitempty" yaml:"s3_access_key,omitempty"`
@@ -59,7 +60,9 @@ type DistributedStorageArgs struct {
 	Providers       map[string]interface{} `default:"" validate:"" json:"providers,omitempty" yaml:"providers,omitempty"`
 	StorageConfig   map[string]interface{} `default:"" validate:"" json:"storage_config,omitempty" yaml:"storage_config,omitempty"`
 	// Args for STSS3Storage
-	STSUserAccessKey string `default:"" validate:"" json:"sts_user_access_key,omitempty" yaml:"sts_user_access_key,omitempty"`
-	STSUserSecretKey string `default:"" validate:"" json:"sts_user_secret_key,omitempty" yaml:"sts_user_secret_key,omitempty"`
-	STSRoleArn       string `default:"" validate:"" json:"sts_role_arn,omitempty" yaml:"sts_role_arn,omitempty"`
+	STSUserAccessKey        string `default:"" validate:"" json:"sts_user_access_key,omitempty" yaml:"sts_user_access_key,omitempty"`
+	STSUserSecretKey        string `default:"" validate:"" json:"sts_user_secret_key,omitempty" yaml:"sts_user_secret_key,omitempty"`
+	STSRoleArn              string `default:"" validate:"" json:"sts_role_arn,omitempty" yaml:"sts_role_arn,omitempty"`
+	STSWebIdentityTokenFile string `default:"" validate:"" json:"sts_web_identity_token_file,omitempty" yaml:"sts_web_identity_token_file,omitempty"`
+	STSRoleSessionName      string `default:"" validate:"" json:"sts_role_session_name,omitempty" yaml:"sts_role_session_name,omitempty"`
 }

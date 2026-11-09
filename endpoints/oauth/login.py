@@ -1,7 +1,9 @@
 import logging
 import os
+import re
 import time
 from collections import namedtuple
+from urllib.parse import urlencode
 
 import recaptcha2
 from flask import Blueprint, abort, redirect, request, session, url_for
@@ -29,6 +31,31 @@ logger = logging.getLogger(__name__)
 client = app.config["HTTPCLIENT"]
 oauthlogin = Blueprint("oauthlogin", __name__)
 
+
+def get_pkce_code_verifier(login_service):
+    """
+    Safely extract PKCE code verifier from session for the given login service.
+
+    This function checks if PKCE is enabled for the login service, retrieves
+    the verifier from the session, and performs defensive type checking.
+
+    Args:
+        login_service: The OAuth login service object
+
+    Returns:
+        str: The PKCE code verifier if present and valid, None otherwise
+    """
+    if not (hasattr(login_service, "pkce_enabled") and login_service.pkce_enabled()):
+        return None
+
+    session_key = f"_oauth_pkce_{login_service.service_id()}"
+    data = session.pop(session_key, None)
+
+    if isinstance(data, dict) and "verifier" in data:
+        return data["verifier"]
+    return None
+
+
 oauthlogin_csrf_protect = csrf_protect(
     OAUTH_CSRF_TOKEN_NAME, "state", all_methods=True, check_header=False
 )
@@ -41,6 +68,54 @@ def _get_response(result):
         )
 
     return _perform_login(result.user_obj, result.service_name)
+
+
+# OAuth error codes from RFC 6749 - safe to pass through
+ALLOWED_OAUTH_ERRORS = {
+    "invalid_request",
+    "unauthorized_client",
+    "access_denied",
+    "unsupported_response_type",
+    "invalid_scope",
+    "server_error",
+    "temporarily_unavailable",
+}
+
+
+def _sanitize_error_message(error_message):
+    """
+    Sanitize error message for safe use in URL redirects.
+
+    React receives error messages via URL parameters (unlike Angular's
+    server-side rendering). This function prevents injection attacks
+    while preserving useful error information.
+
+    Args:
+        error_message: Untrusted error message from OAuth callback
+
+    Returns:
+        Sanitized error message safe for URL parameters
+    """
+    if not error_message:
+        return "Could not load user data. The token may have expired"
+
+    # Allow known OAuth error codes to pass through unchanged
+    if error_message in ALLOWED_OAUTH_ERRORS:
+        return error_message
+
+    # For custom messages: allow only safe characters
+    # Permits: letters, numbers, spaces, and common punctuation
+    sanitized = re.sub(r"[^a-zA-Z0-9\s\.\-_@,\':()]", "", error_message)
+
+    # Limit length to prevent abuse
+    if len(sanitized) > 250:
+        sanitized = sanitized[:250]
+
+    # If sanitization removed everything, use default message
+    if not sanitized.strip():
+        return "Could not load user data. The token may have expired"
+
+    return sanitized.strip()
 
 
 def _render_ologin_error(service_name, error_message=None, register_redirect=False):
@@ -59,7 +134,47 @@ def _render_ologin_error(service_name, error_message=None, register_redirect=Fal
         "user_creation": user_creation,
         "register_redirect": register_redirect,
     }
+    # Determine UI type: check user preference (cookie) first, then system default (config)
+    should_use_react = False
+    patternfly_cookie = request.cookies.get("patternfly", "")
 
+    if patternfly_cookie in ["true", "react"]:
+        should_use_react = True
+    elif patternfly_cookie:
+        should_use_react = False
+    else:  # No cookie: use DEFAULT_UI
+        should_use_react = app.config.get("DEFAULT_UI", "react").lower() == "react"
+
+    if should_use_react:
+        # React UI: redirect to dedicated OAuth error page
+        params_dict = {
+            "error": "oauth_error",
+            "error_description": _sanitize_error_message(error_message),
+            "provider": service_name,
+        }
+
+        if user_creation:
+            params_dict["user_creation"] = "true"
+
+        if register_redirect:
+            params_dict["register_redirect"] = "true"
+
+        # Determine if user is authenticated based on the request context
+        # The attach/cli endpoints require authentication, callback does not
+        authenticated_user = get_authenticated_user()
+
+        if authenticated_user:
+            params_dict["authenticated"] = "true"
+            params_dict["username"] = authenticated_user.username
+
+        params = urlencode(params_dict)
+
+        # Use the configured app URL to construct the redirect, never trust
+        # client-supplied headers (Host, Referer) for redirect targets.
+        app_url = get_app_url()
+        return redirect(f"{app_url}/oauth-error?{params}")
+
+    # Angular UI: render error in template
     resp = index("", error_info=error_info)
     resp.status_code = 400
     return resp
@@ -117,9 +232,13 @@ def _register_service(login_service):
 
         # Exchange the OAuth code for login information.
         code = request.values.get("code")
+        kwargs = {}
+        verifier = get_pkce_code_verifier(login_service)
+        if verifier:
+            kwargs["code_verifier"] = verifier
         try:
             lid, lusername, lemail, additional_info = login_service.exchange_code_for_login(
-                app.config, client, code, ""
+                app.config, client, code, "", **kwargs
             )
         except OAuthLoginException as ole:
             logger.exception("Got login exception")
@@ -170,9 +289,13 @@ def _register_service(login_service):
 
         # Exchange the OAuth code for login information.
         code = request.values.get("code")
+        kwargs = {}
+        verifier = get_pkce_code_verifier(login_service)
+        if verifier:
+            kwargs["code_verifier"] = verifier
         try:
             lid, lusername, _, _ = login_service.exchange_code_for_login(
-                app.config, client, code, "/attach"
+                app.config, client, code, "/attach", **kwargs
             )
         except OAuthLoginException as ole:
             return _render_ologin_error(login_service.service_name(), str(ole))
@@ -221,8 +344,14 @@ def _register_service(login_service):
 
         # Exchange the OAuth code for the ID token.
         code = request.values.get("code")
+        kwargs = {}
+        verifier = get_pkce_code_verifier(login_service)
+        if verifier:
+            kwargs["code_verifier"] = verifier
         try:
-            idtoken, _ = login_service.exchange_code_for_tokens(app.config, client, code, "/cli")
+            idtoken, _ = login_service.exchange_code_for_tokens(
+                app.config, client, code, "/cli", **kwargs
+            )
         except OAuthLoginException as ole:
             return _render_ologin_error(login_service.service_name(), str(ole))
 

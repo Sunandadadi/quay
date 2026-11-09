@@ -1,22 +1,24 @@
 """
 Manage the manifests of a repository.
 """
+
 import json
 import logging
-from datetime import datetime
 from typing import List, Optional
 
 from flask import request
 
-from app import label_validator, storage
+import features
+from app import app, label_validator, storage
 from data.model import InvalidLabelKeyException, InvalidMediaTypeException
+from data.model.oci.retriever import RepositoryContentRetriever
+from data.model.pull_statistics import get_manifest_pull_statistics
 from data.registry_model import registry_model
 from digest import digest_tools
 from endpoints.api import (
     RepositoryParamResource,
     abort,
     api,
-    disallow_for_app_repositories,
     disallow_for_non_normal_repositories,
     disallow_for_user_namespace,
     format_date,
@@ -28,9 +30,11 @@ from endpoints.api import (
     require_repo_read,
     require_repo_write,
     resource,
+    show_if,
     validate_json_request,
 )
 from endpoints.exception import NotFound
+from util.parsing import truthy_bool
 from util.validation import VALID_LABEL_KEY_REGEX
 
 BASE_MANIFEST_ROUTE = '/v1/repository/<apirepopath:repository>/manifest/<regex("{0}"):manifestref>'
@@ -87,13 +91,45 @@ def _manifest_dict(manifest):
         "is_manifest_list": manifest.is_manifest_list,
         "manifest_data": manifest.internal_manifest_bytes.as_unicode(),
         "config_media_type": manifest.config_media_type,
-        "layers_compressed_size": manifest.layers_compressed_size
-        if not manifest.is_manifest_list
-        else 0,
+        "layers_compressed_size": (
+            manifest.layers_compressed_size if not manifest.is_manifest_list else 0
+        ),
         "layers": (
-            [_layer_dict(lyr.layer_info, idx) for idx, lyr in enumerate(layers)] if layers else None
+            [_layer_dict(lyr.layer_info, idx) for idx, lyr in enumerate(layers)]
+            if layers is not None
+            else None
         ),
     }
+
+
+def _find_modelcard_layer(parsed):
+    manifest_layer_modelcard_annotation = app.config["UI_MODELCARD_LAYER_ANNOTATION"]
+    for layer in parsed.filesystem_layers:
+        if (
+            hasattr(layer, "annotations")
+            and manifest_layer_modelcard_annotation.items() <= layer.annotations.items()
+        ):
+            return str(layer.digest)
+
+
+def _get_modelcard_layer_digest(parsed):
+    manifest_modelcard_annotation = app.config["UI_MODELCARD_ANNOTATION"]
+
+    layer_digest = None
+    if parsed.artifact_type and parsed.artifact_type == app.config["UI_MODELCARD_ARTIFACT_TYPE"]:
+        layer_digest = (
+            str(parsed.filesystem_layers[-1].digest)
+            if len(parsed.filesystem_layers) == 1
+            else _find_modelcard_layer(parsed)
+        )
+    elif (
+        manifest_modelcard_annotation
+        and hasattr(parsed, "annotations")
+        and manifest_modelcard_annotation.items() <= parsed.annotations.items()
+    ):
+        layer_digest = _find_modelcard_layer(parsed)
+
+    return layer_digest
 
 
 @resource(MANIFEST_DIGEST_ROUTE)
@@ -104,10 +140,16 @@ class RepositoryManifest(RepositoryParamResource):
     Resource for retrieving a specific repository manifest.
     """
 
-    @require_repo_read(allow_for_superuser=True)
+    @require_repo_read(allow_for_superuser=True, allow_for_global_readonly_superuser=True)
     @nickname("getRepoManifest")
-    @disallow_for_app_repositories
-    def get(self, namespace_name, repository_name, manifestref):
+    @parse_args()
+    @query_param(
+        "include_modelcard",
+        "If specified, include modelcard markdown from image, if any",
+        type=truthy_bool,
+        default=False,
+    )
+    def get(self, namespace_name, repository_name, manifestref, parsed_args):
         repo_ref = registry_model.lookup_repository(namespace_name, repository_name)
         if repo_ref is None:
             raise NotFound()
@@ -120,7 +162,18 @@ class RepositoryManifest(RepositoryParamResource):
         if manifest is None or manifest.internal_manifest_bytes.as_unicode() == "":
             raise NotFound()
 
-        return _manifest_dict(manifest)
+        manifest_dict = _manifest_dict(manifest)
+
+        if features.UI_MODELCARD and parsed_args["include_modelcard"]:
+            parsed = manifest.get_parsed_manifest()
+            layer_digest = _get_modelcard_layer_digest(parsed)
+
+            if layer_digest:
+                retriever = RepositoryContentRetriever(repo_ref._db_id, storage)
+                content = retriever.get_blob_bytes_with_digest(layer_digest)
+                manifest_dict["modelcard"] = content.decode("utf-8")
+
+        return manifest_dict
 
 
 @resource(MANIFEST_DIGEST_ROUTE + "/labels")
@@ -158,9 +211,8 @@ class RepositoryManifestLabels(RepositoryParamResource):
         },
     }
 
-    @require_repo_read(allow_for_superuser=True)
+    @require_repo_read(allow_for_superuser=True, allow_for_global_readonly_superuser=True)
     @nickname("listManifestLabels")
-    @disallow_for_app_repositories
     @parse_args()
     @query_param(
         "filter",
@@ -185,7 +237,6 @@ class RepositoryManifestLabels(RepositoryParamResource):
 
     @require_repo_write(allow_for_superuser=True)
     @nickname("addManifestLabel")
-    @disallow_for_app_repositories
     @disallow_for_non_normal_repositories
     @disallow_for_user_namespace
     @validate_json_request("AddLabel")
@@ -261,9 +312,8 @@ class ManageRepositoryManifestLabel(RepositoryParamResource):
     Resource for managing the labels on a specific repository manifest.
     """
 
-    @require_repo_read(allow_for_superuser=True)
+    @require_repo_read(allow_for_superuser=True, allow_for_global_readonly_superuser=True)
     @nickname("getManifestLabel")
-    @disallow_for_app_repositories
     def get(self, namespace_name, repository_name, manifestref, labelid):
         """
         Retrieves the label with the specific ID under the manifest.
@@ -284,7 +334,6 @@ class ManageRepositoryManifestLabel(RepositoryParamResource):
 
     @require_repo_write(allow_for_superuser=True)
     @nickname("deleteManifestLabel")
-    @disallow_for_app_repositories
     @disallow_for_non_normal_repositories
     @disallow_for_user_namespace
     def delete(self, namespace_name, repository_name, manifestref, labelid):
@@ -314,3 +363,52 @@ class ManageRepositoryManifestLabel(RepositoryParamResource):
 
         log_action("manifest_label_delete", namespace_name, metadata, repo_name=repository_name)
         return "", 204
+
+
+@resource(
+    '/v1/repository/<apirepopath:repository>/manifest/<regex("{0}"):manifestref>/pull_statistics'.format(
+        digest_tools.DIGEST_PATTERN
+    )
+)
+@path_param("repository", "The full path of the repository. e.g. namespace/name")
+@path_param("manifestref", "The digest of the manifest")
+@show_if(features.IMAGE_PULL_STATS)
+class RepositoryManifestPullStatistics(RepositoryParamResource):
+    """
+    Resource for retrieving pull statistics for a specific repository manifest.
+    """
+
+    @require_repo_read(allow_for_superuser=True, allow_for_global_readonly_superuser=True)
+    @nickname("getManifestPullStatistics")
+    def get(self, namespace_name, repository_name, manifestref):
+        """
+        Get pull statistics for a specific manifest.
+        """
+
+        repo_ref = registry_model.lookup_repository(namespace_name, repository_name)
+        if repo_ref is None:
+            raise NotFound()
+
+        # Get the manifest reference
+        manifest = registry_model.lookup_manifest_by_digest(repo_ref, manifestref)
+        if manifest is None:
+            raise NotFound()
+
+        # Get pull statistics from database
+        manifest_stats = get_manifest_pull_statistics(repo_ref.id, manifestref)
+
+        if not manifest_stats:
+            # Return default values if no statistics are available
+            return {
+                "manifest_digest": manifestref,
+                "manifest_pull_count": 0,
+                "last_manifest_pull_date": None,
+            }
+
+        last_pull = manifest_stats.get("last_pull_date")
+
+        return {
+            "manifest_digest": manifestref,
+            "manifest_pull_count": manifest_stats.get("pull_count", 0),
+            "last_manifest_pull_date": format_date(last_pull) if last_pull else None,
+        }

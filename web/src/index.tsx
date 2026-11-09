@@ -1,11 +1,13 @@
 import * as React from 'react';
-import * as ReactDOM from 'react-dom';
+import {createRoot} from 'react-dom/client';
 import reportWebVitals from './reportWebVitals';
 import {RecoilRoot} from 'recoil';
 import {QueryClient, QueryClientProvider} from '@tanstack/react-query';
+import {UIProvider} from './contexts/UIContext';
 
 // Load App after patternfly so custom CSS that overrides patternfly doesn't require !important
 import App from './App';
+import {AppWithFreshLogin} from './AppWithFreshLogin';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -16,15 +18,21 @@ const queryClient = new QueryClient({
   },
 });
 
-ReactDOM.render(
+const container = document.getElementById('root');
+const root = createRoot(container);
+
+root.render(
   <React.StrictMode>
     <RecoilRoot>
-      <QueryClientProvider client={queryClient}>
-        <App />
-      </QueryClientProvider>
+      <UIProvider>
+        <QueryClientProvider client={queryClient}>
+          <AppWithFreshLogin>
+            <App />
+          </AppWithFreshLogin>
+        </QueryClientProvider>
+      </UIProvider>
     </RecoilRoot>
   </React.StrictMode>,
-  document.getElementById('root'),
 );
 
 // If you want to start measuring performance in your app, pass a function

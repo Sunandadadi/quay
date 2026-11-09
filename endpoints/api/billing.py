@@ -1,6 +1,7 @@
 """
 Billing information, subscriptions, and plan information.
 """
+
 import datetime
 import json
 import time
@@ -13,7 +14,10 @@ import features
 from app import app, billing, marketplace_subscriptions, marketplace_users
 from auth import scopes
 from auth.auth_context import get_authenticated_user
-from auth.permissions import AdministerOrganizationPermission
+from auth.permissions import (
+    AdministerOrganizationPermission,
+    GlobalReadOnlySuperUserPermission,
+)
 from data import model
 from data.billing import PLANS, get_plan, get_plan_using_rh_sku
 from data.model import InvalidOrganizationException, organization_skus
@@ -379,7 +383,7 @@ class OrganizationCard(ApiResource):
         Get the organization's credit card.
         """
         permission = AdministerOrganizationPermission(orgname)
-        if permission.can():
+        if permission.can() or GlobalReadOnlySuperUserPermission().can():
             organization = model.organization.get_organization(orgname)
             return get_card(organization)
 
@@ -702,7 +706,7 @@ class OrganizationPlan(ApiResource):
         """
         cus = None
         permission = AdministerOrganizationPermission(orgname)
-        if permission.can():
+        if permission.can() or GlobalReadOnlySuperUserPermission().can():
             private_repos = model.user.get_private_repo_count(orgname)
             organization = model.organization.get_organization(orgname)
             if organization.stripe_id:
@@ -761,7 +765,7 @@ class OrganizationInvoiceList(ApiResource):
         List the invoices for the specified orgnaization.
         """
         permission = AdministerOrganizationPermission(orgname)
-        if permission.can():
+        if permission.can() or GlobalReadOnlySuperUserPermission().can():
             organization = model.organization.get_organization(orgname)
             if not organization.stripe_id:
                 raise NotFound()
@@ -887,7 +891,7 @@ class OrganizationInvoiceFieldList(ApiResource):
         List the invoice fields for the organization.
         """
         permission = AdministerOrganizationPermission(orgname)
-        if permission.can():
+        if permission.can() or GlobalReadOnlySuperUserPermission().can():
             organization = model.organization.get_organization(orgname)
             if not organization.stripe_id:
                 raise NotFound()
@@ -962,7 +966,7 @@ class OrganizationRhSku(ApiResource):
         Get sku assigned to org
         """
         permission = AdministerOrganizationPermission(orgname)
-        if permission.can():
+        if permission.can() or GlobalReadOnlySuperUserPermission().can():
             organization = model.organization.get_organization(orgname)
             query = model.organization_skus.get_org_subscriptions(organization.id)
 
@@ -1136,10 +1140,13 @@ class UserSkuList(ApiResource):
             )
 
         child_subscriptions = []
+        subscriptions_to_return = []
+
         for subscription in user_subscriptions:
             bound_to_org, bindings = organization_skus.subscription_bound_to_org(subscription["id"])
             # fill in information for whether a subscription is bound to an org
             metadata = get_plan_using_rh_sku(subscription["sku"])
+            subscription["metadata"] = metadata
             if bound_to_org:
                 # special case for MW02702, which can be split across orgs
                 if subscription["sku"] == "MW02702":
@@ -1149,9 +1156,9 @@ class UserSkuList(ApiResource):
                         # the response body
                         child_subscription = subscription.copy()
                         child_subscription["quantity"] = binding["quantity"]
-                        child_subscription[
-                            "assigned_to_org"
-                        ] = model.organization.get_organization_by_id(binding["org_id"]).username
+                        child_subscription["assigned_to_org"] = (
+                            model.organization.get_organization_by_id(binding["org_id"]).username
+                        )
                         child_subscription["metadata"] = metadata
                         child_subscriptions.append(child_subscription)
 
@@ -1161,19 +1168,16 @@ class UserSkuList(ApiResource):
                     if remaining_unbound > 0:
                         subscription["quantity"] = remaining_unbound
                         subscription["assigned_to_org"] = None
-                    else:
-                        # all quantities for this subscription are bound, remove it from
-                        # the response body
-                        user_subscriptions.remove(subscription)
+                        subscriptions_to_return.append(subscription)
 
                 else:
                     # default case, only one org is bound
                     subscription["assigned_to_org"] = model.organization.get_organization_by_id(
                         bindings[0]["org_id"]
                     ).username
+                    subscriptions_to_return.append(subscription)
             else:
                 subscription["assigned_to_org"] = None
+                subscriptions_to_return.append(subscription)
 
-            subscription["metadata"] = metadata
-
-        return user_subscriptions + child_subscriptions
+        return subscriptions_to_return + child_subscriptions

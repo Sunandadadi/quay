@@ -33,6 +33,7 @@ import {DrawerContentType} from '../Types';
 import {NotificationsColumnNames} from './ColumnNames';
 import NotificationsKebab from './NotificationsKebab';
 import NotificationsToolbar from './NotificationsToolbar';
+import {usePaginatedSortableTable} from '../../../hooks/usePaginatedSortableTable';
 
 export default function Notifications({
   org,
@@ -45,17 +46,29 @@ export default function Notifications({
   const [expandedUuids, setExpandedUuids] = useState<string[]>([]);
   const {
     notifications,
+    filteredNotifications,
     loading,
     error,
-    paginatedNotifications,
-    page,
-    setPage,
-    perPage,
-    setPerPage,
     filter,
     setFilter,
     resetFilter,
   } = useNotifications(org, repo);
+
+  const {
+    paginatedData: paginatedNotifications,
+    getSortableSort,
+    paginationProps,
+  } = usePaginatedSortableTable(filteredNotifications || [], {
+    columns: {
+      2: (item: RepoNotification) => item.title || '(Untitled)', // Title
+      3: (item: RepoNotification) => item.event, // Event
+      4: (item: RepoNotification) => item.method, // Notification
+      5: (item: RepoNotification) =>
+        isNotificationEnabled(item) ? 'Enabled' : 'Disabled', // Status
+    },
+    initialPerPage: 20,
+    initialSort: {columnIndex: 2, direction: 'asc'}, // Default sort: Title ascending
+  });
 
   const isExpanded = (uuid: string) => expandedUuids.includes(uuid);
   const setExpanded = (uuid: string, isExpanding = true) =>
@@ -76,6 +89,28 @@ export default function Notifications({
       return isSelecting ? [...others, notification] : others;
     });
   };
+
+  useEffect(() => {
+    paginationProps.setPage(1);
+  }, [filter, paginationProps.setPage]);
+
+  useEffect(() => {
+    const filteredUuids = new Set(
+      filteredNotifications.map((notification) => notification.uuid),
+    );
+    if (
+      selectedNotifications.every((notification) =>
+        filteredUuids.has(notification.uuid),
+      )
+    ) {
+      return;
+    }
+    setSelectedNotifications((prevSelected) =>
+      prevSelected.filter((notification) =>
+        filteredUuids.has(notification.uuid),
+      ),
+    );
+  }, [filteredNotifications, selectedNotifications]);
 
   // Close drawer if navigating away from notification settings
   useEffect(() => {
@@ -116,13 +151,13 @@ export default function Notifications({
       <NotificationsToolbar
         org={org}
         repo={repo}
-        allItems={notifications}
+        allItems={filteredNotifications}
         paginatedItems={paginatedNotifications}
         selectedItems={selectedNotifications}
-        page={page}
-        setPage={setPage}
-        perPage={perPage}
-        setPerPage={setPerPage}
+        page={paginationProps.page}
+        setPage={paginationProps.setPage}
+        perPage={paginationProps.perPage}
+        setPerPage={paginationProps.setPerPage}
         onItemSelect={onSelectNotification}
         deselectAll={() => setSelectedNotifications([])}
         setDrawerContent={props.setDrawerContent}
@@ -130,15 +165,21 @@ export default function Notifications({
         setFilter={setFilter}
         resetFilter={resetFilter}
       />
-      <Table aria-label="Repository notifications table" variant="compact">
+      <Table
+        aria-label="Repository notifications table"
+        data-testid="notifications-table"
+        variant="compact"
+      >
         <Thead>
           <Tr>
             <Th />
             <Th />
-            <Th>{NotificationsColumnNames.title}</Th>
-            <Th>{NotificationsColumnNames.event}</Th>
-            <Th>{NotificationsColumnNames.notification}</Th>
-            <Th>{NotificationsColumnNames.status}</Th>
+            <Th sort={getSortableSort(2)}>{NotificationsColumnNames.title}</Th>
+            <Th sort={getSortableSort(3)}>{NotificationsColumnNames.event}</Th>
+            <Th sort={getSortableSort(4)}>
+              {NotificationsColumnNames.notification}
+            </Th>
+            <Th sort={getSortableSort(5)}>{NotificationsColumnNames.status}</Th>
             <Th />
           </Tr>
         </Thead>
@@ -190,7 +231,11 @@ export default function Notifications({
               </Td>
             </Tr>
             <Tr isExpanded={isExpanded(notification.uuid)}>
-              <Td colSpan={7} id="notification-config-details">
+              <Td
+                colSpan={7}
+                id="notification-config-details"
+                data-testid="notification-config-details"
+              >
                 <ExpandableRowContent>
                   <NotificationConfig notification={notification} />
                 </ExpandableRowContent>
@@ -293,16 +338,12 @@ function NotificationConfig({notification}: {notification: RepoNotification}) {
           </Conditional>
         </>
       );
-    // TODO: Quay notifications not supported in new UI until
-    // notification header has been implemented
-    // case NotificationMethodType.quaynotification:
-    //   return (
-    //     <Flex direction={{default: 'column'}}>
-    //       <FlexItem style={{marginBottom: 0}}>
-    //         {notificationMethod.title}
-    //       </FlexItem>
-    //     </Flex>
-    //   );
+    case NotificationMethodType.quaynotification:
+      return (
+        <FlexItem id="quay-notification-recipient" style={{color: 'grey'}}>
+          Recipient: {notification.config?.target?.name}
+        </FlexItem>
+      );
   }
 }
 

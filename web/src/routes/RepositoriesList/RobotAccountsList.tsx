@@ -1,22 +1,21 @@
 import {
   PageSection,
-  PageSectionVariants,
   PanelFooter,
   Spinner,
-  TextContent,
-  Text,
-  TextVariants,
+  Content,
+  ContentVariants,
   DropdownItem,
 } from '@patternfly/react-core';
 import {
-  Table,
   ExpandableRowContent,
-  Thead,
-  Tr,
-  Th,
+  Table,
   Tbody,
   Td,
+  Th,
+  Thead,
+  Tr,
 } from '@patternfly/react-table';
+
 import {Link} from 'react-router-dom';
 import {RobotAccountColumnNames} from './ColumnNames';
 
@@ -49,9 +48,10 @@ import {
 import {useRobotRepoPermissions} from 'src/hooks/useRobotAccounts';
 import RobotTokensModal from 'src/components/modals/RobotTokensModal';
 import {SearchState} from 'src/components/toolbar/SearchTypes';
-import {AlertVariant} from 'src/atoms/AlertState';
-import {useAlerts} from 'src/hooks/UseAlerts';
+import {AlertVariant, useUI} from 'src/contexts/UIContext';
+import {useQuayConfig} from 'src/hooks/UseQuayConfig';
 import {RobotFederationModal} from 'src/components/modals/RobotFederationModal';
+import {usePaginatedSortableTable} from '../../hooks/usePaginatedSortableTable';
 
 export const RepoPermissionDropdownItems = [
   {
@@ -111,20 +111,22 @@ export default function RobotAccountsList(props: RobotAccountsListProps) {
   const [isRobotFederationModalOpen, setRobotFederationModalOpen] =
     useState<boolean>(false);
 
-  const {addAlert} = useAlerts();
+  const {addAlert} = useUI();
+  const quayConfig = useQuayConfig();
+  const robotsDisallowed = quayConfig?.config?.ROBOTS_DISALLOW === true;
 
-  const {robotAccountsForOrg, page, perPage, setPage, setPerPage} =
-    useRobotAccounts({
-      name: props.organizationName,
-      onSuccess: () => {
-        setLoading(false);
-      },
-      onError: (err) => {
-        setErrTitle('Failed to fetch Robot Accounts');
-        setErr([addDisplayError('Unable to fetch robot accounts', err)]);
-        setLoading(false);
-      },
-    });
+  const {robotAccountsForOrg} = useRobotAccounts({
+    name: props.organizationName,
+    enabled: true,
+    onSuccess: () => {
+      setLoading(false);
+    },
+    onError: (err) => {
+      setErrTitle('Failed to fetch Robot Accounts');
+      setErr([addDisplayError('Unable to fetch robot accounts', err)]);
+      setLoading(false);
+    },
+  });
 
   const [search, setSearch] = useState<SearchState>({
     query: '',
@@ -149,12 +151,10 @@ export default function RobotAccountsList(props: RobotAccountsListProps) {
   // Fetching teams
   useQuery(
     ['organization', props.organizationName, 'teams'],
-    ({signal}) => {
-      fetchOrg(props.organizationName, signal).then((response) => {
-        setTeams(Object['values'](response?.teams));
-        return response?.teams;
-      });
-      return [];
+    async ({signal}) => {
+      const response = await fetchOrg(props.organizationName, signal);
+      setTeams(Object['values'](response?.teams));
+      return response?.teams;
     },
     {
       enabled: !props.isUser,
@@ -167,18 +167,31 @@ export default function RobotAccountsList(props: RobotAccountsListProps) {
     },
   );
 
-  const filteredRobotAccounts =
+  const searchFilter =
     search.query !== ''
-      ? robotAccountsList.filter((robotAccount) => {
-          const RobotAccountname = robotAccount.name;
-          return RobotAccountname.includes(search.query);
-        })
-      : robotAccountsList;
+      ? (robotAccount: IRobot) => robotAccount.name.includes(search.query)
+      : undefined;
 
-  const paginatedRobotAccountList = filteredRobotAccounts?.slice(
-    page * perPage - perPage,
-    page * perPage - perPage + perPage,
-  );
+  const {
+    paginatedData: paginatedRobotAccountList,
+    filteredData: filteredRobotAccounts,
+    getSortableSort,
+    paginationProps,
+  } = usePaginatedSortableTable(robotAccountsList || [], {
+    columns: {
+      2: (item: IRobot) => item.name, // Robot account name
+      3: (item: IRobot) => item.teams?.length || 0, // Teams count
+      4: (item: IRobot) => item.repositories?.length || 0, // Repositories count
+      5: (item: IRobot) =>
+        item.last_accessed === 'Never'
+          ? 0
+          : new Date(item.last_accessed).getTime(), // Last accessed (timestamp for proper date sorting)
+      6: (item: IRobot) => item.created, // Created
+    },
+    filter: searchFilter,
+    initialPerPage: 20,
+    initialSort: {columnIndex: 6, direction: 'desc'}, // Default sort: Created descending
+  });
 
   // Expandable Row Logic
   const [expandedRobotNames, setExpandedRobotNames] = useState<string[]>([]);
@@ -476,15 +489,21 @@ export default function RobotAccountsList(props: RobotAccountsListProps) {
       <Empty
         title="There are no viewable robot accounts for this repository"
         icon={CubesIcon}
-        body="Either no robot accounts exist yet or you may not have permission to view any. If you have the permissions, you may create robot accounts in this repository."
+        body={
+          robotsDisallowed
+            ? 'Robot accounts have been disabled. Please contact your administrator.'
+            : 'Either no robot accounts exist yet or you may not have permission to view any. If you have the permissions, you may create robot accounts in this repository.'
+        }
         button={
-          <ToolbarButton
-            id=""
-            buttonValue="Create robot account"
-            Modal={createRobotModal}
-            isModalOpen={isCreateRobotModalOpen}
-            setModalOpen={setCreateRobotModalOpen}
-          />
+          !robotsDisallowed ? (
+            <ToolbarButton
+              id=""
+              buttonValue="Create robot account"
+              Modal={createRobotModal}
+              isModalOpen={isCreateRobotModalOpen}
+              setModalOpen={setCreateRobotModalOpen}
+            />
+          ) : null
         }
       />
     );
@@ -492,18 +511,18 @@ export default function RobotAccountsList(props: RobotAccountsListProps) {
 
   if (loading && paginatedRobotAccountList?.length == 0) {
     return (
-      <Table aria-label="Empty state table" borders={false} variant="compact">
+      <Table aria-label="Empty state table" variant="compact">
         <Tbody>
           <Tr>
-            <Td colSpan={8} textCenter={true}>
+            <Td colSpan={8} style={{textAlign: 'center'}}>
               <Spinner diameter="50px" />
             </Td>
           </Tr>
           <Tr>
-            <Td colSpan={8} textCenter={true}>
-              <TextContent>
-                <Text component={TextVariants.h3}>Loading</Text>
-              </TextContent>
+            <Td colSpan={8} style={{textAlign: 'center'}}>
+              <Content>
+                <Content component={ContentVariants.h3}>Loading</Content>
+              </Content>
             </Td>
           </Tr>
         </Tbody>
@@ -512,7 +531,7 @@ export default function RobotAccountsList(props: RobotAccountsListProps) {
   }
   return (
     <>
-      <PageSection variant={PageSectionVariants.light}>
+      <PageSection hasBodyWrapper={false}>
         <ErrorModal title={errTitle} error={err} setError={setErr} />
         <RobotAccountsToolBar
           search={search}
@@ -526,17 +545,18 @@ export default function RobotAccountsList(props: RobotAccountsListProps) {
           pageModal={createRobotModal}
           isModalOpen={isCreateRobotModalOpen}
           setModalOpen={setCreateRobotModalOpen}
+          hideCreateButton={robotsDisallowed}
           isKebabOpen={isKebabOpen}
           setKebabOpen={setKebabOpen}
           kebabItems={kebabItems}
           deleteModal={bulkDeleteRobotAccountModal}
           deleteKebabIsOpen={isDeleteModalOpen}
           setDeleteModalOpen={setDeleteModalOpen}
-          perPage={perPage}
-          page={page}
-          setPage={setPage}
-          setPerPage={setPerPage}
-          total={filteredRobotAccounts?.length}
+          perPage={paginationProps.perPage}
+          page={paginationProps.page}
+          setPage={paginationProps.setPage}
+          setPerPage={paginationProps.setPerPage}
+          total={paginationProps.total}
           expandTable={expandTable}
           collapseTable={collapseTable}
         />
@@ -600,19 +620,33 @@ export default function RobotAccountsList(props: RobotAccountsListProps) {
           isModalOpen={isRobotFederationModalOpen}
           setIsModalOpen={setRobotFederationModalOpen}
           namespace={props.organizationName}
+          isUser={props.isUser}
         />
-        <Table aria-label="Expandable table" variant="compact">
+        <Table
+          aria-label="Expandable table"
+          variant="compact"
+          id="robot-accounts-table"
+          data-testid="robot-accounts-table"
+        >
           <Thead>
             <Tr>
               <Th />
               <Th />
-              <Th modifier="wrap">
+              <Th modifier="wrap" sort={getSortableSort(2)}>
                 {RobotAccountColumnNames.robotAccountName}
               </Th>
-              <Th modifier="wrap">{RobotAccountColumnNames.teams}</Th>
-              <Th modifier="wrap">{RobotAccountColumnNames.repositories}</Th>
-              <Th modifier="wrap">{RobotAccountColumnNames.lastAccessed}</Th>
-              <Th modifier="wrap">{RobotAccountColumnNames.created}</Th>
+              <Th modifier="wrap" sort={getSortableSort(3)}>
+                {RobotAccountColumnNames.teams}
+              </Th>
+              <Th modifier="wrap" sort={getSortableSort(4)}>
+                {RobotAccountColumnNames.repositories}
+              </Th>
+              <Th modifier="wrap" sort={getSortableSort(5)}>
+                {RobotAccountColumnNames.lastAccessed}
+              </Th>
+              <Th modifier="wrap" sort={getSortableSort(6)}>
+                {RobotAccountColumnNames.created}
+              </Th>
               <Th />
             </Tr>
           </Thead>
@@ -658,7 +692,7 @@ export default function RobotAccountsList(props: RobotAccountsListProps) {
                   </Td>
                   <Td dataLabel={RobotAccountColumnNames.lastAccessed}>
                     {robotAccount.last_accessed
-                      ? robotAccount.last_accessed
+                      ? formatDate(robotAccount.last_accessed)
                       : 'Never'}
                   </Td>
                   <Td dataLabel={RobotAccountColumnNames.created}>
@@ -699,12 +733,12 @@ export default function RobotAccountsList(props: RobotAccountsListProps) {
         <PanelFooter>
           <ToolbarPagination
             itemsList={filteredRobotAccounts}
-            perPage={perPage}
-            page={page}
-            setPage={setPage}
-            setPerPage={setPerPage}
+            perPage={paginationProps.perPage}
+            page={paginationProps.page}
+            setPage={paginationProps.setPage}
+            setPerPage={paginationProps.setPerPage}
             bottom={true}
-            total={filteredRobotAccounts.length}
+            total={paginationProps.total}
           />
         </PanelFooter>
       </PageSection>

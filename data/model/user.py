@@ -18,10 +18,11 @@ from data.database import (
     LoginService,
     Namespace,
     NamespaceAutoPrunePolicy,
-    NamespaceGeoRestriction,
+    NamespaceNotification,
     OAuthApplication,
     OauthAssignedToken,
     QuotaNamespaceSize,
+    QuotaNotificationState,
     RepoMirrorConfig,
     Repository,
     RepositoryBuildTrigger,
@@ -137,31 +138,41 @@ def create_user_noverify(
         # ID to ensure that the database consistency check remains intact.
         email = email or str(uuid.uuid4())
 
-    (username_valid, username_issue) = validate_username(username)
+    username_valid, username_issue = validate_username(username)
     if not username_valid:
         raise InvalidUsernameException("Invalid namespace %s: %s" % (username, username_issue))
 
+    # Check username uniqueness (applies to all users and orgs).
     try:
-        existing = User.get((User.username == username) | (User.email == email))
-        logger.debug("Existing user with same username or email.")
+        existing = User.get(User.username == username)
+        assert not existing.robot
 
-        # A user already exists with either the same username or email
-        if existing.username == username:
-            assert not existing.robot
+        msg = (
+            "Username has already been taken by an organization and cannot be reused: %s" % username
+        )
+        if not existing.organization:
+            msg = "Username has already been taken by user cannot be reused: %s" % username
 
-            msg = (
-                "Username has already been taken by an organization and cannot be reused: %s"
-                % username
-            )
-            if not existing.organization:
-                msg = "Username has already been taken by user cannot be reused: %s" % username
-
-            raise InvalidUsernameException(msg)
-
-        raise InvalidEmailAddressException("Email has already been used: %s" % email)
+        raise InvalidUsernameException(msg)
     except User.DoesNotExist:
-        # This is actually the happy path
-        logger.debug("Email and username are unique!")
+        pass
+
+    try:
+        DeletedNamespace.get(DeletedNamespace.original_username == username)
+        raise InvalidUsernameException("Username is not available")
+    except DeletedNamespace.DoesNotExist:
+        pass
+
+    # Check email uniqueness only among non-organization users. Organizations are allowed
+    # to share emails (enforced by the partial unique index on User.email).
+    if email_required:
+        try:
+            User.get(User.email == email, User.organization == False)
+            raise InvalidEmailAddressException("Email has already been used: %s" % email)
+        except User.DoesNotExist:
+            pass
+
+    logger.debug("Email and username are unique!")
 
     # Create the user.
     try:
@@ -199,9 +210,13 @@ def increase_maximum_build_count(user, maximum_queued_builds_count):
         user.save()
 
 
+def get_username(username):
+    return User.get(User.username == username, can_use_read_replica=True)
+
+
 def is_username_unique(test_username):
     try:
-        User.get((User.username == test_username))
+        get_username(test_username)
         return False
     except User.DoesNotExist:
         return True
@@ -263,7 +278,7 @@ def get_user_prompts(user):
 
 
 def change_username(user_id, new_username):
-    (username_valid, username_issue) = validate_username(new_username)
+    username_valid, username_issue = validate_username(new_username)
     if not username_valid:
         raise InvalidUsernameException("Invalid username %s: %s" % (new_username, username_issue))
 
@@ -337,9 +352,20 @@ def update_enabled(user, set_enabled):
     user.save()
 
 
+def robots_disallowed():
+    return config.app_config.get("ROBOTS_DISALLOW", False)
+
+
+def robot_access_allowed(robot_username):
+    """Return whether an existing robot may be used under the configured robot policy."""
+    return not robots_disallowed() or robot_username in config.app_config.get(
+        "ROBOTS_WHITELIST", []
+    )
+
+
 def create_robot(robot_shortname, parent, description="", unstructured_metadata=None, token=None):
-    (username_valid, username_issue) = validate_username(robot_shortname)
-    if config.app_config.get("ROBOTS_DISALLOW", False):
+    username_valid, username_issue = validate_username(robot_shortname)
+    if robots_disallowed():
         msg = "Robot accounts have been disabled. Please contact your administrator."
         raise InvalidRobotException(msg)
 
@@ -354,7 +380,7 @@ def create_robot(robot_shortname, parent, description="", unstructured_metadata=
     username = format_robot_username(parent.username, robot_shortname)
 
     try:
-        User.get(User.username == username)
+        get_username(username)
 
         msg = "Existing robot with name: %s" % username
         logger.debug(msg)
@@ -381,7 +407,51 @@ def create_robot(robot_shortname, parent, description="", unstructured_metadata=
         raise DataModelException(ex)
 
 
-def get_robot_federation_config(robot):
+# Namespace for ids derived from federation bindings stored before per-binding ids
+# existed: uuid5(NAMESPACE_URL, "https://quay.io/robot-federation-binding").
+LEGACY_FEDERATION_BINDING_NAMESPACE = uuid.UUID("9aefbd37-d08b-5bc0-b22b-7ddcad57d7c0")
+LEGACY_FEDERATION_BINDING_VERSION = 1
+
+
+def legacy_federation_binding_id(binding):
+    """
+    Return the deterministic id of a federation binding stored without one.
+
+    The id is derived from the binding's immutable identity (issuer, subject), so every
+    reader on every pod sees the same id for the same stored record without a write.
+    """
+    identity = "%s\n%s" % (binding.get("issuer") or "", binding.get("subject") or "")
+    return str(uuid.uuid5(LEGACY_FEDERATION_BINDING_NAMESPACE, identity))
+
+
+def normalize_robot_federation_bindings(fed_config):
+    """
+    Return copies of the stored bindings, each with a stable id and version.
+
+    Bindings saved before per-binding ids existed carry neither key. They get the
+    deterministic legacy id and version 1 so validation, minting, audit logging and
+    the federation API never see a binding without them. Nothing is persisted here;
+    create_robot_federation_config keeps the derived id on the next save.
+    """
+    normalized = []
+    for entry in fed_config or []:
+        entry = dict(entry)
+        if not entry.get("id"):
+            entry["id"] = legacy_federation_binding_id(entry)
+        if not entry.get("version"):
+            entry["version"] = LEGACY_FEDERATION_BINDING_VERSION
+        normalized.append(entry)
+    return normalized
+
+
+def ensure_robot_federation_ids(robot):
+    """
+    Return the robot's stored federation bindings, each with a stable id and version.
+
+    This is the single reader every consumer of stored bindings goes through (model
+    lookups, the shared JWT validator and the federation API), so a legacy record is
+    never seen without id/version. It does not write.
+    """
     federated_robot = FederatedLogin.select().where(FederatedLogin.user == robot).get()
     assert federated_robot
 
@@ -391,25 +461,74 @@ def get_robot_federation_config(robot):
     except Exception as e:
         logger.debug("Error parsing metadata: %s", e)
 
-    return metadata.get("federation_config", [])
+    return normalize_robot_federation_bindings(metadata.get("federation_config", []))
+
+
+def get_robot_federation_config(robot):
+    return ensure_robot_federation_ids(robot)
 
 
 def create_robot_federation_config(robot, fed_config):
-    federated_robot = FederatedLogin.select().where(FederatedLogin.user == robot).get()
-    assert federated_robot
-
-    metadata = {}
+    """Persist federation bindings, assigning a stable id and version to each."""
     try:
-        metadata = json.loads(federated_robot.metadata_json)
-    except Exception as e:
-        logger.debug("Error parsing metadata: %s", e)
+        with db_transaction():
+            # Serialize the read-modify-write cycle so every policy change receives a
+            # unique version and invalidates JWTs minted under the previous policy.
+            federated_robot = db_for_update(
+                FederatedLogin.select().where(FederatedLogin.user == robot)
+            ).get()
+            assert federated_robot
 
-    try:
-        metadata["federation_config"] = fed_config
-        federated_robot.metadata_json = json.dumps(metadata)
-        federated_robot.save()
+            metadata = {}
+            try:
+                metadata = json.loads(federated_robot.metadata_json)
+            except Exception as e:
+                logger.debug("Error parsing metadata: %s", e)
+
+            # Legacy bindings carry no id; key them by their derived id so two legacy
+            # entries never collapse under one null key.
+            previous = {
+                entry["id"]: entry
+                for entry in normalize_robot_federation_bindings(
+                    metadata.get("federation_config", [])
+                )
+            }
+            normalized = []
+            for entry in fed_config:
+                entry = dict(entry)
+                requested_id = entry.get("id")
+                binding_id = requested_id if requested_id in previous else str(uuid4())
+                old = previous.get(binding_id)
+                entry["id"] = binding_id
+                if old:
+                    old_policy = {key: value for key, value in old.items() if key != "version"}
+                    new_policy = {key: value for key, value in entry.items() if key != "version"}
+                    entry["version"] = old.get("version", 1) + (old_policy != new_policy)
+                else:
+                    entry["version"] = 1
+                normalized.append(entry)
+            metadata["federation_config"] = normalized
+            federated_robot.metadata_json = json.dumps(metadata)
+            federated_robot.save()
+            return normalized
     except Exception as e:
         raise DataModelException(e)
+
+
+def get_robot_federation_binding(robot, binding_id, version):
+    """Return the active binding matching a JWT's immutable id/version."""
+    if not _is_federation_binding_identity(binding_id, version):
+        # A claim pair without a binding identity can never resolve to a stored binding.
+        return None
+    for binding in ensure_robot_federation_ids(robot):
+        if binding.get("id") == binding_id and binding.get("version") == version:
+            return binding
+    return None
+
+
+def _is_federation_binding_identity(binding_id, version):
+    """A binding identity is a non-empty id and an integer version of at least 1."""
+    return bool(binding_id) and type(version) is int and version >= 1
 
 
 def delete_robot_federation_config(robot):
@@ -503,14 +622,13 @@ def get_matching_robots(name_prefix, username, limit=10):
     user_search = prefix_search(User.username, username + "+" + name_prefix)
     prefix_checks = prefix_checks | user_search
 
-    return User.select().where(prefix_checks).limit(limit)
+    return User.select(can_use_read_replica=True).where(prefix_checks).limit(limit)
 
 
 def verify_robot(robot_username, password, instance_keys):
-    if config.app_config.get("ROBOTS_DISALLOW", False):
-        if not robot_username in config.app_config.get("ROBOTS_WHITELIST", []):
-            msg = "Robot account have been disabled. Please contact your administrator."
-            raise InvalidRobotException(msg)
+    if not robot_access_allowed(robot_username):
+        msg = "Robot account have been disabled. Please contact your administrator."
+        raise InvalidRobotException(msg)
 
     try:
         password.encode("ascii")
@@ -527,7 +645,7 @@ def verify_robot(robot_username, password, instance_keys):
 
     # Find the owner user and ensure it is not disabled.
     try:
-        owner = User.get(User.username == result[0])
+        owner = get_username(result[0])
     except User.DoesNotExist:
         raise InvalidRobotOwnerException("Robot %s owner does not exist" % robot_username)
 
@@ -551,8 +669,18 @@ def verify_robot(robot_username, password, instance_keys):
         msg = "Could not find robot with username: %s and supplied password." % robot_username
         raise InvalidRobotCredentialException(msg)
 
-    _basequery.update_last_accessed(robot)
+    update_robot_last_accessed(robot)
     return robot
+
+
+def update_robot_last_accessed(robot):
+    """
+    Records that the robot account authenticated, whichever credential it used (robot
+    password, robot API token or federated JWT).
+
+    Shares the throttling and read-only handling of the user last_accessed update.
+    """
+    _basequery.update_last_accessed(robot)
 
 
 def regenerate_robot_token(robot_shortname, parent):
@@ -582,18 +710,44 @@ def regenerate_robot_token(robot_shortname, parent):
     return robot, password, metadata
 
 
-def generate_temp_robot_jwt_token(instance_keys):
-    context, subject = build_context_and_subject(get_authenticated_context())
+def generate_federated_robot_jwt_token(instance_keys, robot, api_scopes, federation_binding):
+    """Mints a short-lived Quay JWT for a validated federated robot."""
+    from auth.auth_context_type import ValidatedAuthContext
+
+    context, subject = build_context_and_subject(ValidatedAuthContext(robot=robot))
     audience_param = config.app_config["SERVER_HOSTNAME"]
-    token = generate_bearer_token(
-        audience_param, subject, context, {}, TMP_ROBOT_TOKEN_VALIDITY_LIFETIME_S, instance_keys
+    additional_claims = {}
+    if api_scopes:
+        additional_claims["api_scopes"] = api_scopes
+    if federation_binding:
+        binding_id = federation_binding.get("id")
+        binding_version = federation_binding.get("version")
+        if not _is_federation_binding_identity(binding_id, binding_version):
+            # Never mint a token whose binding claims could not be revoked by id.
+            raise InvalidRobotCredentialException("Federation binding has no stable identity")
+        additional_claims["federation_binding_id"] = binding_id
+        additional_claims["federation_binding_version"] = binding_version
+    return generate_bearer_token(
+        audience_param,
+        subject,
+        context,
+        {},
+        TMP_ROBOT_TOKEN_VALIDITY_LIFETIME_S,
+        instance_keys,
+        additional_claims,
     )
-    return token
+
+
+def generate_temp_robot_jwt_token(instance_keys, api_scopes=None, federation_binding=None):
+    """Mints a short-lived JWT for the robot authenticated in the current request."""
+    robot = get_authenticated_context().robot
+    assert robot
+    return generate_federated_robot_jwt_token(instance_keys, robot, api_scopes, federation_binding)
 
 
 def delete_robot(robot_username):
     try:
-        robot = User.get(username=robot_username, robot=True)
+        robot = User.get(username=robot_username, robot=True, can_use_read_replica=True)
         robot.delete_instance(recursive=True, delete_nullable=True)
 
     except User.DoesNotExist:
@@ -820,12 +974,9 @@ def confirm_user_email(token):
 
 def create_reset_password_email_code(email):
     try:
-        user = User.get(User.email == email)
+        user = User.get(User.email == email, User.organization == False)
     except User.DoesNotExist:
         raise InvalidEmailAddressException("Email address was not found")
-
-    if user.organization:
-        raise InvalidEmailAddressException("Organizations can not have passwords")
 
     verification_code, unhashed = Credential.generate()
     code = EmailConfirmation.create(user=user, pw_reset=True, verification_code=verification_code)
@@ -876,7 +1027,7 @@ def find_user_by_email(email):
         return None
 
     try:
-        return User.get(User.email == email)
+        return User.get(User.email == email, User.organization == False)
     except User.DoesNotExist:
         return None
 
@@ -921,6 +1072,43 @@ def get_namespace_user(username):
         return User.get(User.username == username)
     except User.DoesNotExist:
         return None
+
+
+def get_namespace_users_by_usernames(usernames):
+    """
+    Batch lookup namespace users by username.
+
+    Args:
+        usernames: List of usernames to look up
+
+    Returns:
+        Dictionary mapping username to User object (None for missing users)
+    """
+    if not usernames:
+        return {}
+
+    # Filter out invalid unicode usernames
+    valid_usernames = []
+    for username in usernames:
+        try:
+            if username and isinstance(username, str):
+                username.encode("ascii")
+                valid_usernames.append(username)
+        except UnicodeEncodeError:
+            pass
+
+    if not valid_usernames:
+        return {username: None for username in usernames}
+
+    # Initialize result with None for all requested usernames
+    username_user_map = {username: None for username in usernames}
+
+    # Batch query with IN clause
+    users = User.select().where(User.username << valid_usernames)
+    for user in users:
+        username_user_map[user.username] = user
+
+    return username_user_map
 
 
 def get_user_or_org(username):
@@ -1109,8 +1297,13 @@ def verify_user(username_or_email, password):
         return None
 
     # Fetch the user with the matching username or e-mail address.
+    # For email matching, only consider non-organization users since orgs cannot log in
+    # and multiple orgs may share the same email.
     try:
-        fetched = User.get((User.username == username_or_email) | (User.email == username_or_email))
+        fetched = User.get(
+            (User.username == username_or_email)
+            | ((User.email == username_or_email) & (User.organization == False))
+        )
     except User.DoesNotExist:
         return None
 
@@ -1303,13 +1496,34 @@ def get_solely_admined_organizations(user_obj):
     return solely_admined
 
 
-def mark_namespace_for_deletion(user, queues, namespace_gc_queue, force=False):
+def mark_namespace_for_deletion(
+    user, queues, namespace_gc_queue, force=False, available_after=None
+):
     """
     Marks a namespace (as referenced by the given user) for deletion.
 
     A queue item will be added to delete the namespace's repositories and storage, while the
     namespace itself will be renamed, disabled, and delinked from other tables.
+
+    When available_after > 0 (grace period), linked data (teams, OAuth apps, robots, etc.) is
+    preserved so the namespace can be recovered via direct DB operations during the grace window.
     """
+    if available_after is None:
+        if force:
+            available_after = 0
+        else:
+            grace_period = config.app_config.get("NAMESPACE_GC_GRACE_PERIOD_SECONDS", 0)
+            allowlist = config.app_config.get("NAMESPACE_GC_GRACE_PERIOD_ALLOWLIST", [])
+            if grace_period > 0 and allowlist and user.username in allowlist:
+                available_after = grace_period
+                logger.info(
+                    "Namespace %s marked for deletion with %ds grace period",
+                    user.username,
+                    grace_period,
+                )
+            else:
+                available_after = 0
+
     if not user.enabled:
         return None
 
@@ -1333,8 +1547,10 @@ def mark_namespace_for_deletion(user, queues, namespace_gc_queue, force=False):
     for queue in queues:
         queue.delete_namespaced_items(user.username)
 
-    # Delete non-repository related items. This operation is very quick, so we can do so here.
-    _delete_user_linked_data(user)
+    # When a grace period is active, defer linked data deletion so the namespace can be
+    # recovered. The GC worker (delete_user) will clean up linked data at purge time.
+    if available_after <= 0:
+        _delete_user_linked_data(user)
 
     with db_transaction():
         original_username = user.username
@@ -1363,6 +1579,7 @@ def mark_namespace_for_deletion(user, queues, namespace_gc_queue, force=False):
                 "original_username": original_username,
             }
         ),
+        available_after=available_after,
     )
     marker.save()
     return marker.id
@@ -1399,6 +1616,13 @@ def delete_user(user, queues):
         queue.delete_namespaced_items(user.username)
 
     # Delete any repositories under the user's namespace.
+    # Bulk-mark all repos for deletion in one UPDATE to avoid N individual
+    # per-repo saves inside purge_repository() that held long-duration locks.
+    Repository.update(state=RepositoryState.MARKED_FOR_DELETION).where(
+        Repository.namespace_user == user,
+        Repository.state != RepositoryState.MARKED_FOR_DELETION,
+    ).execute()
+
     while True:
         is_progressing = False
         repositories = list(Repository.select().where(Repository.namespace_user == user))
@@ -1430,7 +1654,17 @@ def delete_user(user, queues):
         return False
 
 
+def _resolve_namespace_name(user):
+    """Returns the original namespace name, consulting the DeletedNamespace marker if the
+    username was replaced with a UUID during soft-delete."""
+    try:
+        return DeletedNamespace.get(DeletedNamespace.namespace == user).original_username
+    except DeletedNamespace.DoesNotExist:
+        return user.username
+
+
 def _delete_user_linked_data(user):
+    namespace_name = _resolve_namespace_name(user)
     if user.organization:
         # Delete the organization's teams.
         with db_transaction():
@@ -1455,18 +1689,28 @@ def _delete_user_linked_data(user):
             trigger.delete_instance(recursive=True, delete_nullable=False)
 
     with db_transaction():
-        quotas = namespacequota.get_namespace_quota_list(user.username)
+        quotas = namespacequota.get_namespace_quota_list(namespace_name)
         for quota in quotas:
             namespacequota.delete_namespace_quota(quota)
 
+    if user.organization:
+        from data.model.org_mirror import (
+            delete_org_mirror_config,
+            get_org_mirror_config,
+        )
+
+        org_mirror_config = get_org_mirror_config(user)
+        if org_mirror_config is not None:
+            delete_org_mirror_config(org_mirror_config)
+
     # Delete any mirrors with robots owned by this user.
     with db_transaction():
-        robots = list(list_namespace_robots(user.username))
+        robots = list(list_namespace_robots(namespace_name))
         RepoMirrorConfig.delete().where(RepoMirrorConfig.internal_robot << robots).execute()
 
     # Delete any robots owned by this user.
     with db_transaction():
-        robots = list(list_namespace_robots(user.username))
+        robots = list(list_namespace_robots(namespace_name))
         for robot in robots:
             robot.delete_instance(recursive=True, delete_nullable=True)
 
@@ -1476,6 +1720,10 @@ def _delete_user_linked_data(user):
 
     # Delete any federated user links.
     FederatedLogin.delete().where(FederatedLogin.user == user).execute()
+
+    # Delete quota notification configs and state
+    NamespaceNotification.delete().where(NamespaceNotification.namespace == user).execute()
+    QuotaNotificationState.delete().where(QuotaNotificationState.namespace == user).execute()
 
     # Delete the quota size entry
     QuotaNamespaceSize.delete().where(QuotaNamespaceSize.namespace_user == user).execute()
@@ -1529,13 +1777,6 @@ def get_federated_logins(user_ids, service_name):
         .join(LoginService)
         .where(FederatedLogin.user << user_ids, LoginService.name == service_name)
     )
-
-
-def list_namespace_geo_restrictions(namespace_name):
-    """
-    Returns all of the defined geographic restrictions for the given namespace.
-    """
-    return NamespaceGeoRestriction.select().join(User).where(User.username == namespace_name)
 
 
 def get_minimum_user_id():

@@ -31,6 +31,7 @@ PARAM_REGEX = re.compile(r"<([^:>]+:)*([\w]+)>")
 
 TYPE_CONVERTER = {
     truthy_bool: "boolean",
+    bool: "boolean",
     str: "string",
     reqparse.text_type: "string",
     int: "integer",
@@ -41,7 +42,14 @@ SERVER_HOSTNAME = app.config["SERVER_HOSTNAME"]
 if SERVER_HOSTNAME == "quay.io" or SERVER_HOSTNAME == "stage.quay.io":
     TERMS_OF_SERVICE_URL = "https://www.openshift.com/legal/terms"
 else:
-    TERMS_OF_SERVICE_URL = app.config["TERMS_OF_SERVICE_URL"]
+    if app.config["FOOTER_LINKS"]:
+        TERMS_OF_SERVICE_URL = (
+            app.config["FOOTER_LINKS"]["TERMS_OF_SERVICE_URL"]
+            if app.config["FOOTER_LINKS"]["TERMS_OF_SERVICE_URL"]
+            else ""
+        )
+    else:
+        TERMS_OF_SERVICE_URL = ""
 CONTACT_EMAIL = app.config["MAIL_DEFAULT_SENDER"]
 
 
@@ -125,6 +133,8 @@ def swagger_route_data(include_internal=False, compact=False):
 
             path_swagger["parameters"] = path_parameters_swagger
 
+        existing_path_params = set((p["name"], p["in"]) for p in path_swagger.get("parameters", []))
+
         # Add the individual HTTP operations.
         method_names = list(rule.methods.difference(["HEAD", "OPTIONS"]))
         for method_name in method_names:
@@ -186,6 +196,10 @@ def swagger_route_data(include_internal=False, compact=False):
             # Add the path parameters.
             if rule.arguments:
                 for path_parameter in rule.arguments:
+                    key = (path_parameter, "path")
+                    if key in existing_path_params:
+                        continue
+
                     description = param_data_map.get(path_parameter, {}).get("description")
                     operation_swagger["parameters"].append(
                         swagger_parameter(path_parameter, description)

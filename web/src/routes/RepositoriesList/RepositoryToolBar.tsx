@@ -9,6 +9,11 @@ import {ToolbarButton} from 'src/components/toolbar/ToolbarButton';
 import {ToolbarPagination} from 'src/components/toolbar/ToolbarPagination';
 
 export function RepositoryToolBar(props: RepositoryToolBarProps) {
+  const handleSearchChange = (searchState) => {
+    props.setSearch(searchState);
+    props.setPage(1);
+  };
+
   const fetchConfirmationModalText = () => {
     if (props.selectedRepoNames.length == 1) {
       return props.selectedRepoNames[0];
@@ -41,25 +46,29 @@ export function RepositoryToolBar(props: RepositoryToolBarProps) {
   return (
     <Toolbar>
       <ToolbarContent>
-        <DropdownCheckbox
-          selectedItems={props.selectedRepoNames}
-          deSelectAll={props.setSelectedRepoNames}
-          allItemsList={props.repositoryList}
-          itemsPerPageList={props.paginatedRepositoryList}
-          onItemSelect={props.onSelectRepo}
-        />
+        {props.showPageButton && (
+          <DropdownCheckbox
+            selectedItems={props.selectedRepoNames}
+            deSelectAll={props.setSelectedRepoNames}
+            allItemsList={props.repositoryList}
+            itemsPerPageList={props.paginatedRepositoryList}
+            onItemSelect={props.onSelectRepo}
+          />
+        )}
         <FilterInput
           id="repositorylist-search-input"
           searchState={props.search}
-          onChange={props.setSearch}
+          onChange={handleSearchChange}
         />
-        <ToolbarButton
-          id="create-repository-button"
-          buttonValue={props.buttonText}
-          Modal={props.pageModal}
-          isModalOpen={props.isModalOpen}
-          setModalOpen={props.setModalOpen}
-        />
+        {props.showCreateButton && (
+          <ToolbarButton
+            id="create-repository-button"
+            buttonValue={props.buttonText}
+            Modal={props.pageModal}
+            isModalOpen={props.isModalOpen}
+            setModalOpen={props.setModalOpen}
+          />
+        )}
         <ToolbarItem>
           {props.selectedRepoNames?.length !== 0 ? (
             <Kebab
@@ -89,6 +98,7 @@ export function RepositoryToolBar(props: RepositoryToolBarProps) {
         buttonText="Make public"
         makePublic={true}
         selectAllRepos={props.selectAllRepos}
+        confirmButtonTestId="make-public-confirm-btn"
       />
       <ConfirmationModal
         title="Make repositories private"
@@ -99,6 +109,7 @@ export function RepositoryToolBar(props: RepositoryToolBarProps) {
         selectedItems={props.selectedRepoNames}
         makePublic={false}
         selectAllRepos={props.selectAllRepos}
+        confirmButtonTestId="make-private-confirm-btn"
       />
     </Toolbar>
   );
@@ -108,6 +119,7 @@ type RepositoryToolBarProps = {
   total: number;
   currentOrg: string;
   showPageButton: boolean;
+  showCreateButton: boolean;
   buttonText: string;
   pageModal: object;
   isModalOpen: boolean;

@@ -209,12 +209,56 @@ class ArchivedLogsTestCase(EndpointTestCase):
         with patch("endpoints.web.log_archive._storage.stream_read_file", return_value=mock_file):
             self.getResponse("web.logarchive", file_id=self.build_uuid, expected_code=200)
 
+    def test_logarchive_transcoded(self):
+        # Storage backends such as GCS decode Content-Encoding: gzip objects
+        # before serving them, so the stream may already be plain JSON.
+        self.login("public", "password")
+        data = b'{"logs": []}'
+        with patch(
+            "endpoints.web.log_archive._storage.stream_read_file", return_value=BytesIO(data)
+        ):
+            with self.assertLogs("endpoints.web", level="WARNING") as logs:
+                resp = self.getResponse(
+                    "web.logarchive", file_id=self.build_uuid, expected_code=200
+                )
+            self.assertEqual(data, resp)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn(self.build_uuid, logs.records[0].getMessage())
+        self.assertIn("already decoded", logs.records[0].getMessage())
+
+    def test_logarchive_unrecognized(self):
+        # Neither gzip nor JSON: controlled JSON 500 before any body bytes go
+        # out, with the build uuid and the leading bytes logged.
+        self.login("public", "password")
+        data = b"<html>not an archive</html>"
+        with patch(
+            "endpoints.web.log_archive._storage.stream_read_file", return_value=BytesIO(data)
+        ):
+            with self.assertLogs("endpoints.web", level="ERROR") as logs:
+                resp = self.getResponse(
+                    "web.logarchive", file_id=self.build_uuid, expected_code=500
+                )
+            self.assertEqual(py_json.loads(resp), {"error": "Archived logs are unreadable"})
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn(self.build_uuid, logs.records[0].getMessage())
+        self.assertIn(data[:32].hex(), logs.records[0].getMessage())
+
 
 class WebhookEndpointTestCase(EndpointTestCase):
     def test_invalid_build_trigger_webhook(self):
         self.postResponse(
             "webhooks.build_trigger_webhook", trigger_uuid="invalidtrigger", expected_code=404
         )
+
+    def test_oversized_multipart_field_does_not_break_request_logging(self):
+        # A multipart text field over MAX_FORM_MEMORY_SIZE must not raise from the
+        # after_request logging hook.
+        rv = self.app.post(
+            url_for("webhooks.build_trigger_webhook", trigger_uuid="invalidtrigger"),
+            data={"field": "a" * 600_000, "file": (BytesIO(b"x"), "f.txt")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(rv.status_code, 404)
 
     def test_valid_build_trigger_webhook_invalid_auth(self):
         trigger = list(model.build.list_build_triggers("devtable", "building"))[0]
@@ -494,6 +538,20 @@ class WebEndpointTestCase(EndpointTestCase):
         self.getResponse("web.redirect_to_namespace", namespace="unknown", expected_code=404)
         self.getResponse("web.redirect_to_namespace", namespace="devtable", expected_code=302)
         self.getResponse("web.redirect_to_namespace", namespace="buynlarge", expected_code=302)
+
+    def test_config_with_billing_disabled(self):
+        with toggle_feature("BILLING", False):
+            resp = self.getResponse("web.config", expected_code=200)
+            data = py_json.loads(resp)
+            self.assertIn("version_number", data)
+            self.assertTrue(data["version_number"].startswith("Quay "))
+
+    def test_config_with_billing_enabled(self):
+        with toggle_feature("BILLING", True):
+            resp = self.getResponse("web.config", expected_code=200)
+            data = py_json.loads(resp)
+            self.assertIn("version_number", data)
+            self.assertEqual(data["version_number"], "")
 
 
 class OAuthTestCase(EndpointTestCase):
@@ -799,6 +857,65 @@ class OAuthTestCase(EndpointTestCase):
 
             if r.status_code == 429:
                 break
+
+    def test_request_authorization_code_basic_auth(self):
+        """
+        Verifies that request authorization code does not raise a 500 anymore when basic
+        auth is provided.
+        """
+        org = model.organization.get_organization("buynlarge")
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/bah")
+
+        auth_header = gen_basic_auth("devtable", "password")
+        rv = self.app.get(
+            url_for(
+                "web.request_authorization_code",
+                client_id=app.client_id,
+                redirect_uri=app.redirect_uri,
+                scope="repo:read",
+                response_type="token",
+            ),
+            headers={"Authorization": auth_header},
+        )
+
+        self.assertEqual(rv.status_code, 200)
+
+    def test_request_authorization_code_basic_auth_invalid_credentials(self):
+        """
+        Verifies that when we have improper credentials that a proper 401 is returned back instead of a 500.
+        """
+        org = model.organization.get_organization("buynlarge")
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/bah")
+
+        auth_header = gen_basic_auth("randomuserwithoutaccess", "password")
+
+        rv = self.app.get(
+            url_for(
+                "web.request_authorization_code",
+                client_id=app.client_id,
+                redirect_uri=app.redirect_uri,
+                scope="repo:read",
+                response_type="token",
+            ),
+            headers={"Authorization": auth_header},
+        )
+
+        self.assertEqual(rv.status_code, 401)
+
+        auth_header = gen_basic_auth("devtable", "completelywrongpassword")
+
+        rv = self.app.get(
+            url_for(
+                "web.request_authorization_code",
+                client_id=app.client_id,
+                redirect_uri=app.redirect_uri,
+                scope="repo:read",
+                response_type="token",
+            ),
+            headers={"Authorization": auth_header},
+        )
+
+        self.assertEqual(rv.status_code, 401)
 
 
 class KeyServerTestCase(EndpointTestCase):
@@ -1188,6 +1305,21 @@ class AssignOauthAppTestCase(EndpointTestCase):
             == NotificationKind.select()
             .where(NotificationKind.name == "assigned_authorization")
             .get()
+        )
+
+    def test_assign_user_nocsrf(self):
+        self.login("devtable", "password")
+        org = get_organization("buynlarge")
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/baz")
+        self.postResponse(
+            "web.assign_user_to_app",
+            with_csrf=False,
+            expected_code=403,
+            client_id=app.client_id,
+            redirect_uri=app.redirect_uri,
+            scope="user:admin",
+            username="randomuser",
+            response_type="token",
         )
 
     def test_assign_user_unauthenticated(self):

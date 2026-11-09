@@ -4,8 +4,11 @@ import os
 import socket
 import time
 
-from raven.conf import setup_logging
-from raven.handlers.logging import SentryHandler
+import sentry_sdk
+from sentry_sdk.integrations.flask import FlaskIntegration
+from sentry_sdk.integrations.logging import LoggingIntegration
+from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
+from sentry_sdk.integrations.stdlib import StdlibIntegration
 
 import features
 from app import (
@@ -19,6 +22,7 @@ from app import userfiles as user_files
 from buildman.manager.ephemeral import EphemeralBuilderManager
 from buildman.server import BuilderServer
 from util.log import logfile_path
+from util.saas.exceptionlog import _sentry_before_send_ignore_known
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +33,53 @@ BUILD_MANAGERS = {
 EXTERNALLY_MANAGED = "external"
 
 DEFAULT_CONTROLLER_PORT = 8686
+
+
+def initialize_sentry():
+    """Initialize Sentry if configured."""
+    # Define buildman name for general use
+    buildman_name = "%s:buildman" % socket.gethostname()
+
+    if app.config.get("EXCEPTION_LOG_TYPE", "FakeSentry") == "Sentry":
+        sentry_dsn = app.config.get("SENTRY_DSN", "")
+        if sentry_dsn:
+            try:
+                integrations = []
+
+                # Always include logging integration
+                integrations.append(
+                    LoggingIntegration(level=logging.INFO, event_level=logging.ERROR)
+                )
+
+                # Only add Flask and SQLAlchemy integrations if OpenTelemetry is not enabled
+                if not getattr(features, "OTEL_TRACING", False):
+                    integrations.extend(
+                        [
+                            FlaskIntegration(transaction_style="endpoint"),
+                            SqlalchemyIntegration(),
+                            StdlibIntegration(),
+                        ]
+                    )
+                else:
+                    logger.info(
+                        "OpenTelemetry enabled - using minimal Sentry integrations for buildman"
+                    )
+
+                sentry_sdk.init(
+                    dsn=sentry_dsn,
+                    environment=app.config.get("SENTRY_ENVIRONMENT", "production"),
+                    traces_sample_rate=app.config.get("SENTRY_TRACES_SAMPLE_RATE", 0.1),
+                    profiles_sample_rate=app.config.get("SENTRY_PROFILES_SAMPLE_RATE", 0.1),
+                    sample_rate=app.config.get("SENTRY_SAMPLE_RATE", 0.1),
+                    integrations=integrations,
+                    default_integrations=False,
+                    auto_session_tracking=True,
+                    before_send=_sentry_before_send_ignore_known,
+                )
+                sentry_sdk.set_tag("service", "buildman")
+                sentry_sdk.set_tag("buildman", buildman_name)
+            except Exception as e:
+                logger.warning("Failed to initialize Sentry: %s", str(e))
 
 
 def run_build_manager():
@@ -97,10 +148,6 @@ if __name__ == "__main__":
     logging.getLogger("peewee").setLevel(logging.WARN)
     logging.getLogger("boto").setLevel(logging.WARN)
 
-    if app.config.get("EXCEPTION_LOG_TYPE", "FakeSentry") == "Sentry":
-        buildman_name = "%s:buildman" % socket.gethostname()
-        setup_logging(
-            SentryHandler(app.config.get("SENTRY_DSN", ""), name=buildman_name, level=logging.ERROR)
-        )
+    initialize_sentry()
 
     run_build_manager()

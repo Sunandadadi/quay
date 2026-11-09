@@ -5,6 +5,7 @@ from functools import wraps
 
 from flask import jsonify, make_response, request, session
 
+import features
 from app import app, docker_v2_signing_key, storage, userevents
 from auth.auth_context import get_authenticated_context, get_authenticated_user
 from auth.credentials import CredentialKind, validate_credentials
@@ -19,6 +20,7 @@ from auth.permissions import (
 )
 from auth.signedgrant import generate_signed_token
 from data import model
+from data.model.org_mirror import is_namespace_org_mirrored
 from data.registry_model import registry_model
 from data.registry_model.manifestbuilder import (
     create_manifest_builder,
@@ -129,8 +131,9 @@ def create_user():
 
         if kind == CredentialKind.user:
             # Mark that the login failed.
-            event = userevents.get_event(username)
-            event.publish_event_data("docker-cli", {"action": "loginfailure"})
+            if app.config.get("FEATURE_USER_EVENTS", True):
+                event = userevents.get_event(username)
+                event.publish_event_data("docker-cli", {"action": "loginfailure"})
             abort(400, result.error_message, issue="login-failure")
 
         # Default case: Just fail.
@@ -144,8 +147,10 @@ def create_user():
                 result.authed_user.username,
                 {"type": "quayauth", "useragent": request.user_agent.string},
             )
-        event = userevents.get_event(username)
-        event.publish_event_data("docker-cli", {"action": "login"})
+
+        if app.config.get("FEATURE_USER_EVENTS", True):
+            event = userevents.get_event(username)
+            event.publish_event_data("docker-cli", {"action": "login"})
 
     return success
 
@@ -242,6 +247,13 @@ def create_repository(namespace_name, repo_name):
             msg = 'You do not have permission to create repositories in namespace "%(namespace)s"'
             abort(403, message=msg, issue="no-create-permission", namespace=namespace_name)
 
+        if features.ORG_MIRROR and is_namespace_org_mirrored(namespace_name):
+            abort(
+                403,
+                message="Cannot create repository: organization is managed by "
+                "organization-level mirroring",
+            )
+
         # Attempt to create the new repository.
         logger.debug(
             "Creating repository %s/%s with owner: %s",
@@ -254,7 +266,7 @@ def create_repository(namespace_name, repo_name):
             namespace_name, repo_name, get_authenticated_user()
         )
 
-    if get_authenticated_user():
+    if get_authenticated_user() and app.config.get("FEATURE_USER_EVENTS", True):
         user_event_data = {
             "action": "push_start",
             "repository": repo_name,

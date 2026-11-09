@@ -142,6 +142,16 @@ func NewDistributedStorageArgs(storageArgs map[string]interface{}) (*shared.Dist
 		}
 	}
 
+	if value, ok := storageArgs["region_name"]; ok && value != nil {
+		str, ok := value.(string)
+		if !ok {
+			return newDistributedStorageArgs, errors.New("region_name must be of type string")
+		}
+		if str != "" {
+			newDistributedStorageArgs.RegionName = str
+		}
+	}
+
 	if value, ok := storageArgs["port"]; ok {
 
 		switch t := value.(type) {
@@ -376,6 +386,20 @@ func NewDistributedStorageArgs(storageArgs map[string]interface{}) (*shared.Dist
 		newDistributedStorageArgs.STSUserSecretKey, ok = value.(string)
 		if !ok {
 			return newDistributedStorageArgs, errors.New("sts_user_secret_key must be a string")
+		}
+	}
+
+	if value, ok := storageArgs["sts_web_identity_token_file"]; ok {
+		newDistributedStorageArgs.STSWebIdentityTokenFile, ok = value.(string)
+		if !ok {
+			return newDistributedStorageArgs, errors.New("sts_web_identity_token_file must be a string")
+		}
+	}
+
+	if value, ok := storageArgs["sts_role_session_name"]; ok {
+		newDistributedStorageArgs.STSRoleSessionName, ok = value.(string)
+		if !ok {
+			return newDistributedStorageArgs, errors.New("sts_role_session_name must be a string")
 		}
 	}
 

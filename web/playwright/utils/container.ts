@@ -1,0 +1,912 @@
+/**
+ * Registry image utilities for Playwright e2e tests.
+ *
+ * These helpers intentionally avoid podman/docker. OpenShift CI pods can
+ * block user namespaces, which makes container runtimes fail even when the
+ * binaries are installed. Skopeo, crane, oras, regctl, and cosign operate
+ * directly against registries and work in restricted pods.
+ */
+
+import {execFile, execFileSync, spawn} from 'child_process';
+import {createHash, randomBytes} from 'crypto';
+import {mkdtempSync, rmSync, writeFileSync} from 'fs';
+import {mkdtemp, mkdir, readFile, rm, writeFile} from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
+import {promisify} from 'util';
+import {API_URL} from './config';
+
+const execFileAsync = promisify(execFile);
+
+// Extract registry host from API_URL (e.g., 'localhost:8080')
+const REGISTRY_HOST = new URL(API_URL).host;
+
+const BUSYBOX_IMAGE = 'quay.io/prometheus/busybox:latest';
+
+/**
+ * Pinned UBI9 image (~77 MiB stored) used to cross quota notification thresholds
+ * reliably in e2e tests. Digest-pinned for reproducible blob sizes in CI.
+ */
+export const QUOTA_NOTIFICATION_SOURCE_IMAGE =
+  'registry.access.redhat.com/ubi9/ubi@sha256:25a147defd01e19674714f55d17538c8dbe55d8c305fa157ecc3f9c8977b05b6';
+
+/**
+ * Pinned UBI9 ubi-micro manifest list used for multi-arch pushes, covering
+ * schema-2 (not prettyjws) linux/amd64 and linux/arm64 children.
+ * registry.access.redhat.com is used, same as QUOTA_NOTIFICATION_SOURCE_IMAGE
+ * above, because it retains digests for consumers.
+ */
+const MULTIARCH_SOURCE_IMAGE =
+  'registry.access.redhat.com/ubi9/ubi-micro@sha256:7a0454cbd9bd847e8f6a63b6f0254a6efbeb6e0ed71a5d824a4f6cccbe626650';
+
+type ToolAvailability = {
+  skopeo: boolean;
+  crane: boolean;
+  oras: boolean;
+  regctl: boolean;
+  cosign: boolean;
+};
+
+let toolAvailabilityPromise: Promise<ToolAvailability> | null = null;
+
+function targetImage(namespace: string, repo: string, tag: string): string {
+  return `${REGISTRY_HOST}/${namespace}/${repo}:${tag}`;
+}
+
+function registryAuthConfig(username: string, password: string): string {
+  const auth = Buffer.from(`${username}:${password}`).toString('base64');
+  return `${JSON.stringify({auths: {[REGISTRY_HOST]: {auth}}})}\n`;
+}
+
+async function withRegistryAuthFile<T>(
+  username: string,
+  password: string,
+  operation: (authFile: string) => Promise<T>,
+): Promise<T> {
+  const authDir = await mkdtemp(path.join(os.tmpdir(), 'quay-registry-auth-'));
+  const authFile = path.join(authDir, 'auth.json');
+
+  try {
+    await writeFile(authFile, registryAuthConfig(username, password), {
+      mode: 0o600,
+    });
+    return await operation(authFile);
+  } finally {
+    await rm(authDir, {recursive: true, force: true});
+  }
+}
+
+function withRegistryAuthFileSync<T>(
+  username: string,
+  password: string,
+  operation: (authFile: string) => T,
+): T {
+  const authDir = mkdtempSync(path.join(os.tmpdir(), 'quay-registry-auth-'));
+  const authFile = path.join(authDir, 'auth.json');
+
+  try {
+    writeFileSync(authFile, registryAuthConfig(username, password), {
+      mode: 0o600,
+    });
+    return operation(authFile);
+  } finally {
+    rmSync(authDir, {recursive: true, force: true});
+  }
+}
+
+async function withRegctlConfig<T>(
+  username: string,
+  password: string,
+  operation: (env: NodeJS.ProcessEnv) => Promise<T>,
+): Promise<T> {
+  await requireTool('regctl');
+
+  const configDir = await mkdtemp(path.join(os.tmpdir(), 'quay-regctl-'));
+  const configFile = path.join(configDir, 'config.json');
+  const env = {...process.env, REGCTL_CONFIG: configFile};
+
+  try {
+    await execFileAsync(
+      'regctl',
+      ['registry', 'set', REGISTRY_HOST, '--tls', 'disabled', '--skip-check'],
+      {env},
+    );
+    await execFileWithInput(
+      'regctl',
+      [
+        'registry',
+        'login',
+        REGISTRY_HOST,
+        '-u',
+        username,
+        '--pass-stdin',
+        '--skip-check',
+      ],
+      password,
+      {env},
+    );
+    return await operation(env);
+  } finally {
+    await rm(configDir, {recursive: true, force: true});
+  }
+}
+
+async function commandAvailable(
+  command: string,
+  args: string[],
+): Promise<boolean> {
+  try {
+    await execFileAsync(command, args);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function detectRegistryTools(): Promise<ToolAvailability> {
+  if (!toolAvailabilityPromise) {
+    toolAvailabilityPromise = Promise.all([
+      commandAvailable('skopeo', ['--version']),
+      commandAvailable('crane', ['version']),
+      commandAvailable('oras', ['version']),
+      commandAvailable('regctl', ['version']),
+      commandAvailable('cosign', ['version']),
+    ]).then(([skopeo, crane, oras, regctl, cosign]) => ({
+      skopeo,
+      crane,
+      oras,
+      regctl,
+      cosign,
+    }));
+  }
+  return toolAvailabilityPromise;
+}
+
+async function requireTool(tool: keyof ToolAvailability): Promise<void> {
+  const tools = await detectRegistryTools();
+  if (!tools[tool]) {
+    throw new Error(`${tool} CLI required for registry image tests`);
+  }
+}
+
+/**
+ * Execute an async operation, retrying with fixed 1s delays on failure.
+ *
+ * Registry pushes can race with repository initialization, so push-like
+ * helpers retry their registry operation a few times. Each failed attempt is
+ * logged so the final thrown error isn't the only one visible.
+ */
+async function retryOperation(
+  operation: () => Promise<void>,
+  maxAttempts = 5,
+): Promise<void> {
+  let lastErr: unknown;
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      await operation();
+      return;
+    } catch (err) {
+      lastErr = err;
+      console.warn(
+        `retryOperation attempt ${i + 1}/${maxAttempts} failed:`,
+        err,
+      );
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+  throw lastErr;
+}
+
+async function skopeoCopy(args: string[]): Promise<void> {
+  await requireTool('skopeo');
+  await execFileAsync('skopeo', ['copy', ...args]);
+}
+
+async function craneLogin(
+  registryHost: string,
+  username: string,
+  password: string,
+  dockerConfig: string,
+): Promise<void> {
+  await requireTool('crane');
+  await execFileWithInput(
+    'crane',
+    [
+      'auth',
+      'login',
+      registryHost,
+      '--username',
+      username,
+      '--password-stdin',
+      '--insecure',
+    ],
+    password,
+    {env: {...process.env, DOCKER_CONFIG: dockerConfig}},
+  );
+}
+
+function execFileWithInput(
+  command: string,
+  args: string[],
+  input: string,
+  options: {env?: NodeJS.ProcessEnv} = {},
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      env: options.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => {
+      stderr += chunk;
+    });
+
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(
+          new Error(
+            `${command} ${args.join(' ')} failed with exit code ${code}: ${stderr}`,
+          ),
+        );
+      }
+    });
+
+    child.stdin.end(input);
+  });
+}
+
+/**
+ * Push a test image to the registry using skopeo.
+ *
+ * Uses busybox as a minimal test image and copies directly from the public
+ * source registry to the Quay registry. No local image store is required.
+ *
+ * @example
+ * ```typescript
+ * await pushImage('myorg', 'myrepo', 'latest', 'testuser', 'password');
+ * ```
+ */
+export async function pushImage(
+  namespace: string,
+  repo: string,
+  tag: string,
+  username: string,
+  password: string,
+): Promise<void> {
+  await pushImageFrom(BUSYBOX_IMAGE, namespace, repo, tag, username, password);
+}
+
+/**
+ * Copy an image from an external registry into Quay via skopeo.
+ *
+ * @param sourceImage - Registry reference (with or without `docker://` prefix)
+ */
+export async function pushImageFrom(
+  sourceImage: string,
+  namespace: string,
+  repo: string,
+  tag: string,
+  username: string,
+  password: string,
+): Promise<void> {
+  const dest = targetImage(namespace, repo, tag);
+  const source = sourceImage.startsWith('docker://')
+    ? sourceImage
+    : `docker://${sourceImage}`;
+
+  await withRegistryAuthFile(username, password, (authFile) =>
+    retryOperation(() =>
+      skopeoCopy([
+        '--override-os=linux',
+        '--override-arch=amd64',
+        source,
+        `docker://${dest}`,
+        '--dest-tls-verify=false',
+        '--dest-authfile',
+        authFile,
+      ]),
+    ),
+  );
+}
+
+/**
+ * Push the pinned UBI9 image used by quota-notification e2e tests.
+ */
+export async function pushQuotaNotificationImage(
+  namespace: string,
+  repo: string,
+  tag: string,
+  username: string,
+  password: string,
+): Promise<void> {
+  await pushImageFrom(
+    QUOTA_NOTIFICATION_SOURCE_IMAGE,
+    namespace,
+    repo,
+    tag,
+    username,
+    password,
+  );
+}
+
+/**
+ * Push an image with a unique layer to the registry, guaranteeing
+ * unique blob digests (no deduplication with prior pushes).
+ */
+export async function pushUniqueImage(
+  namespace: string,
+  repo: string,
+  tag: string,
+  username: string,
+  password: string,
+): Promise<void> {
+  await pushUniqueImageWithLayerBytes(
+    namespace,
+    repo,
+    tag,
+    username,
+    password,
+    64,
+  );
+}
+
+/**
+ * Push an image with a unique, incompressible layer of at least `layerBytes`.
+ * Quota checks during blob upload use stored bytes; random content avoids
+ * gzip collapsing the layer to a negligible size.
+ */
+export async function pushUniqueImageWithLayerBytes(
+  namespace: string,
+  repo: string,
+  tag: string,
+  username: string,
+  password: string,
+  layerBytes: number,
+): Promise<void> {
+  await requireTool('crane');
+
+  const image = targetImage(namespace, repo, tag);
+  const uniqueId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'quay-unique-img-'));
+  const rootDir = path.join(tmpDir, 'root');
+  const authDir = path.join(tmpDir, 'auth');
+  const layerTar = path.join(tmpDir, 'layer.tar');
+
+  try {
+    await mkdir(rootDir);
+    await mkdir(authDir);
+    await writeFile(path.join(rootDir, 'quota-fill'), randomBytes(layerBytes));
+    await writeFile(path.join(rootDir, 'unique'), `${uniqueId}\n`);
+    await execFileAsync('tar', [
+      '-C',
+      rootDir,
+      '-cf',
+      layerTar,
+      'quota-fill',
+      'unique',
+    ]);
+
+    await craneLogin(REGISTRY_HOST, username, password, authDir);
+
+    await retryOperation(() =>
+      execFileAsync(
+        'crane',
+        ['append', '--insecure', '--new_layer', layerTar, '--new_tag', image],
+        {env: {...process.env, DOCKER_CONFIG: authDir}},
+      ).then(() => undefined),
+    );
+  } finally {
+    await rm(tmpDir, {recursive: true, force: true});
+  }
+}
+
+/**
+ * Pull an image from the registry into a temporary OCI layout.
+ *
+ * This verifies the image can be pulled without requiring a local
+ * podman/docker image store.
+ */
+export async function pullImage(
+  namespace: string,
+  repo: string,
+  tag: string,
+  username: string,
+  password: string,
+): Promise<void> {
+  const image = targetImage(namespace, repo, tag);
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'quay-pull-img-'));
+
+  try {
+    await withRegistryAuthFile(username, password, (authFile) =>
+      skopeoCopy([
+        `docker://${image}`,
+        `oci:${tmpDir}:${tag}`,
+        '--src-tls-verify=false',
+        // The oci: transport cannot store signatures, and skopeo's manifest-list
+        // copy path attempts a signature copy even when none exist, failing with
+        // "Pushing signatures for OCI images is not supported". Our test images
+        // never carry real signatures, so stripping them on pull is a no-op for
+        // single-arch and unblocks multi-arch (manifest list) pulls.
+        '--remove-signatures',
+        '--src-authfile',
+        authFile,
+      ]),
+    );
+  } finally {
+    await rm(tmpDir, {recursive: true, force: true});
+  }
+}
+
+/**
+ * Check if registry image tooling is available.
+ *
+ * Kept under the old name because tests use this fixture to decide whether
+ * @container-tagged tests can perform registry image operations.
+ */
+export async function isContainerRuntimeAvailable(): Promise<boolean> {
+  return isRegistryImageToolingAvailable();
+}
+
+/**
+ * Check if the required daemonless registry image tooling is available.
+ */
+export async function isRegistryImageToolingAvailable(): Promise<boolean> {
+  const tools = await detectRegistryTools();
+  return tools.skopeo;
+}
+
+/**
+ * Push a multi-architecture manifest list to the registry.
+ *
+ * Uses a pinned busybox manifest list as the source image.
+ *
+ * @example
+ * ```typescript
+ * await pushMultiArchImage('myorg', 'myrepo', 'manifestlist', 'testuser', 'password');
+ * ```
+ */
+export async function pushMultiArchImage(
+  namespace: string,
+  repo: string,
+  tag: string,
+  username: string,
+  password: string,
+): Promise<void> {
+  const image = targetImage(namespace, repo, tag);
+
+  await withRegistryAuthFile(username, password, (authFile) =>
+    retryOperation(() =>
+      skopeoCopy([
+        '--all',
+        `docker://${MULTIARCH_SOURCE_IMAGE}`,
+        `docker://${image}`,
+        '--dest-tls-verify=false',
+        '--dest-authfile',
+        authFile,
+      ]),
+    ),
+  );
+}
+
+/**
+ * Attach an OCI artifact to a repository using oras.
+ *
+ * @param namespace - Organization/namespace
+ * @param repo - Repository name
+ * @param tag - Tag to attach to
+ * @param username - Registry username
+ * @param password - Registry password
+ * @param artifactType - OCI artifact type
+ * @param annotation - Annotation key=value
+ * @param filePath - Path to the file to attach
+ */
+export function orasAttach(
+  namespace: string,
+  repo: string,
+  tag: string,
+  username: string,
+  password: string,
+  artifactType: string,
+  annotation: string,
+  filePath: string,
+): void {
+  const ref = targetImage(namespace, repo, tag);
+
+  withRegistryAuthFileSync(username, password, (authFile) =>
+    execFileSync(
+      'oras',
+      [
+        'attach',
+        ref,
+        '--insecure',
+        '--registry-config',
+        authFile,
+        `--artifact-type=${artifactType}`,
+        `--annotation=${annotation}`,
+        '--disable-path-validation',
+        filePath,
+      ],
+      {stdio: 'pipe', timeout: 60_000},
+    ),
+  );
+}
+
+/**
+ * Discover the OCI referrers attached to a manifest using oras, returning the
+ * `artifactType` of every referrer found.
+ *
+ * Walks the `oras discover --format json` output defensively so it tolerates
+ * oras output-shape differences across versions.
+ *
+ * @returns Array of artifactType strings for the referrers of the given ref
+ */
+export async function orasDiscover(
+  namespace: string,
+  repo: string,
+  tag: string,
+  username: string,
+  password: string,
+): Promise<string[]> {
+  await requireTool('oras');
+
+  const ref = targetImage(namespace, repo, tag);
+  const {stdout} = await withRegistryAuthFile(username, password, (authFile) =>
+    execFileAsync('oras', [
+      'discover',
+      ref,
+      '--format',
+      'json',
+      '--insecure',
+      '--registry-config',
+      authFile,
+    ]),
+  );
+
+  const artifactTypes: string[] = [];
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      node.forEach(walk);
+      return;
+    }
+    if (node && typeof node === 'object') {
+      for (const [key, value] of Object.entries(node)) {
+        if (key === 'artifactType' && typeof value === 'string') {
+          artifactTypes.push(value);
+        } else {
+          walk(value);
+        }
+      }
+    }
+  };
+  walk(JSON.parse(stdout));
+  return artifactTypes;
+}
+
+/**
+ * Push an image in OCI manifest format to the registry using skopeo.
+ *
+ * Uses `--format=oci` to guarantee the manifest uses the OCI content type,
+ * which exercises a different code path in the security scanner than
+ * Docker v2 schema 2 manifests.
+ *
+ * @example
+ * ```typescript
+ * await pushOCIImage('myorg', 'myrepo', 'latest', 'testuser', 'password');
+ * ```
+ */
+export async function pushOCIImage(
+  namespace: string,
+  repo: string,
+  tag: string,
+  username: string,
+  password: string,
+): Promise<void> {
+  const image = targetImage(namespace, repo, tag);
+
+  await withRegistryAuthFile(username, password, (authFile) =>
+    retryOperation(() =>
+      skopeoCopy([
+        '--format=oci',
+        '--override-os=linux',
+        '--override-arch=amd64',
+        `docker://${BUSYBOX_IMAGE}`,
+        `docker://${image}`,
+        '--dest-tls-verify=false',
+        '--dest-authfile',
+        authFile,
+      ]),
+    ),
+  );
+}
+
+/**
+ * Sign an image digest with Cosign v3 using an ephemeral self-managed key pair.
+ *
+ * Keys are created with `cosign generate-key-pair` (see
+ * https://docs.sigstore.dev/cosign/key_management/signing_with_self-managed_keys/).
+ * Uses Cosign's new-bundle format so the signature is stored as an
+ * OCI 1.1 referrer (no classic sha256-<hex>.sig tag). Signing is offline
+ * (--use-signing-config=false --tlog-upload=false) so Rekor/TUF are not required.
+ */
+export async function cosignSignWithKey(
+  namespace: string,
+  repo: string,
+  digest: string,
+  username: string,
+  password: string,
+): Promise<void> {
+  await requireTool('cosign');
+
+  const imageRef = `${REGISTRY_HOST}/${namespace}/${repo}@${digest}`;
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'quay-cosign-'));
+  const keyPrefix = path.join(tmpDir, 'cosign');
+  const keyPath = `${keyPrefix}.key`;
+  const dockerConfigDir = path.join(tmpDir, 'docker');
+
+  try {
+    await mkdir(dockerConfigDir);
+    await writeFile(
+      path.join(dockerConfigDir, 'config.json'),
+      registryAuthConfig(username, password),
+      {mode: 0o600},
+    );
+
+    const cosignEnv = {
+      ...process.env,
+      // Empty password keeps generate-key-pair non-interactive without a
+      // committed secret. These keys exist only for this test run.
+      COSIGN_PASSWORD: '',
+      DOCKER_CONFIG: dockerConfigDir,
+    };
+
+    await execFileAsync(
+      'cosign',
+      ['generate-key-pair', `--output-key-prefix=${keyPrefix}`],
+      {env: cosignEnv},
+    );
+
+    await retryOperation(() =>
+      execFileAsync(
+        'cosign',
+        [
+          'sign',
+          '--yes',
+          '--key',
+          keyPath,
+          '--new-bundle-format=true',
+          '--use-signing-config=false',
+          '--tlog-upload=false',
+          '--allow-insecure-registry',
+          imageRef,
+        ],
+        {env: cosignEnv},
+      ).then(() => undefined),
+    );
+  } finally {
+    await rm(tmpDir, {recursive: true, force: true});
+  }
+}
+
+/**
+ * Check if oras CLI is available on the system.
+ */
+export async function isOrasAvailable(): Promise<boolean> {
+  const tools = await detectRegistryTools();
+  return tools.oras;
+}
+
+/**
+ * Check if cosign CLI is available on the system.
+ */
+export async function isCosignAvailable(): Promise<boolean> {
+  const tools = await detectRegistryTools();
+  return tools.cosign;
+}
+
+/**
+ * Check if skopeo CLI is available on the system.
+ */
+export async function isSkopeoAvailable(): Promise<boolean> {
+  const tools = await detectRegistryTools();
+  return tools.skopeo;
+}
+
+/**
+ * Check if crane CLI is available on the system.
+ */
+export async function isCraneAvailable(): Promise<boolean> {
+  const tools = await detectRegistryTools();
+  return tools.crane;
+}
+
+/**
+ * Check if regctl CLI is available on the system.
+ */
+export async function isRegctlAvailable(): Promise<boolean> {
+  const tools = await detectRegistryTools();
+  return tools.regctl;
+}
+
+/**
+ * Check if helm CLI is available on the system.
+ */
+export async function isHelmAvailable(): Promise<boolean> {
+  return commandAvailable('helm', ['version']);
+}
+
+/**
+ * List tags for a repository using skopeo.
+ *
+ * @returns Array of tag name strings
+ */
+export async function skopeoListTags(
+  namespace: string,
+  repo: string,
+  username: string,
+  password: string,
+): Promise<string[]> {
+  await requireTool('skopeo');
+
+  const ref = `docker://${REGISTRY_HOST}/${namespace}/${repo}`;
+  const {stdout} = await withRegistryAuthFile(username, password, (authFile) =>
+    execFileAsync('skopeo', [
+      'list-tags',
+      ref,
+      '--tls-verify=false',
+      '--authfile',
+      authFile,
+    ]),
+  );
+  const result = JSON.parse(stdout);
+  return result.Tags ?? [];
+}
+
+/**
+ * List tags for a repository using regctl.
+ *
+ * @returns Array of tag name strings
+ */
+export async function regctlListTags(
+  namespace: string,
+  repo: string,
+  username: string,
+  password: string,
+): Promise<string[]> {
+  const ref = `${REGISTRY_HOST}/${namespace}/${repo}`;
+  const {stdout} = await withRegctlConfig(username, password, (env) =>
+    execFileAsync('regctl', ['tag', 'ls', ref], {env}),
+  );
+  return stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+/**
+ * Log helm in to the registry, then run operation in a temporary directory
+ * that is removed afterwards.
+ */
+async function withHelmRegistry<T>(
+  username: string,
+  password: string,
+  operation: (registryConfig: string, workDir: string) => Promise<T>,
+): Promise<T> {
+  const workDir = await mkdtemp(path.join(os.tmpdir(), 'quay-helm-'));
+  // A per-invocation registry config keeps parallel Playwright workers from
+  // racing on the shared ~/.config/helm/registry/config.json, which corrupts
+  // the stored credentials.
+  const registryConfig = path.join(workDir, 'registry-config.json');
+
+  try {
+    await retryOperation(() =>
+      execFileWithInput(
+        'helm',
+        [
+          'registry',
+          'login',
+          REGISTRY_HOST,
+          '-u',
+          username,
+          '--password-stdin',
+          '--insecure',
+          '--registry-config',
+          registryConfig,
+        ],
+        password,
+      ),
+    );
+    return await operation(registryConfig, workDir);
+  } finally {
+    await rm(workDir, {recursive: true, force: true});
+  }
+}
+
+async function sha256File(file: string): Promise<string> {
+  return createHash('sha256')
+    .update(await readFile(file))
+    .digest('hex');
+}
+
+/**
+ * Package a minimal Helm chart named repo and push it with `helm push`, which
+ * stores it as namespace/repo:version.
+ *
+ * @returns sha256 hex digest of the pushed chart .tgz
+ */
+export async function pushHelmChart(
+  namespace: string,
+  repo: string,
+  version: string,
+  username: string,
+  password: string,
+): Promise<string> {
+  return withHelmRegistry(
+    username,
+    password,
+    async (registryConfig, workDir) => {
+      const chartDir = path.join(workDir, repo);
+      await mkdir(chartDir);
+      await writeFile(
+        path.join(chartDir, 'Chart.yaml'),
+        `apiVersion: v2\nname: ${repo}\ndescription: Test Helm chart for ${repo}\ntype: application\nversion: ${version}\n`,
+      );
+      await writeFile(path.join(chartDir, 'values.yaml'), 'replicaCount: 1\n');
+      await execFileAsync('helm', [
+        'package',
+        chartDir,
+        '--destination',
+        workDir,
+      ]);
+
+      const chart = path.join(workDir, `${repo}-${version}.tgz`);
+      await retryOperation(async () => {
+        await execFileAsync('helm', [
+          'push',
+          chart,
+          `oci://${REGISTRY_HOST}/${namespace}`,
+          '--plain-http',
+          '--registry-config',
+          registryConfig,
+        ]);
+      });
+      return sha256File(chart);
+    },
+  );
+}
+
+/**
+ * Pull namespace/repo:version with `helm pull`.
+ *
+ * @returns sha256 hex digest of the pulled chart .tgz
+ */
+export async function pullHelmChart(
+  namespace: string,
+  repo: string,
+  version: string,
+  username: string,
+  password: string,
+): Promise<string> {
+  return withHelmRegistry(
+    username,
+    password,
+    async (registryConfig, workDir) => {
+      await execFileAsync('helm', [
+        'pull',
+        `oci://${REGISTRY_HOST}/${namespace}/${repo}`,
+        '--version',
+        version,
+        '--plain-http',
+        '--destination',
+        workDir,
+        '--registry-config',
+        registryConfig,
+      ]);
+      return sha256File(path.join(workDir, `${repo}-${version}.tgz`));
+    },
+  );
+}

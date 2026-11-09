@@ -1,3 +1,4 @@
+import features
 from data.database import (
     DeletedNamespace,
     FederatedLogin,
@@ -11,6 +12,7 @@ from data.database import (
 )
 from data.model import (
     DataModelException,
+    InvalidEmailAddressException,
     InvalidOrganizationException,
     InvalidUsernameException,
     _basequery,
@@ -18,22 +20,49 @@ from data.model import (
     team,
     user,
 )
+from util.validation import validate_email
 
 
-def create_organization(name, email, creating_user, email_required=True, is_possible_abuser=False):
+def _create_org_user(name, email, is_possible_abuser=False):
+    """Create a User record for an organization, handling partial index constraints.
+
+    Inserts with no email, sets organization=True, then applies the email.
+    This ordering avoids the partial unique index (WHERE organization = false).
+    """
+    new_org = user.create_user_noverify(
+        name, None, email_required=False, is_possible_abuser=is_possible_abuser
+    )
+    new_org.organization = True
+    if email:
+        new_org.email = email
+    new_org.save()
+    return new_org
+
+
+def create_organization(
+    name, email, creating_user, email_required=True, is_possible_abuser=False, contact_email=None
+):
     with db_transaction():
         try:
-            # Create the org
-            new_org = user.create_user_noverify(
-                name, email, email_required=email_required, is_possible_abuser=is_possible_abuser
-            )
-            new_org.organization = True
-            new_org.save()
+            effective_email = contact_email or email
+            if effective_email and email_required:
+                if not validate_email(effective_email):
+                    raise InvalidEmailAddressException(
+                        "Invalid email address: %s" % effective_email
+                    )
 
-            # Create a team for the owners
+            if (
+                effective_email
+                and not features.ORG_SHARED_EMAIL
+                and user.find_user_by_email(effective_email)
+            ):
+                raise InvalidEmailAddressException(
+                    "Email has already been used: %s" % effective_email
+                )
+
+            new_org = _create_org_user(name, effective_email, is_possible_abuser)
+
             owners_team = team.create_team("owners", new_org, "admin")
-
-            # Add the user who created the org to the owners team
             team.add_user_to_team(creating_user, owners_team)
 
             return new_org
@@ -108,6 +137,30 @@ def get_admin_users(org):
     return __get_org_admin_users(org)
 
 
+def get_admin_users_for_orgs(orgs):
+    """
+    Returns a dict mapping org id to list of admin users, fetched in a single query.
+    """
+    if not orgs:
+        return {}
+
+    org_ids = [o.id for o in orgs]
+    admins = (
+        User.select(User, Team.organization)
+        .join(TeamMember)
+        .join(Team)
+        .join(TeamRole)
+        .where(Team.organization << org_ids, TeamRole.name == "admin", User.robot == False)
+        .distinct()
+    )
+
+    result = {oid: [] for oid in org_ids}
+    for admin in admins:
+        org_id = admin.teammember.team.organization_id
+        result[org_id].append(admin)
+    return result
+
+
 def remove_organization_member(org, user_obj):
     org_admins = [u.username for u in __get_org_admin_users(org)]
     if len(org_admins) == 1 and user_obj.username in org_admins:
@@ -135,12 +188,11 @@ def remove_organization_member(org, user_obj):
             TeamMember.delete().where(TeamMember.id << members).execute()
 
 
-def get_organization_member_set(org, include_robots=False, users_filter=None):
+def get_organization_member_set(org, include_robots=False, user_ids_filter=None):
     """
     Returns the set of all member usernames under the given organization, with optional filtering by
-    robots and/or by a specific set of User objects.
+    robots and/or by a specific set of user IDs.
     """
-    Org = User.alias()
     org_users = (
         User.select(User.username)
         .join(TeamMember)
@@ -152,12 +204,11 @@ def get_organization_member_set(org, include_robots=False, users_filter=None):
     if not include_robots:
         org_users = org_users.where(User.robot == False)
 
-    if users_filter is not None:
-        ids_list = [u.id for u in users_filter if u is not None]
-        if not ids_list:
+    if user_ids_filter is not None:
+        if not user_ids_filter:
             return set()
 
-        org_users = org_users.where(User.id << ids_list)
+        org_users = org_users.where(User.id << user_ids_filter)
 
     return {user.username for user in org_users}
 
@@ -212,3 +263,7 @@ def is_org_admin(user, org):
         .where(Team.organization == org, TeamRole.name == "admin", TeamMember.user == user)
         .exists()
     )
+
+
+def find_organizations_by_email(email):
+    return User.select().where(User.email == email, User.organization == True)

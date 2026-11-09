@@ -4,9 +4,10 @@ Manage the current user.
 
 import json
 import logging
+import time
 
 import recaptcha2
-from flask import abort, request
+from flask import abort, request, session
 from flask_login import logout_user
 from flask_principal import AnonymousIdentity, identity_changed
 from peewee import IntegrityError
@@ -27,19 +28,23 @@ from auth.auth_context import get_authenticated_user
 from auth.permissions import (
     AdministerOrganizationPermission,
     CreateRepositoryPermission,
+    GlobalReadOnlySuperUserPermission,
     SuperUserPermission,
     UserAdminPermission,
     UserReadPermission,
 )
 from data import model
 from data.billing import get_plan
-from data.database import Repository as RepositoryTable
+from data.database import Repository, RepositoryKind, RepositoryState, Star, Visibility
 from data.model.notification import delete_notifications_by_kind
 from data.model.oauth import get_assigned_authorization_for_user
 from data.users.shared import can_create_user
 from endpoints.api import (
     ApiResource,
     RepositoryParamResource,
+    allow_if_any_superuser,
+    allow_if_global_readonly_superuser,
+    allow_if_superuser,
     define_json_response,
     format_date,
     internal_only,
@@ -65,12 +70,20 @@ from endpoints.decorators import (
     readonly_call_allowed,
     restricted_user_readonly_call_allowed,
 )
-from endpoints.exception import DownstreamIssue, InvalidRequest, InvalidToken, NotFound
+from endpoints.exception import (
+    DownstreamIssue,
+    InvalidRequest,
+    InvalidToken,
+    NotFound,
+    Unauthorized,
+)
 from oauth.oidc import DiscoveryFailureException
+from oauth.pkce import code_challenge, generate_code_verifier
 from util.names import parse_single_urn
 from util.request import get_request_ip
 from util.useremails import (
     send_change_email,
+    send_combined_recovery_email,
     send_confirmation_email,
     send_org_recovery_email,
     send_password_changed,
@@ -209,6 +222,17 @@ def user_view(user, previous_username=None):
                 "super_user": user
                 and user == get_authenticated_user()
                 and SuperUserPermission().can()
+            }
+        )
+
+    # Add global_readonly_super_user field for read-only superusers
+    # This is separate from super_user to distinguish the two types
+    if GlobalReadOnlySuperUserPermission().can():
+        user_response.update(
+            {
+                "global_readonly_super_user": user
+                and user == get_authenticated_user()
+                and GlobalReadOnlySuperUserPermission().can()
             }
         )
 
@@ -688,7 +712,7 @@ class ClientKey(ApiResource):
 
         username = get_authenticated_user().username
         password = request.get_json()["password"]
-        (result, error_message) = authentication.confirm_existing_user(username, password)
+        result, error_message = authentication.confirm_existing_user(username, password)
         if not result:
             raise request_error(message=error_message)
 
@@ -701,7 +725,7 @@ def conduct_signin(username_or_email, password, invite_code=None):
     needs_email_verification = False
     invalid_credentials = False
 
-    (found_user, error_message) = authentication.verify_and_link_user(username_or_email, password)
+    found_user, error_message = authentication.verify_and_link_user(username_or_email, password)
     if found_user:
         # If there is an attached invitation code, handle it here. This will mark the
         # user as verified if the code is valid.
@@ -796,7 +820,7 @@ class ConvertToOrganization(ApiResource):
         # Ensure that the sign in credentials work.
         admin_username = convert_data["adminUser"]
         admin_password = convert_data["adminPassword"]
-        (admin_user, _) = authentication.verify_and_link_user(admin_username, admin_password)
+        admin_user, _ = authentication.verify_and_link_user(admin_username, admin_password)
         if not admin_user:
             raise request_error(
                 reason="invaliduser", message="The admin user credentials are not valid"
@@ -906,7 +930,7 @@ class VerifyUser(ApiResource):
         password = signin_data["password"]
 
         username = get_authenticated_user().username
-        (result, error_message) = authentication.confirm_existing_user(username, password)
+        result, error_message = authentication.confirm_existing_user(username, password)
         if not result:
             return {
                 "message": error_message,
@@ -930,8 +954,6 @@ class Signout(ApiResource):
     """
 
     @nickname("logout")
-    @readonly_call_allowed
-    @restricted_user_readonly_call_allowed
     def post(self):
         """
         Request that the current user be signed out.
@@ -994,8 +1016,21 @@ class ExternalLoginInformation(ApiResource):
 
         try:
             login_scopes = login_service.get_login_scopes()
+            extra_auth_params = None
+            if hasattr(login_service, "pkce_enabled") and login_service.pkce_enabled():
+                verifier = generate_code_verifier()
+                method = login_service.pkce_method()
+                challenge = code_challenge(verifier, method)
+                session_key = f"_oauth_pkce_{service_id}"
+                session[session_key] = {"verifier": verifier, "ts": int(time.time())}
+                extra_auth_params = {"code_challenge": challenge, "code_challenge_method": method}
+
             auth_url = login_service.get_auth_url(
-                url_scheme_and_hostname, redirect_suffix, csrf_token, login_scopes
+                url_scheme_and_hostname,
+                redirect_suffix,
+                csrf_token,
+                login_scopes,
+                extra_auth_params,
             )
             return {"auth_url": auth_url}
         except DiscoveryFailureException as dfe:
@@ -1082,21 +1117,35 @@ class Recovery(ApiResource):
 
         email = recovery_data["email"]
         user = model.user.find_user_by_email(email)
-        if not user:
-            return {
-                "status": "sent",
-            }
+        orgs = list(model.organization.find_organizations_by_email(email))
 
-        if user.organization:
-            send_org_recovery_email(user, model.organization.get_admin_users(user))
-            return {
-                "status": "org",
-                "orgemail": email,
-                "orgname": redact(user.username),
-            }
+        is_personal_user = user and not user.organization
+        reset_token = None
+        if is_personal_user:
+            reset_token = model.user.create_reset_password_email_code(email)
 
-        confirmation_code = model.user.create_reset_password_email_code(email)
-        send_recovery_email(email, confirmation_code)
+        if orgs:
+            admins_by_org = model.organization.get_admin_users_for_orgs(orgs)
+            orgs_with_admins = []
+            for org in orgs:
+                admin_users = admins_by_org.get(org.id, [])
+                orgs_with_admins.append(
+                    {
+                        "org_name": org.username,
+                        "admin_usernames": [u.username for u in admin_users],
+                    }
+                )
+            send_combined_recovery_email(email, orgs_with_admins, reset_token=reset_token)
+
+            if not is_personal_user:
+                return {
+                    "status": "org",
+                    "orgemail": email,
+                    "orgname": redact(orgs[0].username),
+                }
+        elif is_personal_user:
+            send_recovery_email(email, reset_token)
+
         return {
             "status": "sent",
         }
@@ -1321,10 +1370,11 @@ class StarredRepositoryList(ApiResource):
         """
         List all starred repositories.
         """
-        repo_query = model.repository.get_user_starred_repositories(get_authenticated_user())
+        user = get_authenticated_user()
+        repo_query = model.repository.get_user_starred_repositories(user)
 
         repos, next_page_token = model.modelutil.paginate(
-            repo_query, RepositoryTable, page_token=page_token, limit=REPOS_PER_PAGE
+            repo_query, Repository, page_token=page_token, limit=REPOS_PER_PAGE
         )
 
         def repo_view(repo_obj):

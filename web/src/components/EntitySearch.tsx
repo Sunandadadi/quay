@@ -24,6 +24,7 @@ export default function EntitySearch(props: EntitySearchProps) {
   const {entities, isError, searchTerm, setSearchTerm} = useEntities(
     props.org,
     props?.includeTeams,
+    props?.includeRobots,
   );
   const id = props.id || 'entity-search';
 
@@ -64,14 +65,20 @@ export default function EntitySearch(props: EntitySearchProps) {
     value: string | number | undefined,
   ) => {
     if (value && value !== 'no results') {
+      // If onTeamSelect is provided and this is a team selection from defaultOptions
+      const isTeamSelection = props.onTeamSelect && !searchTerm;
+
       setSearchTerm(value as string);
       setSelectedEntityName(value as string);
-    }
-    // onClear() prop can be skipped in case the value needs to be cleared automatically from
-    // the dropdown after selection (used in AddTeamMember wizard step)
-    if (!props.onClear) {
-      setSearchTerm('');
-      setSelectedEntityName('');
+
+      if (isTeamSelection) {
+        props.onTeamSelect(value as string);
+      } else if (!props.onClear) {
+        // onClear() prop can be skipped in case the value needs to be cleared automatically from
+        // the dropdown after selection (used in AddTeamMember wizard step)
+        setSearchTerm('');
+        setSelectedEntityName('');
+      }
     }
     setIsOpen(false);
     setFocusedItemIndex(null);
@@ -110,6 +117,7 @@ export default function EntitySearch(props: EntitySearchProps) {
         <TextInputGroupUtilities>
           {!!searchTerm && (
             <Button
+              icon={<TimesIcon aria-hidden />}
               variant="plain"
               onClick={() => {
                 setSelectedEntityName('');
@@ -118,9 +126,7 @@ export default function EntitySearch(props: EntitySearchProps) {
                 props?.onClear();
               }}
               aria-label="Clear input value"
-            >
-              <TimesIcon aria-hidden />
-            </Button>
+            />
           )}
         </TextInputGroupUtilities>
       </TextInputGroup>
@@ -138,25 +144,40 @@ export default function EntitySearch(props: EntitySearchProps) {
       shouldFocusToggleOnSelect
     >
       <SelectList id="entity-search-option-list">
-        {!searchTerm
-          ? props?.defaultOptions
-          : entities?.map((entity, index) => (
-              <SelectOption
-                data-testid={entity.name}
-                key={entity.name}
-                value={entity.name}
-                isFocused={focusedItemIndex === index}
-                onClick={() => {
-                  setSelectedEntityName(entity.name);
-                  if (props?.onSelect) {
-                    props.onSelect(entity);
-                  }
-                }}
-                description={getEntityKind(entity)}
-              >
-                {entity.name}
-              </SelectOption>
-            ))}
+        {!searchTerm ? (
+          props?.defaultOptions ||
+          (props.includeRobots === false && props.includeTeams === false ? (
+            <SelectOption key="not-permitted" value="" isDisabled>
+              Robot accounts and teams are not permitted
+            </SelectOption>
+          ) : null)
+        ) : entities?.length > 0 ? (
+          entities.map((entity, index) => (
+            <SelectOption
+              data-testid={entity.name}
+              key={entity.name}
+              value={entity.name}
+              isFocused={focusedItemIndex === index}
+              onClick={() => {
+                setSelectedEntityName(entity.name);
+                if (props?.onSelect) {
+                  props.onSelect(entity);
+                }
+              }}
+              description={getEntityKind(entity)}
+            >
+              {entity.name}
+            </SelectOption>
+          ))
+        ) : props.includeRobots === false && props.includeTeams === false ? (
+          <SelectOption key="not-permitted" value="" isDisabled>
+            Robot accounts and teams are not permitted
+          </SelectOption>
+        ) : (
+          <SelectOption key="no-results" value="" isDisabled>
+            No results found
+          </SelectOption>
+        )}
       </SelectList>
     </Select>
   );
@@ -165,11 +186,13 @@ export default function EntitySearch(props: EntitySearchProps) {
 interface EntitySearchProps {
   org: string;
   includeTeams?: boolean;
+  includeRobots?: boolean;
   onSelect: (selectedItem: Entity) => void;
   onClear?: () => void;
   onError?: () => void;
+  onTeamSelect?: (teamName: string) => void;
   id?: string;
-  defaultOptions?: any;
+  defaultOptions?: React.ReactNode;
   defaultSelection?: string;
   placeholderText?: string;
   value?: string;

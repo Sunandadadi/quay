@@ -39,14 +39,26 @@ const Breadcrumb = {
 export enum NavigationPath {
   // Side Nav
   home = '/',
-  organizationsList = '/organization',
-
   overviewList = '/overview',
-
+  organizationsList = '/organization',
   repositoriesList = '/repository',
+  search = '/search',
+
+  // Static pages
+  about = '/about',
+  security = '/security',
+
+  // Superuser sections
+  serviceKeys = '/service-keys',
+  changeLog = '/change-log',
+  usageLogs = '/usage-logs',
+  messages = '/messages',
+  buildLogs = '/build-logs',
 
   // Organization detail
   organizationDetail = '/organization/:organizationName',
+
+  userDetail = '/user/:organizationName',
 
   // Repository detail
   repositoryDetail = '/repository/:organizationName/*',
@@ -142,7 +154,7 @@ function domainRoute(currentRoute, definedRoute) {
    ***/
   return (
     currentRoute.replace(
-      /\/(overview|organization|repository|signin)(?!.*\1).*/,
+      /\/(overview|organization|repository|signin)(?=\/|$).*/,
       '',
     ) + definedRoute
   );

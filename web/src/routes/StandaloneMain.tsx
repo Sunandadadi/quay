@@ -1,29 +1,156 @@
-import {Banner, Flex, FlexItem, Page} from '@patternfly/react-core';
+import {
+  Banner,
+  Flex,
+  FlexItem,
+  NotificationDrawer,
+  NotificationDrawerBody,
+  NotificationDrawerHeader,
+  Page,
+  PageSection,
+} from '@patternfly/react-core';
 
-import {Navigate, Outlet, Route, Routes} from 'react-router-dom';
+import {
+  Navigate,
+  Outlet,
+  Route,
+  Routes,
+  useParams,
+  useLocation,
+} from 'react-router-dom';
 
 import {QuayHeader} from 'src/components/header/QuayHeader';
 import {QuaySidebar} from 'src/components/sidebar/QuaySidebar';
+import {QuayFooter} from 'src/components/footer/QuayFooter';
 import {NavigationPath} from './NavigationPath';
-import OrganizationsList from './OrganizationsList/OrganizationsList';
-import Organization from './OrganizationsList/Organization/Organization';
-import RepositoriesList from './RepositoriesList/RepositoriesList';
-import RepositoryTagRouter from './RepositoryTagRouter';
 
-import {useEffect} from 'react';
+import {useEffect, useState, lazy, Suspense} from 'react';
 import ErrorBoundary from 'src/components/errors/ErrorBoundary';
-import {useQuayConfig} from 'src/hooks/UseQuayConfig';
+import {useQuayConfigWithLoading} from 'src/hooks/UseQuayConfig';
 import SiteUnavailableError from 'src/components/errors/SiteUnavailableError';
 import NotFound from 'src/components/errors/404';
 import {useCurrentUser} from 'src/hooks/UseCurrentUser';
 import {InfoCircleIcon} from '@patternfly/react-icons';
-import axios from 'axios';
-import axiosIns from 'src/libs/axios';
 import Alerts from './Alerts';
-import OverviewList from './OverviewList/OverviewList';
-import SetupBuildTriggerRedirect from './SetupBuildtrigger/SetupBuildTriggerRedirect';
 import Conditional from 'src/components/empty/Conditional';
 import RegistryStatus from './RegistryStatus';
+import {NotificationDrawerListComponent} from 'src/components/notifications/NotificationDrawerList';
+import {OAuthError} from 'src/routes/OAuthCallback/OAuthError';
+import SystemStatusBanner from 'src/components/SystemStatusBanner';
+import {GlobalMessages} from 'src/components/GlobalMessages';
+import {LoadingPage} from 'src/components/LoadingPage';
+import {useUI} from 'src/contexts/UIContext';
+import {useExternalScripts} from 'src/hooks/UseExternalScripts';
+
+// Lazy load route components for better performance
+const OrganizationsList = lazy(
+  () => import('./OrganizationsList/OrganizationsList'),
+);
+const Organization = lazy(
+  () => import('./OrganizationsList/Organization/Organization'),
+);
+const RepositoriesList = lazy(
+  () => import('./RepositoriesList/RepositoriesList'),
+);
+import ProtectedRepositoryRoute from './ProtectedRepositoryRoute';
+const OverviewList = lazy(() => import('./OverviewList/OverviewList'));
+const SetupBuildTriggerRedirect = lazy(
+  () => import('./SetupBuildtrigger/SetupBuildTriggerRedirect'),
+);
+const ServiceKeys = lazy(() => import('./Superuser/ServiceKeys/ServiceKeys'));
+const ChangeLog = lazy(() => import('./Superuser/ChangeLog/ChangeLog'));
+const UsageLogs = lazy(() => import('./Superuser/UsageLogs/UsageLogs'));
+const Messages = lazy(() => import('./Superuser/Messages/Messages'));
+const BuildLogs = lazy(() => import('./Superuser/BuildLogs/BuildLogs'));
+const About = lazy(() => import('./About/About'));
+const Security = lazy(() => import('./Security/Security'));
+const Search = lazy(() => import('./Search/Search'));
+
+/**
+ * Interface for shorthand repository route parameters
+ */
+interface ShorthandParams {
+  org: string;
+  '*': string;
+}
+
+/**
+ * Derives reserved route prefixes from NavigationPath enum and additional static routes.
+ * These prefixes should NOT be treated as organization names in shorthand repository URLs.
+ *
+ * @returns Array of reserved path prefixes that won't redirect to repository pages
+ */
+function getReservedRoutePrefixes(): string[] {
+  // Extract first segment from each NavigationPath value
+  const navigationPrefixes = Object.values(NavigationPath)
+    .map((path) => {
+      // Remove leading slash and get first segment
+      const segments = path.replace(/^\//, '').split('/');
+      return segments[0];
+    })
+    .filter((prefix) => prefix && !prefix.startsWith(':')); // Filter out empty and param placeholders
+
+  // Additional static routes not in NavigationPath enum
+  const staticPrefixes = ['signin', 'createaccount', 'oauth-error'];
+
+  // Combine and deduplicate
+  return [...new Set([...navigationPrefixes, ...staticPrefixes])];
+}
+
+/**
+ * Component to handle shorthand organization and repository URLs.
+ *
+ * This component provides backward compatibility with the Angular UI's shorthand URL pattern,
+ * allowing users to navigate directly to organizations and repositories using shorthand paths.
+ *
+ * Behavior:
+ * - Redirects /:org to /organization/:org (single segment)
+ * - Redirects /:org/:repo to /repository/:org/:repo (two or more segments)
+ * - Preserves query parameters and hash fragments during redirect
+ * - Excludes reserved route prefixes to prevent conflicts with existing routes
+ *
+ * Reserved prefixes (dynamically derived from NavigationPath):
+ * - All first segments from NavigationPath enum (e.g., 'user', 'organization', 'repository', 'overview')
+ * - Additional static routes ('signin', 'createaccount', 'oauth-error')
+ *
+ * @example
+ * // Valid organization redirects
+ * /myorg → /organization/myorg
+ * /projectquay?tab=teams → /organization/projectquay?tab=teams
+ *
+ * @example
+ * // Valid repository redirects
+ * /openshift/release → /repository/openshift/release
+ * /user1/hello-world?tab=tags#section → /repository/user1/hello-world?tab=tags#section
+ *
+ * @example
+ * // Returns 404 (reserved prefix - passes through to existing routes)
+ * /user/testuser → 404 (reserved prefix)
+ * /organization/myorg → 404 (reserved prefix)
+ * /repository/foo/bar → 404 (reserved prefix)
+ */
+function RepositoryShorthandRedirect() {
+  const params = useParams<ShorthandParams>();
+  const location = useLocation();
+  const org = params.org;
+  const repo = params['*'];
+
+  const reservedPrefixes = getReservedRoutePrefixes();
+
+  // Show 404 if org matches a reserved route prefix (let existing routes handle it)
+  if (reservedPrefixes.includes(org)) {
+    return <NotFound />;
+  }
+
+  // Single segment (/:org) - redirect to organization
+  if (!repo || repo.trim() === '') {
+    const redirectTo = `/organization/${org}${location.search}${location.hash}`;
+    return <Navigate to={redirectTo} replace />;
+  }
+
+  // Two or more segments (/:org/:repo) - redirect to repository
+  const redirectTo = `/repository/${org}/${repo}${location.search}${location.hash}`;
+  return <Navigate to={redirectTo} replace />;
+}
 
 const NavigationRoutes = [
   {
@@ -43,6 +170,10 @@ const NavigationRoutes = [
     Component: <Organization />,
   },
   {
+    path: NavigationPath.userDetail,
+    Component: <Organization />,
+  },
+  {
     path: NavigationPath.repositoriesList,
     Component: <RepositoriesList organizationName={null} />,
   },
@@ -52,72 +183,162 @@ const NavigationRoutes = [
   },
   {
     path: NavigationPath.repositoryDetail,
-    Component: <RepositoryTagRouter />,
+    Component: <ProtectedRepositoryRoute />,
+  },
+  // Search
+  {
+    path: NavigationPath.search,
+    Component: <Search />,
+  },
+  // Static pages
+  {
+    path: NavigationPath.about,
+    Component: <About />,
+  },
+  {
+    path: NavigationPath.security,
+    Component: <Security />,
+  },
+  // Superuser routes
+  {
+    path: NavigationPath.serviceKeys,
+    Component: <ServiceKeys />,
+  },
+  {
+    path: NavigationPath.changeLog,
+    Component: <ChangeLog />,
+  },
+  {
+    path: NavigationPath.usageLogs,
+    Component: <UsageLogs />,
+  },
+  {
+    path: NavigationPath.messages,
+    Component: <Messages />,
+  },
+  {
+    path: NavigationPath.buildLogs,
+    Component: <BuildLogs />,
   },
 ];
 
 export function StandaloneMain() {
-  axios.defaults.baseURL =
-    process.env.REACT_QUAY_APP_API_URL ||
-    `${window.location.protocol}//${window.location.host}`;
-  axiosIns.defaults.baseURL = axios.defaults.baseURL;
+  const {
+    config: quayConfig,
+    isLoading: configLoading,
+    error: configError,
+  } = useQuayConfigWithLoading();
+  const {user, loading: userLoading, error: userError} = useCurrentUser();
+  const location = useLocation();
+  const {clearAllAlerts} = useUI();
 
-  const quayConfig = useQuayConfig();
-  const {loading, error} = useCurrentUser();
+  // Load external scripts (Stripe, StatusPage) only when BILLING feature is enabled (PROJQUAY-9803)
+  useExternalScripts();
+
+  const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+
+  // Clear alerts when navigating to a different route
+  useEffect(() => {
+    clearAllAlerts();
+  }, [location.pathname, clearAllAlerts]);
+
+  const toggleDrawer = () => {
+    setIsDrawerOpen((prev) => !prev);
+  };
+
+  const notificationDrawer = (
+    <NotificationDrawer>
+      <NotificationDrawerHeader title="Notifications" onClose={toggleDrawer} />
+      <NotificationDrawerBody>
+        <NotificationDrawerListComponent />
+      </NotificationDrawerBody>
+    </NotificationDrawer>
+  );
 
   useEffect(() => {
     if (quayConfig?.config?.REGISTRY_TITLE) {
-      document.title = quayConfig.config.REGISTRY_TITLE;
+      document.title = `${quayConfig.config.REGISTRY_TITLE} • Quay`;
     }
   }, [quayConfig]);
 
-  if (loading) {
+  // Wait for both user data and config to load before rendering
+  if (userLoading || configLoading) {
     return null;
   }
+
+  // If user is anonymous and ANONYMOUS_ACCESS is not enabled, redirect to
+  // signin (preserves existing behavior when anonymous access is disabled).
+  // When ANONYMOUS_ACCESS is enabled, let anonymous users browse public repos
+  if (user?.anonymous && quayConfig?.features?.ANONYMOUS_ACCESS !== true) {
+    window.location.href = '/signin';
+    return null;
+  }
+
+  // Surface config or user fetch errors via the ErrorBoundary
+  const hasError = !!configError || !!userError;
   return (
-    <ErrorBoundary hasError={!!error} fallback={<SiteUnavailableError />}>
+    <ErrorBoundary hasError={hasError} fallback={<SiteUnavailableError />}>
       <Page
-        header={<QuayHeader />}
+        masthead={<QuayHeader toggleDrawer={toggleDrawer} />}
         sidebar={<QuaySidebar />}
-        style={{height: '100vh'}}
         isManagedSidebar
         defaultManagedSidebarIsOpen={true}
+        notificationDrawer={notificationDrawer}
+        isNotificationDrawerExpanded={isDrawerOpen}
+        isContentFilled
       >
-        <Banner variant="blue">
-          <Flex
-            spaceItems={{default: 'spaceItemsSm'}}
-            justifyContent={{default: 'justifyContentCenter'}}
-          >
-            <FlexItem>
-              <InfoCircleIcon />
-            </FlexItem>
-            <FlexItem>
-              Please use{' '}
-              <a
-                href={quayConfig?.config?.UI_V2_FEEDBACK_FORM}
-                target="_blank"
-                rel="noreferrer"
-              >
-                this form
-              </a>{' '}
-              to provide feedback on your experience
-            </FlexItem>
-          </Flex>
-        </Banner>
+        <Conditional if={quayConfig?.config?.UI_V2_FEEDBACK_FORM}>
+          <Banner color="blue">
+            <Flex
+              spaceItems={{default: 'spaceItemsSm'}}
+              justifyContent={{default: 'justifyContentCenter'}}
+            >
+              <FlexItem>
+                <InfoCircleIcon />
+              </FlexItem>
+              <FlexItem>
+                Please use{' '}
+                <a
+                  href={quayConfig?.config?.UI_V2_FEEDBACK_FORM}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  this form
+                </a>{' '}
+                to provide feedback on your experience
+              </FlexItem>
+            </Flex>
+          </Banner>
+        </Conditional>
+        <SystemStatusBanner />
+        <GlobalMessages />
         <Conditional if={quayConfig?.features?.BILLING}>
           <ErrorBoundary fallback={<>Error loading registry status</>}>
             <RegistryStatus />
           </ErrorBoundary>
         </Conditional>
         <Alerts />
-        <Routes>
-          <Route index element={<Navigate to="/organization" replace />} />
-          {NavigationRoutes.map(({path, Component}, key) => (
-            <Route path={path} key={key} element={Component} />
-          ))}
-          <Route path="*" element={<NotFound />} />
-        </Routes>
-        <Outlet />
+        <PageSection isFilled>
+          <Suspense fallback={<LoadingPage />}>
+            <Routes>
+              <Route index element={<Navigate to="/organization" replace />} />
+              {NavigationRoutes.filter((route) => {
+                if (route.path === NavigationPath.overviewList) {
+                  return quayConfig?.features?.BILLING;
+                }
+                return true;
+              }).map(({path, Component}, key) => (
+                <Route path={path} key={key} element={Component} />
+              ))}
+              <Route path="oauth-error" element={<OAuthError />} />
+              {/* Redirect shorthand repository URLs (e.g., /openshift/release) to /repository/openshift/release */}
+              <Route path=":org/*" element={<RepositoryShorthandRedirect />} />
+              <Route path="*" element={<NotFound />} />
+            </Routes>
+          </Suspense>
+          <Outlet />
+        </PageSection>
+        <QuayFooter />
       </Page>
     </ErrorBoundary>
   );

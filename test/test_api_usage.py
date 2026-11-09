@@ -67,6 +67,7 @@ from endpoints.api.manifest import (
     ManageRepositoryManifestLabel,
     RepositoryManifestLabels,
 )
+from endpoints.api.mirror import RepoMirrorResource
 from endpoints.api.organization import (
     ApplicationInformation,
     Organization,
@@ -470,7 +471,7 @@ class TestUserStarredRepositoryList(ApiTestCase):
         self.login(READ_ACCESS_USER)
 
         # Queries: Base + the list query
-        with assert_query_count(BASE_LOGGEDIN_QUERY_COUNT):
+        with assert_query_count(BASE_LOGGEDIN_QUERY_COUNT + 1):
             self.getJsonResponse(StarredRepositoryList, expected_code=200)
 
     def test_star_repo_guest(self):
@@ -487,7 +488,7 @@ class TestUserStarredRepositoryList(ApiTestCase):
         self.login(READ_ACCESS_USER)
 
         # Queries: Base + the list query
-        with assert_query_count(BASE_LOGGEDIN_QUERY_COUNT):
+        with assert_query_count(BASE_LOGGEDIN_QUERY_COUNT + 1):
             json = self.getJsonResponse(StarredRepositoryList)
             assert json["repositories"] == []
 
@@ -832,7 +833,7 @@ class TestCreateNewUser(ApiTestCase):
 
     def test_recaptcha_whitelisted_users(self):
         self.login(READ_ACCESS_USER)
-        with (self.toggleFeature("RECAPTCHA", True)):
+        with self.toggleFeature("RECAPTCHA", True):
             app.config["RECAPTCHA_WHITELISTED_USERS"] = READ_ACCESS_USER
             self.postResponse(User, data=NEW_USER_DETAILS, expected_code=200)
 
@@ -2081,21 +2082,6 @@ class TestCreateRepo(ApiTestCase):
         self.assertEqual(ADMIN_ACCESS_USER, json["namespace"])
         self.assertEqual("newrepo", json["name"])
 
-    def test_create_app_repo(self):
-        self.login(ADMIN_ACCESS_USER)
-
-        json = self.postJsonResponse(
-            RepositoryList,
-            data=dict(
-                repository="newrepo", visibility="public", description="", repo_kind="application"
-            ),
-            expected_code=201,
-        )
-
-        self.assertEqual(ADMIN_ACCESS_USER, json["namespace"])
-        self.assertEqual("newrepo", json["name"])
-        self.assertEqual("application", json["kind"])
-
     def test_createrepo_underorg(self):
         self.login(ADMIN_ACCESS_USER)
 
@@ -2112,26 +2098,6 @@ class TestCreateRepo(ApiTestCase):
 
 
 class TestListRepos(ApiTestCase):
-    def test_list_app_repos(self):
-        self.login(ADMIN_ACCESS_USER)
-
-        # Create an app repo.
-        self.postJsonResponse(
-            RepositoryList,
-            data=dict(
-                repository="newrepo", visibility="public", description="", repo_kind="application"
-            ),
-            expected_code=201,
-        )
-
-        json = self.getJsonResponse(
-            RepositoryList,
-            params=dict(namespace=ADMIN_ACCESS_USER, public=False, repo_kind="application"),
-        )
-
-        self.assertEqual(1, len(json["repositories"]))
-        self.assertEqual("application", json["repositories"][0]["kind"])
-
     def test_listrepos_asguest(self):
         # Queries: Base + the list query
         # TODO: Add quota queries
@@ -2204,7 +2170,7 @@ class TestListRepos(ApiTestCase):
         # Queries: Base + the list query + the popularity and last modified queries + full perms load
         # TODO: Add quota queries
         with patch("features.QUOTA_MANAGEMENT", False):
-            with assert_query_count(BASE_LOGGEDIN_QUERY_COUNT + 4):
+            with assert_query_count(BASE_LOGGEDIN_QUERY_COUNT + 5):
                 json = self.getJsonResponse(
                     RepositoryList,
                     params=dict(
@@ -2412,18 +2378,18 @@ class TestChangeRepoVisibility(ApiTestCase):
         # Change the subscription of the namespace.
         self.putJsonResponse(UserPlan, data=dict(plan="personal-2018"))
 
-        # Try to make private.
+        # Try to make private. Superusers with full access bypass license limits.
         self.postJsonResponse(
             RepositoryVisibility,
             params=dict(repository=self.SIMPLE_REPO),
             data=dict(visibility="private"),
-            expected_code=402,
+            expected_code=200,
         )
 
-        # Verify the visibility.
+        # Verify the visibility changed to private (superuser bypassed license limit).
         json = self.getJsonResponse(Repository, params=dict(repository=self.SIMPLE_REPO))
 
-        self.assertEqual(True, json["is_public"])
+        self.assertEqual(False, json["is_public"])
 
     def test_changevisibility(self):
         self.login(ADMIN_ACCESS_USER)
@@ -2451,6 +2417,76 @@ class TestChangeRepoVisibility(ApiTestCase):
         json = self.getJsonResponse(Repository, params=dict(repository=self.SIMPLE_REPO))
 
         self.assertEqual(False, json["is_public"])
+
+    def test_plan_limit_enforcement_for_regular_users(self):
+        """
+        Test that plan limits are enforced for regular (non-superuser) users.
+
+        This test is identical to test_trychangevisibility but uses a non-superuser
+        to validate that license limits are still enforced for regular users.
+        """
+        from data import model
+
+        # Use NO_ACCESS_USER (freshuser) who is definitely not a superuser
+        # Set up billing for this user so the UserPlan endpoint works
+        user = model.user.get_user(NO_ACCESS_USER)
+        user.stripe_id = "test_stripe_id_freshuser"
+        user.save()
+
+        self.login(NO_ACCESS_USER)
+
+        # Change the subscription to a limited plan first
+        self.putJsonResponse(UserPlan, data=dict(plan="personal-2018"))
+
+        # Create private repositories until we hit the plan limit
+        # The personal-2018 plan allows a limited number of private repos
+        for i in range(20):
+            try:
+                self.postJsonResponse(
+                    RepositoryList,
+                    data=dict(
+                        namespace=NO_ACCESS_USER,
+                        repository=f"private_{i}",
+                        description="private repo to exhaust limit",
+                        visibility="private",
+                    ),
+                    expected_code=201,
+                )
+            except AssertionError:
+                # Hit the limit, which is expected
+                break
+
+        test_repo = NO_ACCESS_USER + "/simple"
+
+        # Create one more repository as public (should work)
+        self.postJsonResponse(
+            RepositoryList,
+            data=dict(
+                namespace=NO_ACCESS_USER,
+                repository="simple",
+                description="test repository",
+                visibility="public",
+            ),
+            expected_code=201,
+        )
+
+        # Verify the visibility.
+        json = self.getJsonResponse(Repository, params=dict(repository=test_repo))
+
+        self.assertEqual(True, json["is_public"])
+
+        # Try to make private - should be blocked by plan limit for regular users.
+        self.postJsonResponse(
+            RepositoryVisibility,
+            params=dict(repository=test_repo),
+            data=dict(visibility="private"),
+            expected_code=402,
+        )
+
+        # Verify the visibility stayed public (blocked by plan limit).
+        json = self.getJsonResponse(Repository, params=dict(repository=test_repo))
+
+        self.assertEqual(True, json["is_public"])
 
 
 class TestDeleteRepository(ApiTestCase):
@@ -2549,17 +2585,22 @@ class TestDeleteRepository(ApiTestCase):
             ADMIN_ACCESS_USER, "complex", "b@c.com"
         )
 
-        # Create some repository action count entries.
-        RepositoryActionCount.create(repository=repository, date=datetime.datetime.now(), count=1)
-        RepositoryActionCount.create(
+        # Create some repository action count entries (use get_or_create to avoid conflicts
+        # with entries created during database initialization).
+        RepositoryActionCount.get_or_create(
             repository=repository,
-            date=datetime.datetime.now() - datetime.timedelta(days=2),
-            count=2,
+            date=datetime.datetime.now().date(),
+            defaults={"count": 1},
         )
-        RepositoryActionCount.create(
+        RepositoryActionCount.get_or_create(
             repository=repository,
-            date=datetime.datetime.now() - datetime.timedelta(days=5),
-            count=6,
+            date=(datetime.datetime.now() - datetime.timedelta(days=2)).date(),
+            defaults={"count": 2},
+        )
+        RepositoryActionCount.get_or_create(
+            repository=repository,
+            date=(datetime.datetime.now() - datetime.timedelta(days=5)).date(),
+            defaults={"count": 6},
         )
 
         repo_ref = registry_model.lookup_repository(ADMIN_ACCESS_USER, "complex")
@@ -2590,11 +2631,11 @@ class TestGetRepository(ApiTestCase):
         self.login(ADMIN_ACCESS_USER)
 
         # base + repo + is_starred + tags
-        with assert_query_count(BASE_LOGGEDIN_QUERY_COUNT + 3):
+        with assert_query_count(BASE_LOGGEDIN_QUERY_COUNT + 4):
             self.getJsonResponse(Repository, params=dict(repository=ADMIN_ACCESS_USER + "/simple"))
 
         # base + repo + is_starred + tags
-        with assert_query_count(BASE_LOGGEDIN_QUERY_COUNT + 3):
+        with assert_query_count(BASE_LOGGEDIN_QUERY_COUNT + 4):
             json = self.getJsonResponse(
                 Repository, params=dict(repository=ADMIN_ACCESS_USER + "/gargantuan")
             )
@@ -2836,7 +2877,7 @@ class TestRepoBuilds(ApiTestCase):
         self.login(ADMIN_ACCESS_USER)
 
         # Queries: Permission + the list query + app check
-        with assert_query_count(2):
+        with assert_query_count(1):
             json = self.getJsonResponse(
                 RepositoryBuildList, params=dict(repository=ADMIN_ACCESS_USER + "/simple")
             )
@@ -2847,7 +2888,7 @@ class TestRepoBuilds(ApiTestCase):
         self.login(ADMIN_ACCESS_USER)
 
         # Queries: Permission + the list query + app check
-        with assert_query_count(2):
+        with assert_query_count(1):
             json = self.getJsonResponse(
                 RepositoryBuildList, params=dict(repository=ADMIN_ACCESS_USER + "/building")
             )
@@ -2988,7 +3029,7 @@ class TestRequestRepoBuild(ApiTestCase):
             expected_code=404,
         )
 
-    def test_requestrepobuild_with_unauthorized_robot(self):
+    def test_requestrepobuild_superuser_with_unauthorized_robot(self):
         self.login(ADMIN_ACCESS_USER)
 
         # Request a (fake) build.
@@ -2996,6 +3037,37 @@ class TestRequestRepoBuild(ApiTestCase):
         self.postResponse(
             RepositoryBuildList,
             params=dict(repository=ADMIN_ACCESS_USER + "/simple"),
+            data=dict(file_id="foobarbaz", pull_robot=pull_robot),
+            expected_code=201,
+        )
+
+    def test_requestrepobuild_regular_user_with_own_org_robot(self):
+        self.login(READ_ACCESS_USER)
+
+        # Ensure the regular user can write to the org repo and is an org admin (owner).
+        model.permission.set_user_repo_permission(READ_ACCESS_USER, ORGANIZATION, ORG_REPO, "write")
+        owners = model.team.get_organization_team(ORGANIZATION, "owners")
+        reader_user = model.user.get_user(READ_ACCESS_USER)
+        model.team.add_user_to_team(reader_user, owners)
+
+        pull_robot = ORGANIZATION + "+coolrobot"
+        self.postResponse(
+            RepositoryBuildList,
+            params=dict(repository=ORGANIZATION + "/" + ORG_REPO),
+            data=dict(file_id="foobarbaz", pull_robot=pull_robot),
+            expected_code=201,
+        )
+
+    def test_requestrepobuild_regular_user_with_other_org_robot(self):
+        self.login(READ_ACCESS_USER)
+
+        # Ensure the regular user can write to the org repo used for building.
+        model.permission.set_user_repo_permission(READ_ACCESS_USER, ORGANIZATION, ORG_REPO, "write")
+
+        pull_robot = ADMIN_ACCESS_USER + "+dtrobot"
+        self.postResponse(
+            RepositoryBuildList,
+            params=dict(repository=ORGANIZATION + "/" + ORG_REPO),
             data=dict(file_id="foobarbaz", pull_robot=pull_robot),
             expected_code=403,
         )
@@ -3724,11 +3796,11 @@ class TestUserRobots(ApiTestCase):
         self.putJsonResponse(UserRobot, params=dict(robot_shortname="coolbot"), expected_code=201)
 
         # Queries: Base + the lookup query
-        with assert_query_count(BASE_LOGGEDIN_QUERY_COUNT):
+        with assert_query_count(BASE_LOGGEDIN_QUERY_COUNT + 1):
             self.getJsonResponse(UserRobotList)
 
         # Queries: Base + the lookup query
-        with assert_query_count(BASE_LOGGEDIN_QUERY_COUNT):
+        with assert_query_count(BASE_LOGGEDIN_QUERY_COUNT + 1):
             self.getJsonResponse(UserRobotList, params=dict(permissions=True))
 
     def test_robots(self):
@@ -3944,7 +4016,7 @@ class TestOrgRobots(ApiTestCase):
         self.login("globalreadonlysuperuser")
         params = dict(orgname=ORGANIZATION)
         for r in self.getJsonResponse(OrgRobotList, params=params)["robots"]:
-            assert "token" in r
+            assert r.get("token") is None
 
 
 class TestLogs(ApiTestCase):
@@ -4596,6 +4668,54 @@ class TestBuildTriggers(ApiTestCase):
         assert "id" in start_json
         self.assertEqual("build-name", start_json["display_name"])
         self.assertEqual(["bar"], start_json["tags"])
+
+    def test_list_build_triggers_as_globalreadonlysuperuser(self):
+        self.login("globalreadonlysuperuser")
+
+        json = self.getJsonResponse(
+            BuildTriggerList,
+            params=dict(repository=ADMIN_ACCESS_USER + "/building"),
+        )
+        self.assertEqual(1, len(json["triggers"]))
+
+        trigger = json["triggers"][0]
+        assert trigger["config"] == {}
+        assert trigger["can_invoke"] is False
+        assert trigger["build_source"] is not None
+
+    def test_get_build_trigger_as_globalreadonlysuperuser(self):
+        self.login("globalreadonlysuperuser")
+
+        json = self.getJsonResponse(
+            BuildTriggerList,
+            params=dict(repository=ADMIN_ACCESS_USER + "/building"),
+        )
+        trigger = json["triggers"][0]
+
+        trigger_json = self.getJsonResponse(
+            BuildTrigger,
+            params=dict(
+                repository=ADMIN_ACCESS_USER + "/building",
+                trigger_uuid=trigger["id"],
+            ),
+        )
+        assert trigger_json["config"] == {}
+        assert trigger_json["can_invoke"] is False
+        assert trigger_json["build_source"] is not None
+
+
+class TestRepoMirror(ApiTestCase):
+    def test_get_mirror_config_as_globalreadonlysuperuser(self):
+        self.login("globalreadonlysuperuser")
+
+        json = self.getJsonResponse(
+            RepoMirrorResource,
+            params=dict(repository=ADMIN_ACCESS_USER + "/mirrored"),
+        )
+        assert json["external_registry_username"] is None
+        assert json["external_registry_config"] == {}
+        assert json["external_reference"] is not None
+        assert json["is_enabled"] is True
 
 
 class TestUserAuthorizations(ApiTestCase):
@@ -5374,6 +5494,59 @@ class TestOrganizationRhSku(ApiTestCase):
             params=dict(orgname=SUBSCRIPTION_ORG),
         )
         self.assertEqual(org_subs[0]["quantity"], 3)
+
+    def test_splittable_sku_multiple_attached(self):
+        # case where one MW02702 sku is attached fully to an org
+        # and another MW02702 sku is not
+        with patch("util.marketplace.FakeSubscriptionApi.lookup_subscription") as mock:
+            self.login(SUBSCRIPTION_USER)
+            mock.return_value = [
+                {
+                    "id": 12121212,
+                    "masterEndSystemName": "SUBSCRIPTION",
+                    "createdEndSystemName": "WEB",
+                    "createdDate": 1718373229000,
+                    "lastUpdateDate": 1718373337000,
+                    "externalLastUpdateDate": 1718373289000,
+                    "installBaseStartDate": 1718337600000,
+                    "webCustomerId": 123456,
+                    "quantity": 1,
+                    "effectiveStartDate": 1707368400000,
+                    "effectiveEndDate": 3813177600000,
+                },
+                {
+                    "id": 43434343,
+                    "masterEndSystemName": "SUBSCRIPTION",
+                    "createdEndSystemName": "SUBSCRIPTION",
+                    "createdDate": 1742376193000,
+                    "lastUpdateDate": 1742376193000,
+                    "quantity": 100,
+                    "effectiveStartDate": 1742356800000,
+                    "effectiveEndDate": 3813177600000,
+                },
+            ]
+            self.postResponse(
+                resource_name=OrganizationRhSku,
+                params=dict(orgname=SUBSCRIPTION_ORG),
+                data={"subscriptions": [{"subscription_id": 12121212, "quantity": 1}]},
+                expected_code=201,
+            )
+
+            # validate user marketplace response
+            user_subs = self.getJsonResponse(
+                resource_name=UserSkuList,
+            )
+
+            # look for remaining subscription unbound and make sure
+            # fields are present
+            other_sub = None
+            for sub in user_subs:
+                if sub["id"] == 43434343:
+                    other_sub = sub
+
+            self.assertIsNotNone(other_sub, "Could not find other subscription")
+            self.assertIsNotNone(other_sub["metadata"], "metadata missing")
+            self.assertIsNone(other_sub["assigned_to_org"])
 
 
 if __name__ == "__main__":

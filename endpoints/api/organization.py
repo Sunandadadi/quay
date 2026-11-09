@@ -4,6 +4,7 @@ Manage organizations, members and OAuth applications.
 
 import logging
 import time
+import uuid
 
 import recaptcha2
 from flask import request
@@ -17,18 +18,23 @@ from auth.auth_context import get_authenticated_user
 from auth.permissions import (
     AdministerOrganizationPermission,
     CreateRepositoryPermission,
+    GlobalReadOnlySuperUserPermission,
     OrganizationMemberPermission,
     SuperUserPermission,
-    ViewTeamPermission,
 )
 from data import model
 from data.billing import get_plan, get_plan_using_rh_sku
 from data.database import ProxyCacheConfig
 from data.model import organization_skus
+from data.model.immutability import namespace_has_immutable_tags
+from data.model.org_mirror import is_namespace_org_mirrored
 from endpoints.api import (
     ApiResource,
+    allow_if_any_superuser,
     allow_if_global_readonly_superuser,
     allow_if_superuser,
+    allow_if_superuser_with_full_access,
+    get_viewable_teams_for_org,
     internal_only,
     log_action,
     nickname,
@@ -48,8 +54,36 @@ from proxy import Proxy, UpstreamRegistryError
 from util.marketplace import MarketplaceSubscriptionApi
 from util.names import parse_robot_username
 from util.request import get_request_ip
+from util.security.ssrf import (
+    SSRFBlockedError,
+    get_environment_proxy_config,
+    validate_external_registry_url,
+)
+from util.validation import validate_email
 
 logger = logging.getLogger(__name__)
+
+SSRF_GENERIC_ERROR = "The provided registry URL is not allowed"
+
+
+def _get_ssrf_allowed_hosts():
+    return app.config.get("SSRF_ALLOWED_HOSTS", [])
+
+
+def _validate_upstream_registry(upstream_registry, insecure=False):
+    hostname = upstream_registry.split("/", 1)[0]
+    scheme = "http" if insecure else "https"
+    url = f"{scheme}://{hostname}"
+    try:
+        validate_external_registry_url(
+            url,
+            allowed_hosts=_get_ssrf_allowed_hosts(),
+            proxy_config=get_environment_proxy_config(),
+        )
+    except SSRFBlockedError:
+        raise request_error(SSRF_GENERIC_ERROR)
+    except ValueError as e:
+        raise request_error(str(e))
 
 
 def quota_view(quota):
@@ -70,13 +104,26 @@ def limit_view(limit):
     }
 
 
-def team_view(orgname, team):
+def team_view(team, viewable_teams):
+    """
+    Returns a view of a team for the API response.
+
+    Args:
+        team: The team object
+        viewable_teams: Set of team names the user can view, or None if the
+                       user is an org admin and can view all teams.
+    """
+    if viewable_teams is None:
+        can_view = True
+    else:
+        can_view = team.name in viewable_teams
+
     return {
         "name": team.name,
         "description": team.description,
         "role": team.role_name,
         "avatar": avatar.get_data_for_team(team),
-        "can_view": ViewTeamPermission(orgname, team.name).can(),
+        "can_view": can_view,
         "repo_count": team.repo_count,
         "member_count": team.member_count,
         "is_synced": team.is_synced,
@@ -86,10 +133,23 @@ def team_view(orgname, team):
 def org_view(o, teams):
     is_admin = AdministerOrganizationPermission(o.username).can()
     is_member = OrganizationMemberPermission(o.username).can()
+    # Global readonly superusers can always view, regular superusers need FULL_ACCESS
+    can_view_as_superuser = allow_if_global_readonly_superuser() or (
+        features.SUPERUSERS_FULL_ACCESS and allow_if_superuser()
+    )
+
+    # Grant superusers effective admin/member status for UI visibility
+    if can_view_as_superuser:
+        is_admin = True
+        is_member = True
+
+    org_email = ""
+    if is_admin or can_view_as_superuser:
+        org_email = o.email if validate_email(o.email) else ""
 
     view = {
         "name": o.username,
-        "email": o.email if is_admin else "",
+        "email": org_email,
         "avatar": avatar.get_data_for_user(o),
         "is_admin": is_admin,
         "is_member": is_member,
@@ -97,7 +157,17 @@ def org_view(o, teams):
 
     if teams is not None:
         teams = sorted(teams, key=lambda team: team.id)
-        view["teams"] = {t.name: team_view(o.username, t) for t in teams}
+
+        # Pre-compute viewable teams in a single query to avoid N+1 permission checks.
+        # Returns None if user is org admin (can view all teams), or a set of team names.
+        # Superusers and global readonly superusers can also view all teams.
+        if can_view_as_superuser or is_admin:
+            viewable_teams = None  # Can view all teams
+        else:
+            user = get_authenticated_user()
+            viewable_teams = get_viewable_teams_for_org(o.username, user)
+
+        view["teams"] = {t.name: team_view(t, viewable_teams) for t in teams}
         view["ordered_teams"] = [team.name for team in teams]
 
     if is_admin:
@@ -136,6 +206,10 @@ class OrganizationList(ApiResource):
                     "type": "string",
                     "description": "Organization contact email",
                 },
+                "contact_email": {
+                    "type": "string",
+                    "description": "Optional contact email for organization recovery and notifications",
+                },
                 "recaptcha_response": {
                     "type": "string",
                     "description": "The (may be disabled) recaptcha response code for verification",
@@ -151,15 +225,17 @@ class OrganizationList(ApiResource):
         """
         Create a new organization.
         """
-        if features.SUPERUSERS_ORG_CREATION_ONLY and not SuperUserPermission().can():
-            raise Unauthorized()
+        # When SUPERUSERS_ORG_CREATION_ONLY is enabled, only regular superusers can create orgs
+        if features.SUPERUSERS_ORG_CREATION_ONLY:
+            if not allow_if_superuser():
+                raise Unauthorized()
 
         user = get_authenticated_user()
         org_data = request.get_json()
         existing = None
 
         # Super users should be able to create new orgs regardless of user restriction
-        if user.username not in app.config.get("SUPER_USERS", None):
+        if not usermanager.is_superuser(user.username):
             if features.RESTRICTED_USERS and usermanager.is_restricted_user(user.username):
                 raise Unauthorized()
 
@@ -175,8 +251,9 @@ class OrganizationList(ApiResource):
             msg = "A user or organization with this name already exists"
             raise request_error(message=msg)
 
-        if features.MAILING and not org_data.get("email"):
-            raise request_error(message="Email address is required")
+        email = org_data.get("contact_email") or org_data.get("email")
+        if email and not validate_email(email):
+            raise request_error(message="Invalid email address")
 
         # If recaptcha is enabled, then verify the user is a human.
         if features.RECAPTCHA:
@@ -193,7 +270,7 @@ class OrganizationList(ApiResource):
         try:
             model.organization.create_organization(
                 org_data["name"],
-                org_data.get("email"),
+                email,
                 user,
                 email_required=features.MAILING,
                 is_possible_abuser=is_possible_abuser,
@@ -201,7 +278,7 @@ class OrganizationList(ApiResource):
             log_action(
                 "org_create",
                 org_data["name"],
-                {"email": org_data.get("email"), "namespace": org_data["name"]},
+                {"email": email, "namespace": org_data["name"]},
             )
             return "Created", 201
         except model.DataModelException as ex:
@@ -223,6 +300,10 @@ class Organization(ApiResource):
             "properties": {
                 "email": {
                     "type": "string",
+                    "description": "Organization contact email",
+                },
+                "contact_email": {
+                    "type": ["string", "null"],
                     "description": "Organization contact email",
                 },
                 "invoice_email": {
@@ -253,7 +334,12 @@ class Organization(ApiResource):
             raise NotFound()
 
         teams = None
-        if OrganizationMemberPermission(orgname).can():
+        # Global readonly superusers can always view teams, regular superusers need FULL_ACCESS
+        if (
+            OrganizationMemberPermission(orgname).can()
+            or allow_if_global_readonly_superuser()
+            or (features.SUPERUSERS_FULL_ACCESS and allow_if_superuser())
+        ):
             has_syncing = features.TEAM_SYNCING and bool(authentication.federated_service)
             teams = model.team.get_teams_within_org(org, has_syncing)
 
@@ -267,7 +353,7 @@ class Organization(ApiResource):
         Change the details for the specified organization.
         """
         permission = AdministerOrganizationPermission(orgname)
-        if permission.can() or allow_if_superuser():
+        if permission.can() or allow_if_superuser_with_full_access():
             try:
                 org = model.organization.get_organization(orgname)
             except model.InvalidOrganizationException:
@@ -296,20 +382,29 @@ class Organization(ApiResource):
                     {"invoice_email_address": new_email, "namespace": orgname},
                 )
 
-            if "email" in org_data and org_data["email"] != org.email:
-                new_email = org_data["email"]
-                old_email = org.email
-
-                if model.user.find_user_by_email(new_email):
-                    raise request_error(message="E-mail address already used")
-
-                logger.debug("Changing email address for organization: %s", org.username)
-                model.user.update_email(org, new_email)
-                log_action(
-                    "org_change_email",
-                    orgname,
-                    {"email": new_email, "namespace": orgname, "old_email": old_email},
+            if "contact_email" in org_data or "email" in org_data:
+                new_email = (
+                    org_data.get("contact_email")
+                    if "contact_email" in org_data
+                    else org_data.get("email")
                 )
+                new_email = new_email or ""
+                current_email = org.email if validate_email(org.email) else ""
+                if new_email != current_email:
+                    if new_email and not validate_email(new_email):
+                        raise request_error(message="Invalid email address")
+                    old_email = current_email
+                    org.email = new_email if new_email else str(uuid.uuid4())
+                    org.save()
+                    log_action(
+                        "org_change_email",
+                        orgname,
+                        {
+                            "email": new_email,
+                            "namespace": orgname,
+                            "old_email": old_email,
+                        },
+                    )
 
             if features.CHANGE_TAG_EXPIRATION and "tag_expiration_s" in org_data:
                 logger.debug(
@@ -334,7 +429,7 @@ class Organization(ApiResource):
         Deletes the specified organization.
         """
         permission = AdministerOrganizationPermission(orgname)
-        if permission.can() or allow_if_superuser():
+        if permission.can() or allow_if_superuser_with_full_access():
             try:
                 org = model.organization.get_organization(orgname)
             except model.InvalidOrganizationException:
@@ -431,10 +526,11 @@ class OrganizationCollaboratorList(ApiResource):
         List outside collaborators of the specified organization.
         """
         permission = AdministerOrganizationPermission(orgname)
+        # Global readonly superusers can always view, regular superusers need FULL_ACCESS
         if (
             not permission.can()
-            and not allow_if_superuser()
             and not allow_if_global_readonly_superuser()
+            and not (features.SUPERUSERS_FULL_ACCESS and allow_if_superuser())
         ):
             raise Unauthorized()
 
@@ -483,7 +579,11 @@ class OrganizationMemberList(ApiResource):
         List the human members of the specified organization.
         """
         permission = AdministerOrganizationPermission(orgname)
-        if permission.can() or allow_if_superuser() or allow_if_global_readonly_superuser():
+        if (
+            permission.can()
+            or allow_if_global_readonly_superuser()
+            or allow_if_superuser_with_full_access()
+        ):
             try:
                 org = model.organization.get_organization(orgname)
             except model.InvalidOrganizationException:
@@ -544,7 +644,11 @@ class OrganizationMember(ApiResource):
         Retrieves the details of a member of the organization.
         """
         permission = AdministerOrganizationPermission(orgname)
-        if permission.can() or allow_if_superuser() or allow_if_global_readonly_superuser():
+        if (
+            permission.can()
+            or allow_if_global_readonly_superuser()
+            or allow_if_superuser_with_full_access()
+        ):
             # Lookup the user.
             member = model.user.get_user(membername)
             if not member:
@@ -594,7 +698,7 @@ class OrganizationMember(ApiResource):
         it from all teams in the organization.
         """
         permission = AdministerOrganizationPermission(orgname)
-        if permission.can() or allow_if_superuser():
+        if permission.can() or allow_if_superuser_with_full_access():
             # Lookup the user.
             user = model.user.get_nonrobot_user(membername)
             if not user:
@@ -638,6 +742,11 @@ class ApplicationInformation(ApiResource):
             "avatar": app_data,
             "organization": org_view(application.organization, []),
         }
+
+
+def _ensure_oauth_app_name_is_not_reserved(name):
+    if model.oauth.is_bootstrap_app_name(name):
+        request_error(message="Application name is reserved for bootstrap token provisioning")
 
 
 def app_view(application):
@@ -705,7 +814,11 @@ class OrganizationApplications(ApiResource):
         List the applications for the specified organization.
         """
         permission = AdministerOrganizationPermission(orgname)
-        if permission.can() or allow_if_superuser() or allow_if_global_readonly_superuser():
+        if (
+            permission.can()
+            or allow_if_global_readonly_superuser()
+            or allow_if_superuser_with_full_access()
+        ):
             try:
                 org = model.organization.get_organization(orgname)
             except model.InvalidOrganizationException:
@@ -724,13 +837,14 @@ class OrganizationApplications(ApiResource):
         Creates a new application under this organization.
         """
         permission = AdministerOrganizationPermission(orgname)
-        if permission.can() or allow_if_superuser():
+        if permission.can() or allow_if_superuser_with_full_access():
             try:
                 org = model.organization.get_organization(orgname)
             except model.InvalidOrganizationException:
                 raise NotFound()
 
             app_data = request.get_json()
+            _ensure_oauth_app_name_is_not_reserved(app_data["name"])
             application = model.oauth.create_application(
                 org,
                 app_data["name"],
@@ -795,7 +909,11 @@ class OrganizationApplicationResource(ApiResource):
         Retrieves the application with the specified client_id under the specified organization.
         """
         permission = AdministerOrganizationPermission(orgname)
-        if permission.can() or allow_if_superuser() or allow_if_global_readonly_superuser():
+        if (
+            permission.can()
+            or allow_if_global_readonly_superuser()
+            or allow_if_superuser_with_full_access()
+        ):
             try:
                 org = model.organization.get_organization(orgname)
             except model.InvalidOrganizationException:
@@ -817,7 +935,7 @@ class OrganizationApplicationResource(ApiResource):
         Updates an application under this organization.
         """
         permission = AdministerOrganizationPermission(orgname)
-        if permission.can() or allow_if_superuser():
+        if permission.can() or allow_if_superuser_with_full_access():
             try:
                 org = model.organization.get_organization(orgname)
             except model.InvalidOrganizationException:
@@ -828,6 +946,7 @@ class OrganizationApplicationResource(ApiResource):
                 raise NotFound()
 
             app_data = request.get_json()
+            _ensure_oauth_app_name_is_not_reserved(app_data["name"])
             application.name = app_data["name"]
             application.application_uri = app_data["application_uri"]
             application.redirect_uri = app_data["redirect_uri"]
@@ -851,7 +970,7 @@ class OrganizationApplicationResource(ApiResource):
         Deletes the application under this organization.
         """
         permission = AdministerOrganizationPermission(orgname)
-        if permission.can() or allow_if_superuser():
+        if permission.can() or allow_if_superuser_with_full_access():
             try:
                 org = model.organization.get_organization(orgname)
             except model.InvalidOrganizationException:
@@ -886,7 +1005,7 @@ class OrganizationApplicationResetClientSecret(ApiResource):
         Resets the client secret of the application.
         """
         permission = AdministerOrganizationPermission(orgname)
-        if permission.can() or allow_if_superuser():
+        if permission.can() or allow_if_superuser_with_full_access():
             try:
                 org = model.organization.get_organization(orgname)
             except model.InvalidOrganizationException:
@@ -943,10 +1062,11 @@ class OrganizationProxyCacheConfig(ApiResource):
         Retrieves the proxy cache configuration of the organization.
         """
         permission = OrganizationMemberPermission(orgname)
+        # Global readonly superusers can always view, regular superusers need FULL_ACCESS
         if (
             not permission.can()
-            and not allow_if_superuser()
             and not allow_if_global_readonly_superuser()
+            and not (features.SUPERUSERS_FULL_ACCESS and allow_if_superuser())
         ):
             raise Unauthorized()
 
@@ -964,7 +1084,7 @@ class OrganizationProxyCacheConfig(ApiResource):
         Creates proxy cache configuration for the organization.
         """
         permission = AdministerOrganizationPermission(orgname)
-        if not permission.can() and not allow_if_superuser():
+        if not permission.can() and not allow_if_superuser_with_full_access():
             raise Unauthorized()
 
         try:
@@ -973,20 +1093,49 @@ class OrganizationProxyCacheConfig(ApiResource):
         except model.InvalidProxyCacheConfigException:
             pass
 
+        # Check for org mirror in the organization
+        if features.ORG_MIRROR and is_namespace_org_mirrored(orgname):
+            raise request_error(
+                "Cannot create proxy cache: organization is managed by organization-level mirroring"
+            )
+
+        # Check for immutable tags in the organization
+        if features.IMMUTABLE_TAGS:
+            org = model.organization.get_organization(orgname)
+            if namespace_has_immutable_tags(org.id):
+                logger.warning(
+                    "Blocking proxy cache creation for org '%s': immutable tags exist",
+                    orgname,
+                )
+                raise request_error(
+                    "Cannot convert organization to proxy cache: immutable tags exist"
+                )
+
         data = request.get_json()
-        # filter None values
-        data = {k: v for k, v in data.items() if (v is not None or not "")}
+
+        _validate_upstream_registry(
+            data.get("upstream_registry", ""),
+            insecure=data.get("insecure", False),
+        )
 
         try:
-            config = model.proxy_cache.create_proxy_cache_config(**data)
+            config = model.proxy_cache.create_proxy_cache_config(
+                org_name=orgname,
+                upstream_registry=data.get("upstream_registry"),
+                upstream_registry_username=data.get("upstream_registry_username"),
+                upstream_registry_password=data.get("upstream_registry_password"),
+                expiration_s=data.get("expiration_s", 86400),
+                insecure=data.get("insecure", False),
+                allowed_hosts=_get_ssrf_allowed_hosts(),
+            )
             if config is not None:
                 log_action(
                     "create_proxy_cache_config",
                     orgname,
                     {
-                        "upstream_registry": data["upstream_registry"]
-                        if data["upstream_registry"]
-                        else None
+                        "upstream_registry": (
+                            data["upstream_registry"] if data["upstream_registry"] else None
+                        )
                     },
                 )
                 return "Created", 201
@@ -1001,7 +1150,7 @@ class OrganizationProxyCacheConfig(ApiResource):
         Delete proxy cache configuration for the organization.
         """
         permission = AdministerOrganizationPermission(orgname)
-        if not permission.can() and not allow_if_superuser():
+        if not permission.can() and not allow_if_superuser_with_full_access():
             raise Unauthorized()
 
         try:
@@ -1044,12 +1193,12 @@ class ProxyCacheConfigValidation(ApiResource):
     @validate_json_request("NewProxyCacheConfig")
     def post(self, orgname):
         permission = AdministerOrganizationPermission(orgname)
-        if not permission.can() and not allow_if_superuser():
+        if not permission.can() and not allow_if_superuser_with_full_access():
             raise Unauthorized()
 
         try:
             model.proxy_cache.get_proxy_cache_config_for_org(orgname)
-            request_error("Proxy Cache Configuration already exists")
+            raise request_error("Proxy Cache Configuration already exists")
         except model.InvalidProxyCacheConfigException:
             pass
 
@@ -1057,6 +1206,11 @@ class ProxyCacheConfigValidation(ApiResource):
 
         # filter None values
         data = {k: v for k, v in data.items() if v is not None}
+
+        _validate_upstream_registry(
+            data.get("upstream_registry", ""),
+            insecure=data.get("insecure", False),
+        )
 
         try:
             config = ProxyCacheConfig(**data)
@@ -1069,6 +1223,8 @@ class ProxyCacheConfigValidation(ApiResource):
                 return "Valid", 202
             if response.status_code == 401:
                 return "Anonymous", 202
+        except SSRFBlockedError:
+            raise request_error(SSRF_GENERIC_ERROR)
         except UpstreamRegistryError as e:
             raise request_error(
                 message="Failed login to remote registry. Please verify entered details and try again."

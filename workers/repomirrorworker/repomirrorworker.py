@@ -9,7 +9,12 @@ from util.log import logfile_path
 from util.repomirror.skopeomirror import SkopeoMirror
 from util.repomirror.validator import RepoMirrorConfigValidator
 from workers.gunicorn_worker import GunicornWorker
-from workers.repomirrorworker import process_mirrors
+from workers.repomirrorworker import (
+    process_mirrors,
+    process_org_mirror_discovery,
+    process_org_mirrors,
+    repo_mirror_workers_active,
+)
 from workers.worker import Worker
 
 logger = logging.getLogger(__name__)
@@ -20,20 +25,60 @@ DEFAULT_MIRROR_INTERVAL = 30
 class RepoMirrorWorker(Worker):
     def __init__(self):
         super(RepoMirrorWorker, self).__init__()
-        RepoMirrorConfigValidator(app.config.get("FEATURE_REPO_MIRROR", False)).valid()
+        RepoMirrorConfigValidator(features.REPO_MIRROR).valid()
 
         self._mirrorer = SkopeoMirror()
         self._next_token = None
+        self._org_discovery_token = None
+        self._org_next_token = None
 
+        # Repository-level mirror operation
         interval = app.config.get("REPO_MIRROR_INTERVAL", DEFAULT_MIRROR_INTERVAL)
         self.add_operation(self._process_mirrors, interval)
 
+        # Organization-level mirror operations (if enabled)
+        # Discovery phase runs first to populate OrgMirrorRepository table
+        org_interval = app.config.get("ORG_MIRROR_INTERVAL", DEFAULT_MIRROR_INTERVAL)
+        self.add_operation(self._process_org_mirror_discovery, org_interval)
+        self.add_operation(self._process_org_mirrors, org_interval)
+
+        if features.REPO_MIRROR:
+            repo_mirror_workers_active.set(1)
+
+    def terminate(self, signal_num=None, stack_frame=None, graceful=False):
+        if features.REPO_MIRROR:
+            repo_mirror_workers_active.set(0)
+        super(RepoMirrorWorker, self).terminate(signal_num, stack_frame, graceful)
+
     def _process_mirrors(self):
         while True:
-            assert app.config.get("FEATURE_REPO_MIRROR", False)
+            assert features.REPO_MIRROR
 
             self._next_token = process_mirrors(self._mirrorer, self._next_token)
             if self._next_token is None:
+                break
+
+    def _process_org_mirror_discovery(self):
+        """
+        Discover repositories from source registries for org-level mirrors.
+
+        Phase 1: Fetches repository list from source, applies filters,
+        and populates OrgMirrorRepository table for subsequent sync.
+        """
+        while True:
+            self._org_discovery_token = process_org_mirror_discovery(self._org_discovery_token)
+            if self._org_discovery_token is None:
+                break
+
+    def _process_org_mirrors(self):
+        """
+        Process organization-level mirror repositories.
+
+        Phase 2: Syncs tags for discovered repositories in OrgMirrorRepository table.
+        """
+        while True:
+            self._org_next_token = process_org_mirrors(self._mirrorer, self._org_next_token)
+            if self._org_next_token is None:
                 break
 
 

@@ -41,6 +41,7 @@ def add_enterprise_config_defaults(config_obj, current_secret_key):
     config_obj["FEATURE_MAILING"] = config_obj.get("FEATURE_MAILING", False)
     config_obj["FEATURE_BUILD_SUPPORT"] = config_obj.get("FEATURE_BUILD_SUPPORT", False)
     config_obj["FEATURE_REPO_MIRROR"] = config_obj.get("FEATURE_REPO_MIRROR", False)
+    config_obj["FEATURE_ORG_MIRROR"] = config_obj.get("FEATURE_ORG_MIRROR", False)
 
     # Default repo mirror config.
     config_obj["REPO_MIRROR_TLS_VERIFY"] = config_obj.get("REPO_MIRROR_TLS_VERIFY", True)
@@ -52,6 +53,9 @@ def add_enterprise_config_defaults(config_obj, current_secret_key):
     )
 
     config_obj["FEATURE_SECURITY_SCANNER"] = config_obj.get("FEATURE_SECURITY_SCANNER", False)
+    config_obj["SECURITY_SCANNER_V4_INDEXING"] = config_obj.get(
+        "SECURITY_SCANNER_V4_INDEXING", True
+    )
 
     # Default time machine config.
     config_obj["TAG_EXPIRATION_OPTIONS"] = config_obj.get(

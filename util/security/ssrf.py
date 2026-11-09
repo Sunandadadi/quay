@@ -1,0 +1,492 @@
+# -*- coding: utf-8 -*-
+"""
+SSRF prevention utilities for validating user-supplied URLs.
+"""
+
+import ipaddress
+import logging
+import os
+import re
+from enum import Enum
+from socket import AF_UNSPEC, SOCK_STREAM
+from socket import gaierror as _gaierror
+from socket import getaddrinfo as _getaddrinfo
+from typing import List, Mapping, Optional
+from urllib.parse import urlparse, urlsplit
+
+from requests.utils import should_bypass_proxies
+
+logger = logging.getLogger(__name__)
+
+
+class SSRFBlockedError(ValueError):
+    """Raised when a URL is rejected due to SSRF protection.
+
+    Subclasses ValueError so existing defense-in-depth ``except ValueError``
+    handlers (e.g. in the data-model layer) continue to work without
+    modification.  The API layer catches this type explicitly to return a
+    generic error message instead of leaking internal network topology.
+    """
+
+
+# Private and reserved IP networks that must never be accessed by user-controlled URLs.
+# Based on OWASP SSRF Prevention Cheat Sheet and IANA Special-Purpose Address Registries.
+BLOCKED_NETWORKS = [
+    ipaddress.ip_network("0.0.0.0/8"),  # "This host" (RFC 1122)
+    ipaddress.ip_network("10.0.0.0/8"),  # Private Class A (RFC 1918)
+    ipaddress.ip_network("100.64.0.0/10"),  # Shared Address Space / CGN (RFC 6598)
+    ipaddress.ip_network("127.0.0.0/8"),  # Loopback (RFC 1122)
+    ipaddress.ip_network("169.254.0.0/16"),  # Link-Local / AWS metadata (RFC 3927)
+    ipaddress.ip_network("172.16.0.0/12"),  # Private Class B (RFC 1918)
+    ipaddress.ip_network("192.0.0.0/24"),  # IETF Protocol Assignments (RFC 6890)
+    ipaddress.ip_network("192.0.2.0/24"),  # TEST-NET-1 (RFC 5737)
+    ipaddress.ip_network("192.168.0.0/16"),  # Private Class C (RFC 1918)
+    ipaddress.ip_network("198.18.0.0/15"),  # Benchmarking (RFC 2544)
+    ipaddress.ip_network("198.51.100.0/24"),  # TEST-NET-2 (RFC 5737)
+    ipaddress.ip_network("203.0.113.0/24"),  # TEST-NET-3 (RFC 5737)
+    ipaddress.ip_network("224.0.0.0/4"),  # Multicast (RFC 3171)
+    ipaddress.ip_network("240.0.0.0/4"),  # Reserved for future use (RFC 1112)
+    ipaddress.ip_network("255.255.255.255/32"),  # Broadcast
+    ipaddress.ip_network("::1/128"),  # IPv6 loopback
+    ipaddress.ip_network("64:ff9b::/96"),  # NAT64 well-known prefix (RFC 6052)
+    ipaddress.ip_network("100::/64"),  # Discard-Only (RFC 6666)
+    ipaddress.ip_network("2001:db8::/32"),  # Documentation (RFC 3849)
+    ipaddress.ip_network("fc00::/7"),  # IPv6 unique local (RFC 4193)
+    ipaddress.ip_network("fe80::/10"),  # IPv6 link-local (RFC 4291)
+    ipaddress.ip_network("::ffff:0:0/96"),  # IPv4-mapped IPv6 (RFC 4291)
+]
+
+# Hostnames that resolve to internal services and must be blocked regardless of DNS.
+BLOCKED_HOSTNAMES = {
+    "localhost",
+    "metadata.google.internal",  # GCP metadata service
+    "metadata.azure.internal",  # Azure Instance Metadata Service (IMDS)
+    "metadata",  # Common cloud metadata alias
+    "kubernetes.default.svc",  # Kubernetes API
+    "kubernetes.default.svc.cluster.local",  # Kubernetes API (FQDN)
+    "kubernetes.default",  # Kubernetes API
+    "kubernetes",  # Kubernetes API
+}
+
+ALLOWED_SCHEMES = {"http", "https"}
+
+_REGISTRY_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+)
+
+
+class ProxyRoute(str, Enum):
+    DIRECT = "direct"
+    PROXY = "proxy"
+    UNKNOWN = "unknown"
+
+
+def _proxy_route_for_url(
+    url: str,
+    proxy_config: Optional[Mapping[str, Optional[str]]],
+) -> ProxyRoute:
+    if not proxy_config:
+        return ProxyRoute.DIRECT
+
+    try:
+        parsed = urlsplit(url)
+        scheme = parsed.scheme.lower()
+        if scheme not in ("http", "https") or not parsed.hostname:
+            return ProxyRoute.UNKNOWN
+    except (TypeError, ValueError):
+        return ProxyRoute.UNKNOWN
+
+    no_proxy = proxy_config.get("no_proxy")
+    if no_proxy:
+        # proxy_config values are Optional[str]; a truthy value is already a str.
+        try:
+            if should_bypass_proxies(url, no_proxy=no_proxy):
+                return ProxyRoute.DIRECT
+        except (TypeError, ValueError):
+            return ProxyRoute.UNKNOWN
+
+    # Prefer scheme-specific proxy, then ALL_PROXY — same order as requests/urllib3.
+    proxy_url = proxy_config.get(f"{scheme}_proxy")
+    if proxy_url is None or proxy_url == "":
+        proxy_url = proxy_config.get("all_proxy")
+    if proxy_url is None or proxy_url == "":
+        return ProxyRoute.DIRECT
+    if not proxy_url.strip():
+        return ProxyRoute.UNKNOWN
+
+    return ProxyRoute.PROXY
+
+
+# Public alias for unit tests and integration assertions.
+proxy_route_for_url = _proxy_route_for_url
+
+
+def get_environment_proxy_config() -> Optional[Mapping[str, Optional[str]]]:
+    """
+    Return HTTP(S) proxy settings from the process environment.
+
+    Used for proxy-cache SSRF validation where outbound registry traffic is
+    routed through Quay's configured HTTP_PROXY/HTTPS_PROXY (or ALL_PROXY)
+    rather than a per-mirror proxy block in external_registry_config.
+
+    Matches requests environment proxy selection: lowercase variables win over
+    uppercase, and ALL_PROXY/all_proxy is honoured when scheme-specific
+    proxies are unset.
+    """
+    http_proxy = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
+    https_proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+    all_proxy = os.environ.get("all_proxy") or os.environ.get("ALL_PROXY")
+    no_proxy = os.environ.get("no_proxy") or os.environ.get("NO_PROXY")
+    if not http_proxy and not https_proxy and not all_proxy:
+        return None
+    return {
+        "http_proxy": http_proxy,
+        "https_proxy": https_proxy,
+        "all_proxy": all_proxy,
+        "no_proxy": no_proxy,
+    }
+
+
+def resolve_proxy_config_for_ssrf(
+    explicit_proxy: Optional[Mapping[str, Optional[str]]] = None,
+) -> Optional[Mapping[str, Optional[str]]]:
+    """
+    Resolve proxy settings for SSRF validation.
+
+    Prefer an explicit per-mirror proxy mapping when it defines a usable proxy
+    URL (http_proxy, https_proxy, or all_proxy). Otherwise fall back to process
+    environment proxies so validation matches Skopeo/requests ambient routing
+    when mirror UI proxy fields are empty.
+
+    When an explicit mapping sets only some scheme keys, fill the unset schemes
+    from the process environment so validation matches Skopeo/requests (which
+    keep ambient proxies for schemes the mirror does not override). Explicit
+    ``no_proxy`` is preserved when present; otherwise ambient ``no_proxy`` is
+    cleared to match ``SkopeoMirror.setup_env``.
+
+    A no_proxy-only explicit mapping overlays its bypass rule on the environment
+    proxy mapping (or is returned as-is when no ambient proxy is set).
+    """
+    # Keep the truthiness check on ``explicit_proxy`` in this ``if`` so mypy
+    # narrows it away from Optional before ``.get`` / ``in`` below.
+    if explicit_proxy and (
+        explicit_proxy.get("http_proxy")
+        or explicit_proxy.get("https_proxy")
+        or explicit_proxy.get("all_proxy")
+    ):
+        # all_proxy alone covers both schemes for routing; both scheme-specific
+        # keys already set means nothing to inherit from the environment.
+        if explicit_proxy.get("all_proxy") and not (
+            explicit_proxy.get("http_proxy") or explicit_proxy.get("https_proxy")
+        ):
+            return explicit_proxy
+        if explicit_proxy.get("http_proxy") and explicit_proxy.get("https_proxy"):
+            return explicit_proxy
+
+        environment_proxy = get_environment_proxy_config()
+        if not environment_proxy:
+            return explicit_proxy
+        return {
+            "http_proxy": explicit_proxy.get("http_proxy") or environment_proxy.get("http_proxy"),
+            "https_proxy": explicit_proxy.get("https_proxy")
+            or environment_proxy.get("https_proxy"),
+            "all_proxy": explicit_proxy.get("all_proxy") or environment_proxy.get("all_proxy"),
+            "no_proxy": (explicit_proxy.get("no_proxy") if "no_proxy" in explicit_proxy else None),
+        }
+
+    environment_proxy = get_environment_proxy_config()
+    explicit_no_proxy = explicit_proxy.get("no_proxy") if explicit_proxy else None
+    if explicit_no_proxy:
+        if environment_proxy:
+            return {
+                **environment_proxy,
+                "no_proxy": explicit_no_proxy,
+            }
+        return explicit_proxy
+    return environment_proxy
+
+
+def _is_ip_blocked(ip_str: str) -> bool:
+    """
+    Check whether an IP address is unsafe for a user-controlled destination.
+
+    Only globally routable unicast addresses are allowed by default. The explicit
+    network list remains necessary for globally classified translation ranges such
+    as NAT64 and IPv4-mapped IPv6.
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True  # Unparseable IPs are treated as blocked
+
+    return (
+        any(ip in network for network in BLOCKED_NETWORKS)
+        or not ip.is_global
+        or ip.is_multicast
+        or getattr(ip, "is_site_local", False)
+    )
+
+
+def _is_allowed(hostname: str, ip_str: Optional[str], allowed_hosts: List[str]) -> bool:
+    """
+    Check if a hostname or IP is in the configured allowlist.
+
+    Each entry in allowed_hosts can be a hostname (matched case-insensitively)
+    or a CIDR range (matched against the IP).
+
+    Args:
+        hostname: The hostname being validated
+        ip_str: The resolved IP address (or None if not resolved yet)
+        allowed_hosts: List of allowed hostnames or CIDR ranges
+
+    Returns:
+        True if the hostname or IP is explicitly allowed
+    """
+    hostname_lower = hostname.lower()
+
+    for entry in allowed_hosts:
+        # Try as CIDR range first
+        try:
+            network = ipaddress.ip_network(entry, strict=False)
+            if ip_str:
+                try:
+                    if ipaddress.ip_address(ip_str) in network:
+                        return True
+                except ValueError:
+                    pass
+            # Also check if hostname itself is an IP in this network
+            try:
+                if ipaddress.ip_address(hostname) in network:
+                    return True
+            except ValueError:
+                pass
+            continue
+        except ValueError:
+            pass
+
+        # Match as hostname (case-insensitive)
+        if entry.lower() == hostname_lower:
+            return True
+
+    return False
+
+
+def validate_external_registry_reference(
+    reference: str,
+    resolve_dns: bool = True,
+    allowed_hosts: Optional[List[str]] = None,
+    proxy_config: Optional[Mapping[str, Optional[str]]] = None,
+) -> None:
+    """
+    Validate a scheme-less container registry reference used by repository mirroring.
+
+    Repository mirror references have the form ``registry[:port]/namespace/repository``.
+    Only the registry authority determines the network destination, so it is normalized
+    to an HTTPS URL before applying the shared SSRF checks.
+
+    Args:
+        reference: Scheme-less external repository reference
+        resolve_dns: Whether to resolve and validate the registry hostname
+        allowed_hosts: Optional hostnames/CIDRs that bypass the blocklist
+        proxy_config: Mirror/proxy-cache proxy settings (http_proxy, https_proxy, no_proxy)
+
+    Raises:
+        SSRFBlockedError: If the registry destination is blocked
+        ValueError: If the reference is empty or malformed
+    """
+    if not reference or not isinstance(reference, str):
+        raise ValueError("External registry reference is required")
+
+    if not reference.strip():
+        raise ValueError("External registry reference is required")
+
+    if reference != reference.strip() or any(char.isspace() for char in reference):
+        raise ValueError("External registry reference must not include whitespace")
+
+    if "://" in reference:
+        raise ValueError("External registry reference must not include a URL scheme")
+
+    if any(char in reference for char in ("?", "#", "\\", "%")):
+        raise ValueError("External registry reference contains an invalid character")
+
+    reference_parts = reference.split("/", 1)
+    if len(reference_parts) != 2 or not all(reference_parts):
+        raise ValueError("External registry reference must include a repository path")
+
+    registry = reference_parts[0]
+    if registry.startswith("["):
+        bracket_end = registry.find("]")
+        suffix = registry[bracket_end + 1 :] if bracket_end >= 0 else None
+        if bracket_end < 0 or (suffix and not suffix.startswith(":")):
+            raise ValueError("External registry reference contains an invalid registry authority")
+        if suffix == ":":
+            raise ValueError("External registry reference contains an invalid registry port")
+    else:
+        if registry.count(":") > 1:
+            raise ValueError("External registry reference contains an invalid registry authority")
+        if registry.endswith(":"):
+            raise ValueError("External registry reference contains an invalid registry port")
+
+    try:
+        parsed_registry = urlparse(f"https://{registry}")
+        hostname = parsed_registry.hostname
+        port = parsed_registry.port
+    except ValueError:
+        raise ValueError("External registry reference contains an invalid registry authority")
+
+    if parsed_registry.username or parsed_registry.password or not hostname:
+        raise ValueError("External registry reference must include a valid registry hostname")
+
+    if port == 0:
+        raise ValueError("External registry reference contains an invalid registry port")
+
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        if hostname.endswith(".") or not _REGISTRY_HOSTNAME_RE.fullmatch(hostname):
+            raise ValueError("External registry reference must include a valid registry hostname")
+
+    validate_external_registry_url(
+        f"https://{registry}",
+        resolve_dns=resolve_dns,
+        allowed_hosts=allowed_hosts,
+        proxy_config=proxy_config,
+    )
+
+
+def validate_external_registry_url(
+    url: str,
+    resolve_dns: bool = True,
+    allowed_hosts: Optional[List[str]] = None,
+    proxy_config: Optional[Mapping[str, Optional[str]]] = None,
+) -> None:
+    """
+    Validate an external registry URL to prevent Server-Side Request Forgery (SSRF).
+
+    Checks:
+        1. URL is non-empty and well-formed
+        2. Scheme is http or https only
+        3. Hostname is present and not in the blocked list
+        4. No userinfo (username:password) in the URL authority
+        5. If hostname is an IP literal, it is not in a blocked network
+        6. DNS resolution of hostname does not yield any blocked IPs (when resolve_dns=True)
+
+    Hosts in the allowed_hosts list bypass the blocklist check (but not scheme/format checks).
+
+    Args:
+        url: The external registry URL to validate
+        resolve_dns: Whether to resolve hostnames via DNS and check resulting IPs.
+            Set to False for defense-in-depth layers where DNS resolution may not
+            be appropriate (e.g., data model layer). The API layer and adapter
+            constructor should always use True (the default).
+        allowed_hosts: Optional list of hostnames or CIDR ranges that bypass the
+            blocklist. Populated from the SSRF_ALLOWED_HOSTS config option.
+        proxy_config: Optional mirror proxy settings used to determine whether
+            outbound requests route through a configured proxy.
+
+    Raises:
+        SSRFBlockedError: If the URL is blocked by SSRF protection (blocked
+            hostname, private/reserved IP, or DNS resolving to a blocked IP).
+            Subclass of ValueError.
+        ValueError: If the URL fails a format/syntax check (bad scheme,
+            embedded credentials, missing hostname, DNS resolution failure)
+    """
+    if not url or not isinstance(url, str):
+        raise ValueError("External registry URL is required")
+
+    url = url.strip()
+    if not url:
+        raise ValueError("External registry URL is required")
+
+    # Parse the URL
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        raise ValueError("Invalid URL format")
+
+    # Check scheme
+    if parsed.scheme not in ALLOWED_SCHEMES:
+        raise ValueError(f"Invalid URL scheme '{parsed.scheme}': only HTTP and HTTPS are allowed")
+
+    # Check for userinfo in URL (e.g., http://user:pass@host/)
+    if parsed.username or parsed.password:
+        raise ValueError("URLs with embedded credentials are not allowed")
+
+    # Extract hostname
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("URL must include a hostname")
+
+    _allowed_hosts = allowed_hosts or []
+
+    # Check blocked hostnames (case-insensitive)
+    hostname_lower = hostname.lower()
+    blocked_by_name = (
+        hostname_lower in BLOCKED_HOSTNAMES
+        or hostname_lower.endswith(".internal")
+        or hostname_lower.endswith(".local")
+    )
+    name_allowlisted = _is_allowed(hostname, None, _allowed_hosts)
+    if blocked_by_name and not name_allowlisted and not resolve_dns:
+        logger.warning("SSRF blocked: hostname '%s' is not allowed", hostname)
+        raise SSRFBlockedError(f"Hostname '{hostname}' is not allowed")
+
+    # Check if hostname is an IP address literal
+    try:
+        ip = ipaddress.ip_address(hostname)
+        if _is_ip_blocked(str(ip)):
+            if not _is_allowed(hostname, str(ip), _allowed_hosts):
+                logger.warning("SSRF blocked: IP literal '%s' is in a blocked network", hostname)
+                raise SSRFBlockedError("URL points to a private or reserved IP address")
+        # IP literal is allowed (public or allowlisted), no DNS resolution needed
+        return
+    except SSRFBlockedError:
+        raise
+    except ValueError:
+        # Not an IP literal, continue with hostname validation
+        pass
+
+    # Use explicit proxy_config supplied by the caller.
+    # Do not call os.environ directly here.
+    route = _proxy_route_for_url(url, proxy_config)
+    if route is ProxyRoute.PROXY:
+        if name_allowlisted:
+            resolve_dns = False
+        elif blocked_by_name:
+            has_cidr_allowlist = any("/" in entry for entry in _allowed_hosts)
+            if not has_cidr_allowlist:
+                logger.warning("SSRF blocked: hostname '%s' is not allowed", hostname)
+                raise SSRFBlockedError(f"Hostname '{hostname}' is not allowed")
+
+    if not resolve_dns:
+        return
+
+    # Resolve hostname and check all resulting IPs
+    try:
+        addr_infos = _getaddrinfo(hostname, None, AF_UNSPEC, SOCK_STREAM)
+    except _gaierror:
+        raise ValueError(f"Cannot resolve hostname '{hostname}'")
+
+    if not addr_infos:
+        raise ValueError(f"Cannot resolve hostname '{hostname}'")
+
+    resolved_ips = [addr_info[4][0] for addr_info in addr_infos]
+
+    # If the hostname was blocked by name but not allowlisted by hostname match,
+    # check if any resolved IP matches a CIDR entry in the allowlist.
+    # This allows CIDR-based allowlisting of .internal/.local hostnames.
+    if blocked_by_name and not name_allowlisted:
+        if not any(_is_allowed(hostname, ip, _allowed_hosts) for ip in resolved_ips):
+            logger.warning("SSRF blocked: hostname '%s' is not allowed", hostname)
+            raise SSRFBlockedError(f"Hostname '{hostname}' is not allowed")
+
+    for ip_str in resolved_ips:
+        if _is_ip_blocked(ip_str):
+            if not _is_allowed(hostname, ip_str, _allowed_hosts):
+                logger.warning(
+                    "SSRF blocked: hostname '%s' resolves to private/reserved IP '%s'",
+                    hostname,
+                    ip_str,
+                )
+                raise SSRFBlockedError("URL resolves to a private or reserved IP address")

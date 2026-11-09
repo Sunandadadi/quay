@@ -1,12 +1,23 @@
 import {ReactElement, useState} from 'react';
 import {
+  Dropdown,
   DropdownItem,
+  DropdownList,
+  MenuItem,
+  MenuToggle,
+  MenuToggleElement,
   Toolbar,
   ToolbarContent,
   ToolbarItem,
 } from '@patternfly/react-core';
+import {CogIcon} from '@patternfly/react-icons';
 import {useRecoilState} from 'recoil';
-import {searchTagsState, selectedTagsState} from 'src/atoms/TagListState';
+import {
+  searchTagsState,
+  selectedTagsState,
+  showSignaturesState,
+  expandedViewState,
+} from 'src/atoms/TagListState';
 import {Tag} from 'src/resources/TagResource';
 import {DeleteModal, ModalOptions} from './DeleteModal';
 import {ToolbarPagination} from 'src/components/toolbar/ToolbarPagination';
@@ -15,9 +26,13 @@ import {SearchDropdown} from 'src/components/toolbar/SearchDropdown';
 import {DropdownCheckbox} from 'src/components/toolbar/DropdownCheckbox';
 import ColumnNames from './ColumnNames';
 import {SearchState} from 'src/components/toolbar/SearchTypes';
-import {RepositoryDetails} from 'src/resources/RepositoryResource';
+import {
+  RepositoryDetails,
+  isNonNormalState,
+} from 'src/resources/RepositoryResource';
 import {useQuayConfig} from 'src/hooks/UseQuayConfig';
 import EditExpirationModal from './TagsActionsEditExpirationModal';
+import ImmutabilityModal from './TagsActionsImmutabilityModal';
 import {FilterInput} from 'src/components/toolbar/FilterInput';
 
 export function TagsToolbar(props: ToolBarProps) {
@@ -28,9 +43,62 @@ export function TagsToolbar(props: ToolBarProps) {
   });
   const [selectedTags, setSelectedTags] = useRecoilState(selectedTagsState);
   const [search, setSearch] = useRecoilState<SearchState>(searchTagsState);
+  const [showSignatures, setShowSignatures] =
+    useRecoilState(showSignaturesState);
+  const [expandedView, setExpandedView] = useRecoilState(expandedViewState);
   const [isEditExpirationModalOpen, setIsEditExpirationModalOpen] =
     useState(false);
+  const [isImmutabilityModalOpen, setIsImmutabilityModalOpen] = useState(false);
+  const [isRemoveImmutabilityModalOpen, setIsRemoveImmutabilityModalOpen] =
+    useState(false);
   const [isKebabOpen, setKebabOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+
+  const handleSearchChange = (searchState) => {
+    setSearch(searchState);
+    props.setPage(1);
+  };
+
+  // Filter selected tags to get only mutable ones for bulk immutability
+  const selectedMutableTags = selectedTags.filter((tagName) => {
+    const tag = props.TagList.find((t) => t.name === tagName);
+    return tag && !tag.immutable;
+  });
+
+  // Filter selected tags to get immutable ones for delete warning
+  const selectedImmutableTags = selectedTags.filter((tagName) => {
+    const tag = props.TagList.find((t) => t.name === tagName);
+    return tag && tag.immutable;
+  });
+
+  // Check if immutable tags can expire
+  const canImmutableTagsExpire =
+    quayConfig?.config?.FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE ?? false;
+
+  // Filter mutable tags that have expiration (can't be made immutable when config disallows)
+  const selectedMutableTagsWithExpiration = canImmutableTagsExpire
+    ? []
+    : selectedMutableTags.filter((tagName) => {
+        const tag = props.TagList.find((t) => t.name === tagName);
+        return tag && tag.expiration;
+      });
+
+  // Mutable tags without expiration (or all if config allows expiration)
+  const selectedMutableTagsForImmutability = canImmutableTagsExpire
+    ? selectedMutableTags
+    : selectedMutableTags.filter((tagName) => {
+        const tag = props.TagList.find((t) => t.name === tagName);
+        return tag && !tag.expiration;
+      });
+
+  // Determine tooltip for delete actions when all selected tags are immutable
+  let deleteTooltip: string | undefined;
+  if (selectedTags.length > 0 && selectedMutableTags.length === 0) {
+    deleteTooltip = 'All selected tags are immutable and cannot be deleted';
+  }
+
+  const isNonNormalRepo = isNonNormalState(props.repoDetails?.state);
+
   const kebabItems: ReactElement[] = [
     <DropdownItem
       key="set-expiration"
@@ -38,7 +106,12 @@ export function TagsToolbar(props: ToolBarProps) {
         setKebabOpen(!isKebabOpen);
         setIsEditExpirationModalOpen(true);
       }}
-      isDisabled={selectedTags.length <= 0}
+      isDisabled={selectedTags.length <= 0 || isNonNormalRepo}
+      tooltipProps={
+        isNonNormalRepo
+          ? {content: 'Tag expiration cannot be modified on this repository'}
+          : undefined
+      }
     >
       Set expiration
     </DropdownItem>,
@@ -51,12 +124,74 @@ export function TagsToolbar(props: ToolBarProps) {
           isOpen: !prevOptions.isOpen,
         }));
       }}
-      isDisabled={selectedTags.length <= 0}
+      isDisabled={selectedMutableTags.length <= 0}
+      tooltipProps={deleteTooltip ? {content: deleteTooltip} : undefined}
       style={{color: 'red'}}
+      data-testid="bulk-remove-action"
     >
       Remove
     </DropdownItem>,
   ];
+
+  // Add immutability action if feature is enabled
+  if (quayConfig?.features?.IMMUTABLE_TAGS) {
+    // Determine tooltip content
+    let immutableTooltip: string | undefined;
+    if (selectedTags.length > 0 && selectedMutableTags.length === 0) {
+      immutableTooltip = 'All selected tags are already immutable';
+    } else if (
+      selectedMutableTags.length > 0 &&
+      selectedMutableTagsForImmutability.length === 0 &&
+      !canImmutableTagsExpire
+    ) {
+      immutableTooltip =
+        'All selected mutable tags have expiration dates. Clear expiration first.';
+    }
+
+    // Determine tooltip for remove immutability
+    let removeImmutableTooltip: string | undefined;
+    if (selectedTags.length > 0 && selectedImmutableTags.length === 0) {
+      removeImmutableTooltip = 'No immutable tags selected';
+    } else if (!props.repoDetails?.can_admin) {
+      removeImmutableTooltip =
+        'Admin permission is required to remove immutability';
+    }
+
+    kebabItems.splice(
+      1, // Insert after "Set expiration"
+      0,
+      <DropdownItem
+        key="make-immutable"
+        onClick={() => {
+          setKebabOpen(!isKebabOpen);
+          setIsImmutabilityModalOpen(true);
+        }}
+        isDisabled={selectedMutableTagsForImmutability.length <= 0}
+        tooltipProps={
+          immutableTooltip ? {content: immutableTooltip} : undefined
+        }
+        data-testid="bulk-make-immutable-action"
+      >
+        Make immutable
+      </DropdownItem>,
+      <DropdownItem
+        key="remove-immutability"
+        onClick={() => {
+          setKebabOpen(!isKebabOpen);
+          setIsRemoveImmutabilityModalOpen(true);
+        }}
+        isDisabled={
+          selectedImmutableTags.length <= 0 || !props.repoDetails?.can_admin
+        }
+        tooltipProps={
+          removeImmutableTooltip ? {content: removeImmutableTooltip} : undefined
+        }
+        data-testid="bulk-remove-immutability-action"
+      >
+        Remove immutability
+      </DropdownItem>,
+    );
+  }
 
   if (
     quayConfig?.config?.PERMANENTLY_DELETE_TAGS &&
@@ -72,7 +207,8 @@ export function TagsToolbar(props: ToolBarProps) {
             isOpen: !prevOptions.isOpen,
           }));
         }}
-        isDisabled={selectedTags.length <= 0}
+        isDisabled={selectedMutableTags.length <= 0}
+        tooltipProps={deleteTooltip ? {content: deleteTooltip} : undefined}
         style={{color: 'red'}}
       >
         Permanently delete
@@ -92,14 +228,58 @@ export function TagsToolbar(props: ToolBarProps) {
         />
         <SearchDropdown
           searchState={search}
-          setSearchState={setSearch}
+          setSearchState={handleSearchChange}
           items={[ColumnNames.name, ColumnNames.digest]}
         />
         <FilterInput
           id="tagslist-search-input"
           searchState={search}
-          onChange={setSearch}
+          onChange={handleSearchChange}
         />
+        <ToolbarItem>
+          <Dropdown
+            toggle={(toggleRef: React.Ref<MenuToggleElement>) => (
+              <MenuToggle
+                ref={toggleRef}
+                id="tags-settings-toggle"
+                aria-label="Tags view settings"
+                variant="plain"
+                onClick={() => setIsSettingsOpen(!isSettingsOpen)}
+                isExpanded={isSettingsOpen}
+              >
+                <CogIcon />
+              </MenuToggle>
+            )}
+            isOpen={isSettingsOpen}
+            onOpenChange={(isOpen) => setIsSettingsOpen(isOpen)}
+            popperProps={{
+              enableFlip: true,
+              position: 'center',
+              direction: 'up',
+            }}
+          >
+            <DropdownList>
+              <MenuItem
+                itemId="expanded-view"
+                description="Display additional tag details inline"
+                hasCheckbox
+                isSelected={expandedView}
+                onClick={() => setExpandedView(!expandedView)}
+              >
+                Expanded View
+              </MenuItem>
+              <MenuItem
+                itemId="show-signatures"
+                description="Display cosign signature tags"
+                hasCheckbox
+                isSelected={showSignatures}
+                onClick={() => setShowSignatures(!showSignatures)}
+              >
+                Show Signatures
+              </MenuItem>
+            </DropdownList>
+          </Dropdown>
+        </ToolbarItem>
         <ToolbarItem>
           {selectedTags?.length !== 0 ? (
             <Kebab
@@ -107,6 +287,7 @@ export function TagsToolbar(props: ToolBarProps) {
               setKebabOpen={setKebabOpen}
               kebabItems={kebabItems}
               useActions={true}
+              data-testid="bulk-actions-kebab"
             />
           ) : null}
         </ToolbarItem>
@@ -122,7 +303,8 @@ export function TagsToolbar(props: ToolBarProps) {
       <DeleteModal
         modalOptions={modalOptions}
         setModalOptions={setModalOptions}
-        tags={selectedTags}
+        tags={selectedMutableTags}
+        immutableTags={selectedImmutableTags}
         onComplete={() => {
           setSelectedTags([]);
         }}
@@ -131,12 +313,40 @@ export function TagsToolbar(props: ToolBarProps) {
         loadTags={props.loadTags}
         repoDetails={props.repoDetails}
       />
-      <EditExpirationModal
+      {!isNonNormalRepo && (
+        <EditExpirationModal
+          org={props.organization}
+          repo={props.repository}
+          isOpen={isEditExpirationModalOpen}
+          setIsOpen={setIsEditExpirationModalOpen}
+          tags={selectedTags}
+          immutableTags={canImmutableTagsExpire ? [] : selectedImmutableTags}
+          loadTags={props.loadTags}
+          onComplete={() => {
+            setSelectedTags([]);
+          }}
+        />
+      )}
+      <ImmutabilityModal
         org={props.organization}
         repo={props.repository}
-        isOpen={isEditExpirationModalOpen}
-        setIsOpen={setIsEditExpirationModalOpen}
-        tags={selectedTags}
+        isOpen={isImmutabilityModalOpen}
+        setIsOpen={setIsImmutabilityModalOpen}
+        tags={selectedMutableTagsForImmutability}
+        tagsWithExpiration={selectedMutableTagsWithExpiration}
+        currentlyImmutable={false}
+        loadTags={props.loadTags}
+        onComplete={() => {
+          setSelectedTags([]);
+        }}
+      />
+      <ImmutabilityModal
+        org={props.organization}
+        repo={props.repository}
+        isOpen={isRemoveImmutabilityModalOpen}
+        setIsOpen={setIsRemoveImmutabilityModalOpen}
+        tags={selectedImmutableTags}
+        currentlyImmutable={true}
         loadTags={props.loadTags}
         onComplete={() => {
           setSelectedTags([]);

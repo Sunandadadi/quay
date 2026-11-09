@@ -1,14 +1,16 @@
 import {
   Button,
-  Modal,
-  ModalVariant,
   PageSection,
-  PageSectionVariants,
   TextInput,
   Toolbar,
   ToolbarContent,
   ToolbarItem,
   SearchInput,
+  Modal,
+  ModalVariant,
+  ModalHeader,
+  ModalBody,
+  ModalFooter,
 } from '@patternfly/react-core';
 import {Table, Tbody, Td, Th, Thead, Tr} from '@patternfly/react-table';
 import {useEffect, useState} from 'react';
@@ -45,11 +47,10 @@ export const BulkDeleteModalTemplate = <T,>(
     } else {
       /* Note: This search filter assumes that the search is always based on the 1st column,
          hence we do "colNames[0]" */
-      const filteredTableRow = props.selectedItems.filter(
-        (item) =>
-          item[props.mapOfColNamesToTableData[colNames[0]].label]
-            ?.toLowerCase()
-            .includes(value.toLowerCase()),
+      const filteredTableRow = props.selectedItems.filter((item) =>
+        item[props.mapOfColNamesToTableData[colNames[0]].label]
+          ?.toLowerCase()
+          .includes(value.toLowerCase()),
       );
       setItemsMarkedForDelete(filteredTableRow);
     }
@@ -63,7 +64,7 @@ export const BulkDeleteModalTemplate = <T,>(
 
   useEffect(() => {
     setItemsMarkedForDelete(props.selectedItems);
-  }, []);
+  }, [props.selectedItems]);
 
   /* Function that transforms a given cell value with the transformation function if present
   else returns the default cell value */
@@ -72,16 +73,96 @@ export const BulkDeleteModalTemplate = <T,>(
       ? props.mapOfColNamesToTableData[name].transformFunc(item)
       : item[props.mapOfColNamesToTableData[name].label];
 
+  const title = props.title ?? `Permanently delete ${props.resourceName}?`;
+  const description =
+    props.description ??
+    `This action deletes all ${props.resourceName} and cannot be recovered.`;
+  const confirmationLabel =
+    props.confirmationLabel ?? 'Confirm deletion by typing';
+  const actionLabel = props.actionLabel ?? 'Delete';
+
   return (
     <Modal
-      title={`Permanently delete ${props.resourceName}?`}
       id="bulk-delete-modal"
-      titleIconVariant="warning"
-      aria-label={`Permanently delete ${props.resourceName}?`}
+      data-testid="bulk-delete-modal"
+      aria-label={title}
       variant={ModalVariant.medium}
       isOpen={props.isModalOpen}
       onClose={props.handleModalToggle}
-      actions={[
+    >
+      <ModalHeader title={title} titleIconVariant="warning" />
+      <ModalBody>
+        <span>{description}</span>
+        <PageSection hasBodyWrapper={false}>
+          <Toolbar>
+            <ToolbarContent className="pf-v6-u-pl-0">
+              <ToolbarItem>
+                <SearchInput
+                  type="search"
+                  id="modal-with-form-form-name"
+                  name="search input"
+                  placeholder="Search"
+                  value={searchInput}
+                  onChange={onSearch}
+                />
+              </ToolbarItem>
+              <ToolbarPagination
+                page={bulkModalPage}
+                perPage={bulkModalPerPage}
+                itemsList={itemsMarkedForDelete}
+                setPage={setBulkModalPage}
+                setPerPage={setBulkModalPerPage}
+              />
+            </ToolbarContent>
+          </Toolbar>
+          <Table aria-label="Simple table" variant="compact">
+            <Thead>
+              <Tr>
+                {colNames.map((name, idx) => (
+                  <Th key={idx}>{name}</Th>
+                ))}
+              </Tr>
+            </Thead>
+            <Tbody>
+              {paginatedBulkItemsList.map((item, idx) => (
+                <Tr key={idx}>
+                  {colNames.map((name, index) => (
+                    <Td
+                      key={index}
+                      dataLabel={
+                        item[props.mapOfColNamesToTableData[name].label]
+                      }
+                    >
+                      {applyTransformFuncIfGiven(item, name)}
+                    </Td>
+                  ))}
+                </Tr>
+              ))}
+            </Tbody>
+          </Table>
+          <Toolbar>
+            <ToolbarPagination
+              page={bulkModalPage}
+              perPage={bulkModalPerPage}
+              itemsList={itemsMarkedForDelete}
+              setPage={setBulkModalPage}
+              setPerPage={setBulkModalPerPage}
+            />
+          </Toolbar>
+          <p className="pf-v6-u-pt-md">
+            {confirmationLabel} <b>&quot;confirm&quot;</b> below:
+          </p>
+          <TextInput
+            id="delete-confirmation-input"
+            data-testid="delete-confirmation-input"
+            value={confirmDeletionInput}
+            type="text"
+            onChange={(_event, value) => setConfirmDeletionInput(value)}
+            aria-label="text input example"
+          />
+        </PageSection>
+      </ModalBody>
+      <ModalFooter>
         <Button
           key="delete"
           variant="danger"
@@ -90,8 +171,8 @@ export const BulkDeleteModalTemplate = <T,>(
           isDisabled={confirmDeletionInput !== 'confirm'}
           data-testid="bulk-delete-confirm-btn"
         >
-          Delete
-        </Button>,
+          {actionLabel}
+        </Button>
         <Button
           key="cancel"
           id="delete-org-cancel"
@@ -99,78 +180,8 @@ export const BulkDeleteModalTemplate = <T,>(
           onClick={props.handleModalToggle}
         >
           Cancel
-        </Button>,
-      ]}
-    >
-      <span>
-        This action deletes all {props.resourceName} and cannot be recovered.
-      </span>
-      <PageSection variant={PageSectionVariants.light}>
-        <Toolbar>
-          <ToolbarContent className="pf-v5-u-pl-0">
-            <ToolbarItem>
-              <SearchInput
-                type="search"
-                id="modal-with-form-form-name"
-                name="search input"
-                placeholder="Search"
-                value={searchInput}
-                onChange={onSearch}
-              />
-            </ToolbarItem>
-            <ToolbarPagination
-              page={bulkModalPage}
-              perPage={bulkModalPerPage}
-              itemsList={itemsMarkedForDelete}
-              setPage={setBulkModalPage}
-              setPerPage={setBulkModalPerPage}
-              className="pf-v5-u-mr-md"
-            />
-          </ToolbarContent>
-        </Toolbar>
-        <Table aria-label="Simple table" variant="compact">
-          <Thead>
-            <Tr>
-              {colNames.map((name, idx) => (
-                <Th key={idx}>{name}</Th>
-              ))}
-            </Tr>
-          </Thead>
-          <Tbody>
-            {paginatedBulkItemsList.map((item, idx) => (
-              <Tr key={idx}>
-                {colNames.map((name, index) => (
-                  <Td
-                    key={index}
-                    dataLabel={item[props.mapOfColNamesToTableData[name].label]}
-                  >
-                    {applyTransformFuncIfGiven(item, name)}
-                  </Td>
-                ))}
-              </Tr>
-            ))}
-          </Tbody>
-        </Table>
-        <Toolbar>
-          <ToolbarPagination
-            page={bulkModalPage}
-            perPage={bulkModalPerPage}
-            itemsList={itemsMarkedForDelete}
-            setPage={setBulkModalPage}
-            setPerPage={setBulkModalPerPage}
-          />
-        </Toolbar>
-        <p className="pf-v5-u-pt-md">
-          Confirm deletion by typing <b>&quot;confirm&quot;</b> below:
-        </p>
-        <TextInput
-          id="delete-confirmation-input"
-          value={confirmDeletionInput}
-          type="text"
-          onChange={(_event, value) => setConfirmDeletionInput(value)}
-          aria-label="text input example"
-        />
-      </PageSection>
+        </Button>
+      </ModalFooter>
     </Modal>
   );
 };
@@ -184,4 +195,9 @@ type BulkDeleteModalTemplateProps<T> = {
   handleBulkDeletion: (items: T[]) => void;
   selectedItems: T[];
   resourceName: string;
+  // Optional wording overrides; the defaults keep the delete wording.
+  title?: string;
+  description?: React.ReactNode;
+  confirmationLabel?: string;
+  actionLabel?: string;
 };

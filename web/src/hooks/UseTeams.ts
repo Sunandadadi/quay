@@ -18,8 +18,7 @@ import {
 import {BulkOperationError, ResourceError} from 'src/resources/ErrorHandling';
 import {useCurrentUser} from './UseCurrentUser';
 import {IAvatar} from 'src/resources/OrganizationResource';
-import {useAlerts} from './UseAlerts';
-import {AlertVariant} from 'src/atoms/AlertState';
+import {useUI, AlertVariant} from 'src/contexts/UIContext';
 import {addRepoPermissionToTeam} from 'src/resources/DefaultPermissionResource';
 
 interface createNewTeamForNamespaceParams {
@@ -29,7 +28,7 @@ interface createNewTeamForNamespaceParams {
 
 export function useCreateTeam(orgName, {onSuccess, onError}) {
   const queryClient = useQueryClient();
-  const {addAlert} = useAlerts();
+  const {addAlert} = useUI();
 
   const {
     data: responseData,
@@ -78,7 +77,7 @@ export interface ITeams {
   is_synced: boolean;
 }
 
-export function useFetchTeams(orgName: string) {
+export function useFetchTeams(orgName: string, enabled = true) {
   const {user} = useCurrentUser();
   const [page, setPage] = useState(1);
   const [perPage, setPerPage] = useState(20);
@@ -97,7 +96,7 @@ export function useFetchTeams(orgName: string) {
     ({signal}) => fetchTeamsForNamespace(orgName, signal),
     {
       placeholderData: [],
-      enabled: !(user.username === orgName),
+      enabled: enabled && !(user.username === orgName),
     },
   );
 
@@ -161,7 +160,7 @@ export function useFetchRepoPermForTeam(orgName: string, teamName: string) {
     isError: errorLoadingRepos,
   } = useQuery<IRepository[]>(
     ['repos'],
-    ({signal}) => fetchRepositoriesForNamespace(orgName, signal),
+    ({signal}) => fetchRepositoriesForNamespace(orgName, {signal}, false),
     {
       placeholderData: [],
     },

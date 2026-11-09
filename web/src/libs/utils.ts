@@ -1,25 +1,29 @@
 import moment, {Duration} from 'moment';
+import React from 'react';
 import {ITeamMember} from 'src/hooks/UseMembers';
 import {VulnerabilitySeverity} from 'src/resources/TagResource';
 
 export function getSeverityColor(severity: VulnerabilitySeverity) {
   switch (severity) {
     case VulnerabilitySeverity.Critical:
-      return 'var(--pf-v5-global--palette--red-200)';
+      return 'var(--pf-t--global--icon--color--severity--critical--default)';
     case VulnerabilitySeverity.High:
-      return 'var(--pf-v5-global--palette--red-100)';
+      return 'var(--pf-t--global--icon--color--severity--important--default)';
     case VulnerabilitySeverity.Medium:
-      return 'var(--pf-v5-global--palette--orange-300)';
+      return 'var(--pf-t--global--icon--color--severity--moderate--default)';
     case VulnerabilitySeverity.Low:
-      return 'var(--pf-v5-global--palette--gold-300)';
+      return 'var(--pf-t--global--icon--color--severity--minor--default)';
     case VulnerabilitySeverity.None:
-      return 'var(--pf-v5-global--palette--green-400)';
+      return 'var(--pf-t--global--icon--color--severity--none--default)';
     default:
-      return 'var(--pf-v5-global--palette--black-300)';
+      return 'var(--pf-t--global--icon--color--severity--undefined--default)';
   }
 }
 
-export function formatDate(date: string | number) {
+export function formatDate(
+  date: string | number,
+  timeStyle: 'short' | 'medium' | 'long' = 'short',
+) {
   if (!date || date == -1) {
     return 'N/A';
   }
@@ -27,22 +31,34 @@ export function formatDate(date: string | number) {
   const adjustedDate = typeof date === 'number' ? date * 1000 : date;
   return new Date(adjustedDate).toLocaleString(navigator.language, {
     timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    timeStyle: 'short',
+    timeStyle,
     dateStyle: 'medium',
   });
 }
 
+/** Parse a date string to epoch millis, returning 0 for falsy or unparseable values. */
+export function toEpochOrZero(value?: string): number {
+  if (!value) return 0;
+  const ts = Date.parse(value);
+  return Number.isFinite(ts) ? ts : 0;
+}
+
 export function formatSize(sizeInBytes: number) {
-  if (!sizeInBytes) {
-    // null or undefined
+  // Handle null/undefined but allow 0 as a valid value
+  if (sizeInBytes === null || sizeInBytes === undefined) {
     return 'N/A';
+  }
+
+  // Handle 0 explicitly to avoid Math.log(0) = -Infinity
+  if (sizeInBytes === 0) {
+    return '0.00 KiB';
   }
 
   const i = Math.floor(Math.log(sizeInBytes) / Math.log(1024));
   return (
     (sizeInBytes / Math.pow(1024, i)).toFixed(2) +
     ' ' +
-    ['B', 'kB', 'MB', 'GB', 'TB'][i]
+    ['B', 'KiB', 'MiB', 'GiB', 'TiB'][i]
   );
 }
 
@@ -53,6 +69,14 @@ export function isValidEmail(email: string): boolean {
 
 export const validateTeamName = (name: string) => {
   return /^([a-z0-9]+(?:[._-][a-z0-9]+)*)$/.test(name);
+};
+
+export const validateRobotName = (name: string) => {
+  return /^(?=.{2,255}$)([a-z0-9]+(?:[._-][a-z0-9]+)*)$/.test(name);
+};
+
+export const validateTagName = (name: string) => {
+  return /^[\w][\w.-]{0,127}$/.test(name);
 };
 
 export function parseRepoNameFromUrl(url: string): string {
@@ -212,3 +236,88 @@ export const escapeHtmlString = function (text) {
 
   return adjusted;
 };
+
+// Mirroring utility functions
+const timeUnits = {
+  seconds: 1,
+  minutes: 60,
+  hours: 60 * 60,
+  days: 60 * 60 * 24,
+  weeks: 60 * 60 * 24 * 7,
+};
+
+export const convertToSeconds = (value: number, unit: string): number => {
+  return value * (timeUnits[unit] || 1);
+};
+
+export const convertFromSeconds = (
+  seconds: number,
+): {value: number; unit: string} => {
+  const units = ['weeks', 'days', 'hours', 'minutes', 'seconds'];
+  for (const unit of units) {
+    const divisor = timeUnits[unit];
+    if (seconds % divisor === 0) {
+      return {value: seconds / divisor, unit};
+    }
+  }
+  return {value: seconds, unit: 'seconds'};
+};
+
+// Convert ISO date to datetime-local format
+export const formatDateForInput = (isoDate: string): string => {
+  if (!isoDate) return '';
+  const date = new Date(isoDate);
+  if (isNaN(date.getTime())) return '';
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  return `${year}-${month}-${day}T${hours}:${minutes}`;
+};
+
+export function formatRelativeTime(date: string | number): string {
+  if (!date || date == -1 || date === 'Never') {
+    return 'Never';
+  }
+
+  const adjustedDate = typeof date === 'number' ? date * 1000 : date;
+  return moment(adjustedDate).fromNow();
+}
+
+/**
+ * Recursively extracts plain text from a React node (JSX elements, fragments, etc.)
+ * This is useful for making JSX content searchable in filters.
+ *
+ * @param node - A React node (string, number, element, fragment, array, etc.)
+ * @returns The plain text content extracted from the React node
+ *
+ * @example
+ * const jsx = <>Push of <code>tag123</code> to repository <code>user/repo</code></>;
+ * extractTextFromReactNode(jsx); // Returns: "Push of tag123 to repository user/repo"
+ */
+export function extractTextFromReactNode(node: React.ReactNode): string {
+  // Handle primitives (strings and numbers)
+  if (typeof node === 'string' || typeof node === 'number') {
+    return String(node);
+  }
+
+  // Handle null, undefined, or boolean values
+  if (node == null || typeof node === 'boolean') {
+    return '';
+  }
+
+  // Handle arrays (e.g., from fragments or multiple children)
+  if (Array.isArray(node)) {
+    return node.map(extractTextFromReactNode).join('');
+  }
+
+  // Handle React elements (check if it's a valid React element)
+  if (React.isValidElement(node)) {
+    // Recursively extract text from children
+    return extractTextFromReactNode(node.props.children);
+  }
+
+  // Fallback for unknown types
+  return '';
+}

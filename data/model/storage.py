@@ -1,11 +1,11 @@
 import logging
 from collections import namedtuple
+from contextvars import ContextVar
 
 from cachetools.func import lru_cache
 from peewee import SQL, IntegrityError
 
 from data.database import (
-    ApprBlob,
     ImageStorage,
     ImageStorageLocation,
     ImageStoragePlacement,
@@ -25,6 +25,7 @@ from data.model import (
     config,
     db_transaction,
 )
+from util.locking import GlobalLock, LockAcquireTimeout, LockNotAcquiredException
 from util.metrics.prometheus import gc_storage_blobs_deleted, gc_table_rows_deleted
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,28 @@ _Location = namedtuple("_Location", ["id", "name"])
 
 EMPTY_LAYER_BLOB_DIGEST = "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4"
 SPECIAL_BLOB_DIGESTS = set([EMPTY_LAYER_BLOB_DIGEST])
+
+# Total seconds a blob writer waits for a contended BLOB_DELETE lock before giving up.
+BLOB_DELETE_LOCK_ACQUIRE_TIMEOUT = 3
+
+# Why with_blob_lock_or_fallback is running func without the BLOB_DELETE lock (None while it holds
+# the lock). func only receives skip_lock=True either way, so get_or_create_blob_with_lock reads
+# this to decide whether it may create a missing blob.
+_BLOB_LOCK_TIMED_OUT = "timed_out"
+_BLOB_LOCK_UNAVAILABLE = "unavailable"
+_blob_lock_fallback = ContextVar("blob_lock_fallback", default=None)
+
+# role lock identifiers
+_GC_LOCK_ROLES = frozenset({"gcworker", "repositorygcworker", "namespacegcworker"})
+
+
+def _is_gcworker_holder(holder_id):
+    """
+    Checks if the holder of the lock is one of the three GC workers.
+    """
+    if not holder_id:
+        return False
+    return holder_id.split(":")[0] in _GC_LOCK_ROLES
 
 
 @lru_cache(maxsize=1)
@@ -86,10 +109,22 @@ def _is_storage_orphaned(candidate_id):
         except UploadedBlob.DoesNotExist:
             pass
 
+        # We need to check if a blob is a placeholder blob. If it is, we must **NOT** delete this blob.
+        has_placement = (
+            ImageStoragePlacement.select()
+            .where(ImageStoragePlacement.storage == candidate_id)
+            .exists()
+        )
+
+        if not has_placement:
+            # Placeholder blobs will be GCed later in a future cycle or the download worker will download it
+            logger.debug("Skipping GC of placeholder blob %s (no placement yet)", candidate_id)
+            return False
+
     return True
 
 
-def garbage_collect_storage(storage_id_whitelist):
+def garbage_collect_storage(storage_id_whitelist, namespace=None, repo_name=None):
     """
     Performs GC on a possible subset of the storage's with the IDs found in the whitelist.
 
@@ -133,20 +168,7 @@ def garbage_collect_storage(storage_id_whitelist):
                         is_referenced_checksums,
                     )
 
-                # Check the ApprBlob table as well.
-                query = ApprBlob.select(ApprBlob.digest).where(
-                    ApprBlob.digest << list(content_checksums)
-                )
-                appr_blob_referenced_checksums = set([blob.digest for blob in query])
-                if appr_blob_referenced_checksums:
-                    logger.warning(
-                        "GC attempted to remove CAS checksums %s, which are ApprBlob referenced",
-                        appr_blob_referenced_checksums,
-                    )
-
-                unreferenced_checksums = (
-                    content_checksums - appr_blob_referenced_checksums - is_referenced_checksums
-                )
+                unreferenced_checksums = content_checksums - is_referenced_checksums
 
             # Return all placements for all image storages found not at a CAS path or with a content
             # checksum that is referenced.
@@ -226,17 +248,35 @@ def garbage_collect_storage(storage_id_whitelist):
                 continue
 
             # Perform one final check to ensure the blob is not needed.
-            if (
-                ImageStorage.select()
-                .where(ImageStorage.content_checksum == storage_checksum)
-                .exists()
-            ):
+            # Note: GlobalLock ensures that deletion is atomic with the database operation, but does not
+            # avoid *all* race conditions. However, it does make the window extremely small, potentially
+            # happening only between the check and actual deletion under lock. Mitigations added in
+            # _is_storage_orphaned and the UploadedBlob check should ensure further narrow the possible
+            # race condition window.
+            try:
+                with GlobalLock(f"BLOB_DELETE_{storage_checksum}", lock_ttl=120):
+                    if (
+                        ImageStorage.select()
+                        .where(ImageStorage.content_checksum == storage_checksum)
+                        .exists()
+                    ):
+                        continue
+
+                    version_id = config.store.remove({location_name}, image_path)
+                    if namespace:
+                        msg = "Removed blob %s from %s (path: %s) " "under namespace %s (repo: %s)"
+                        args = [storage_checksum, location_name, image_path, namespace, repo_name]
+                        if version_id:
+                            msg += " (delete_marker: %s)"
+                            args.append(version_id)
+                        logger.info(msg, *args)
+                    gc_storage_blobs_deleted.inc()
+            # If a lock cannot be acquired, skip deletion of the blob from storage backend (safe option)
+            except LockNotAcquiredException:
+                logger.debug(
+                    "Could not acquire lock for blob %s, skipping deletion", storage_checksum
+                )
                 continue
-
-        logger.debug("Removing %s from %s", image_path, location_name)
-        config.store.remove({location_name}, image_path)
-        gc_storage_blobs_deleted.inc()
-
     return orphaned_storage_ids
 
 
@@ -286,6 +326,162 @@ def _get_storage(query_modifier):
         get_image_location_for_id(placement.location_id).name for placement in placements
     }
     return found
+
+
+def with_blob_lock_or_fallback(digest, func, *args, **kwargs):
+    """
+    Execute a function under the BLOB_DELETE GlobalLock, or without a lock if it cannot be
+    acquired within BLOB_DELETE_LOCK_ACQUIRE_TIMEOUT.
+
+    This helper consolidates the common pattern of:
+    1. Try to acquire GlobalLock for blob deletion coordination (outer lock), bounded by
+       BLOB_DELETE_LOCK_ACQUIRE_TIMEOUT
+    2. Execute func with skip_lock=True (caller holds, or has already given up on, the lock)
+
+    The primary purpose is to coordinate with garbage collection (GC) to prevent the race condition
+    where GC deletes a blob from object storage while another operation is creating database entries
+    for that same blob.
+
+    Args:
+        digest: Blob digest for lock key (e.g., "sha256:abc123...")
+        func: Callable to execute (must accept skip_lock kwarg)
+        *args, **kwargs: Arguments to pass to func
+
+    Returns:
+        Result of func()
+
+    Fallback behavior:
+        func is still called with skip_lock=True, so it does not re-attempt the same
+        BLOB_DELETE_<digest> lock.
+
+        If another holder (e.g., GC) still has the lock after BLOB_DELETE_LOCK_ACQUIRE_TIMEOUT, func
+        may use an existing blob, but a missing one is not created: LockAcquireTimeout is raised
+        and the registry returns a 5xx that clients retry. GC could be removing that blob's object
+        from storage right now.
+
+        If Redis is unavailable, func may also create a missing blob without the lock. The race
+        condition can *still* happen then, but the window is extremely narrow, and database
+        uniqueness constraints provide the ultimate safety guarantee. This lockless creation is
+        the same as the logic that existed before the race condition fix.
+
+        The fallback state is communicated to func via a ContextVar, so it only applies to
+        digests that func creates by calling get_or_create_blob_with_lock(skip_lock=True); a
+        func that creates blobs some other way is not covered by this fallback behavior.
+    """
+    try:
+        with GlobalLock(
+            f"BLOB_DELETE_{digest}",
+            lock_ttl=30,
+            blocking_timeout=BLOB_DELETE_LOCK_ACQUIRE_TIMEOUT,
+        ):
+            return func(*args, skip_lock=True, **kwargs)
+    except LockAcquireTimeout as e:
+        if _is_gcworker_holder(e.holder):
+            # GC is actively using the lock: allow finding an already-existing blob (safe — GC
+            # checks references before deleting), but prevent creating a missing one whose object
+            # may be mid-deletion from storage.
+            logger.warning(
+                "GC worker holds BLOB_DELETE_%s (held by %s); using existing blob only",
+                digest,
+                e.holder,
+            )
+            fallback = _BLOB_LOCK_TIMED_OUT
+        else:
+            # Holder is another registry worker or unreadable (response-mixing artifact such as
+            # "OK" or None). Registry-vs-registry races are safe: the IntegrityError guard in
+            # _get_or_create_blob_with_lock handles duplicates.
+            logger.warning(
+                "Timed out acquiring blob lock for %s (held by %s), proceeding without lock",
+                digest,
+                e.holder,
+            )
+            fallback = _BLOB_LOCK_UNAVAILABLE
+    except LockNotAcquiredException as e:
+        logger.warning("Could not acquire lock for blob %s: %s", digest, e)
+        fallback = _BLOB_LOCK_UNAVAILABLE
+
+    token = _blob_lock_fallback.set(fallback)
+    try:
+        return func(*args, skip_lock=True, **kwargs)
+    finally:
+        _blob_lock_fallback.reset(token)
+
+
+def _get_or_create_blob_with_lock(digest, lock_acquired=True, may_create=True, **blob_attrs):
+    """
+    Gets or creates the ImageStorage reference for the provided blob digest. If the reference to the blob
+    does not exists in storage, we attempt to create it. If during creation an integrity error is raised (meaning
+    another worker has created the reference already), we return the found reference.
+    """
+    try:
+        return ImageStorage.get(content_checksum=digest)
+    except ImageStorage.DoesNotExist:
+        if not may_create:
+            raise LockAcquireTimeout(
+                "BLOB_DELETE_%s is held elsewhere; not creating blob %s without it"
+                % (digest, digest)
+            )
+        if not lock_acquired:
+            logger.warning("Blob %s: proceeding without lock", digest)
+        try:
+            return ImageStorage.create(content_checksum=digest, **blob_attrs)
+        except IntegrityError as e:
+            logger.warning("Another worker already created blob %s: %s", digest, e)
+            return ImageStorage.get(content_checksum=digest)
+
+
+def get_or_create_blob_with_lock(digest, skip_lock=False, **blob_attrs):
+    """
+    Atomically gets or creates an ImageStorage blob, coordinating with GC deletion.
+
+    This function uses the same GlobalLock as the GC blob deletion path to ensure
+    mutual exclusion between blob creation and deletion, preventing the race condition
+    where a blob could be deleted from storage while a database record is being created.
+
+    Args:
+        digest: The blob digest (e.g., "sha256:abc123...")
+        skip_lock: If False (default), acquire a lock inside this function. If True, do not acquire
+        the lock (the caller holds it or has already given up on it).
+        **blob_attrs: Additional attributes to pass to ImageStorage.create() if creating
+
+    Returns:
+        ImageStorage object (either existing or newly created)
+    """
+    if skip_lock:
+        fallback = _blob_lock_fallback.get()
+        return _get_or_create_blob_with_lock(
+            digest,
+            lock_acquired=fallback is None,
+            may_create=fallback != _BLOB_LOCK_TIMED_OUT,
+            **blob_attrs,
+        )
+    if GlobalLock.lock_factory is None:
+        # No locking configured, proceed without lock
+        return _get_or_create_blob_with_lock(digest, lock_acquired=False, **blob_attrs)
+    try:
+        with GlobalLock(
+            f"BLOB_DELETE_{digest}",
+            lock_ttl=30,
+            blocking_timeout=BLOB_DELETE_LOCK_ACQUIRE_TIMEOUT,
+        ):
+            # If multiple workers try to create a blob at the same time, we must ensure that blob creation doesn't
+            # fail. Otherwise, push will fail.
+            return _get_or_create_blob_with_lock(digest, lock_acquired=True, **blob_attrs)
+    except LockAcquireTimeout as e:
+        # Verify that the lock is being held by the gcworker. If the lock is being held by
+        # the gc worker, do not create a missing one because it might be in process of deletion
+        # from storage.
+        if _is_gcworker_holder(e.holder):
+            return _get_or_create_blob_with_lock(
+                digest, lock_acquired=False, may_create=False, **blob_attrs
+            )
+        return _get_or_create_blob_with_lock(digest, lock_acquired=False, **blob_attrs)
+    except LockNotAcquiredException:
+        # If we cannot acquire a lock, check if we have the ImageStorage entries for the provided
+        # digest. If that reading fails, then create new entries in the table anyway but report
+        # the lock failure in the log. If multiple workers try to create a blob at the same time,
+        # we must ensure that blob creation doesn't fail. Otherwise, push will fail.
+        return _get_or_create_blob_with_lock(digest, lock_acquired=False, **blob_attrs)
 
 
 def get_storage_by_uuid(storage_uuid):

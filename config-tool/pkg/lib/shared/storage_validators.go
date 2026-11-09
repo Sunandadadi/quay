@@ -3,14 +3,14 @@ package shared
 import (
 	"context"
 	"fmt"
-	"net/url"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/aws/aws-sdk-go/aws"
 	awscredentials "github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/credentials/ec2rolecreds"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sts"
 	"github.com/minio/minio-go/v7"
@@ -18,6 +18,78 @@ import (
 	"github.com/ncw/swift"
 	log "github.com/sirupsen/logrus"
 )
+
+// buildEndpoint normalizes endpoint configuration from both Boto2 and Boto3 formats.
+func buildEndpoint(endpointURL string, host string, port int, defaultIsSecure bool) (string, bool, error) {
+	var endpoint string
+	var isSecure bool
+
+	// Prefer endpoint_url if provided (Boto3 style)
+	if endpointURL != "" {
+		endpoint = endpointURL
+
+		// Determine security from scheme
+		if strings.HasPrefix(endpoint, "https://") {
+			isSecure = true
+			endpoint = strings.TrimPrefix(endpoint, "https://")
+		} else if strings.HasPrefix(endpoint, "http://") {
+			isSecure = false
+			endpoint = strings.TrimPrefix(endpoint, "http://")
+		} else {
+			// No scheme in endpoint_url, use default
+			isSecure = defaultIsSecure
+		}
+	} else if host != "" {
+		// Boto2 style: use host + port
+		endpoint = host
+		isSecure = defaultIsSecure
+
+		// Append port if provided and not already in host
+		if port != 0 {
+			endpoint = endpoint + ":" + strconv.Itoa(port)
+		}
+	} else {
+		return "", false, fmt.Errorf("either endpoint_url or host must be provided")
+	}
+
+	return endpoint, isSecure, nil
+}
+
+// buildSTSEndpointConfig builds endpoint configuration for STS-based storage types (IRSA and STS).
+// defaultIsSecure controls TLS when no explicit scheme is present in the endpoint; callers should
+// pass true for S3Storage (mirrors Python's hardcoded is_secure=True) and args.IsSecure otherwise.
+func buildSTSEndpointConfig(args *DistributedStorageArgs, defaultIsSecure bool) (string, bool, *aws.Config, error) {
+	var s3Endpoint string
+	var isSecure bool
+	awsConfig := &aws.Config{}
+
+	if args.EndpointURL != "" || args.Host != "" {
+		var err error
+		s3Endpoint, isSecure, err = buildEndpoint(args.EndpointURL, args.Host, args.Port, defaultIsSecure)
+		if err != nil {
+			return "", false, nil, err
+		}
+
+		// Reconstruct the full URL with scheme for STS client
+		var stsEndpointURL string
+		if isSecure {
+			stsEndpointURL = "https://" + s3Endpoint
+		} else {
+			stsEndpointURL = "http://" + s3Endpoint
+		}
+
+		awsConfig.Endpoint = aws.String(stsEndpointURL)
+		if !isSecure {
+			awsConfig.DisableSSL = aws.Bool(true)
+		}
+	} else {
+		// Default to AWS S3
+		s3Endpoint = "s3.amazonaws.com"
+		isSecure = true
+	}
+
+	return s3Endpoint, isSecure, awsConfig, nil
+}
 
 // ValidateStorage will validate a S3 storage connection.
 func ValidateStorage(opts Options, storageName string, storageType string, args *DistributedStorageArgs, fgName string) (bool, []ValidationError) {
@@ -55,6 +127,11 @@ func ValidateStorage(opts Options, storageName string, storageType string, args 
 			errors = append(errors, err)
 		}
 
+		var region string
+		if args.RegionName != "" {
+			region = args.RegionName
+		}
+
 		// Grab necessary variables
 		accessKey = args.AccessKey
 		secretKey = args.SecretKey
@@ -72,24 +149,26 @@ func ValidateStorage(opts Options, storageName string, storageType string, args 
 		}
 
 		log.Debugf("Storage parameters: ")
-		log.Debugf("hostname: %s, bucket name: %s, TLS enabled: %t", endpoint, bucketName, isSecure)
+		log.Debugf("hostname: %s, region (if available): %s, bucket name: %s, TLS enabled: %t",
+			endpoint, region, bucketName, isSecure)
 
-		if ok, err := validateMinioGateway(opts, storageName, endpoint, accessKey, secretKey, bucketName, token, isSecure, fgName); !ok {
+		// for IBMCloudStorage region name should not be present in the config parameters
+		// because the driver doesn't support it
+		if storageType == "IBMCloudStorage" && region != "" {
+			newError := ValidationError{
+				Tags:       []string{"DISTRIBUTED_STORAGE_CONFIG"},
+				FieldGroup: fgName,
+				Message:    fmt.Sprintf("%s does not support region_name as parameter", storageName),
+			}
+			errors = append(errors, newError)
+		}
+
+		if ok, err := validateMinioGateway(opts, storageName, endpoint, region, accessKey,
+			secretKey, bucketName, token, isSecure, fgName); !ok {
 			errors = append(errors, err)
 		}
 
 	case "S3Storage":
-
-		// // Check access key
-		// if ok, err := ValidateRequiredString(args.S3AccessKey, "DISTRIBUTED_STORAGE_CONFIG."+storageName+".s3_access_key", fgName); !ok {
-		// 	errors = append(errors, err)
-		// }
-		// // Check secret key
-		// if ok, err := ValidateRequiredString(args.S3SecretKey, "DISTRIBUTED_STORAGE_CONFIG."+storageName+".s3_secret_key", fgName); !ok {
-		// 	errors = append(errors, err)
-		// }
-
-		// Check bucket name
 		log.Debugf("Using Amazon S3 Storage.")
 
 		if ok, err := ValidateRequiredString(args.S3Bucket, "DISTRIBUTED_STORAGE_CONFIG."+storageName+".s3_bucket", fgName); !ok {
@@ -99,25 +178,36 @@ func ValidateStorage(opts Options, storageName string, storageType string, args 
 		accessKey = args.S3AccessKey
 		secretKey = args.S3SecretKey
 		bucketName = args.S3Bucket
-		isSecure = true
 
-		if len(args.Host) == 0 {
-			endpoint = "s3.amazonaws.com"
+		// Build endpoint from either endpoint_url (boto3) or host+port (boto2).
+		// S3Storage always uses HTTPS (matching Python storage/cloud.py:L803 is_secure=True).
+		var awsConfig *aws.Config
+		if args.EndpointURL != "" || args.Host != "" {
+			var err error
+			endpoint, isSecure, awsConfig, err = buildSTSEndpointConfig(args, true)
+			if err != nil {
+				errors = append(errors, ValidationError{
+					Tags:       []string{"DISTRIBUTED_STORAGE_CONFIG"},
+					FieldGroup: fgName,
+					Message:    "Invalid endpoint configuration: " + err.Error(),
+				})
+				return false, errors
+			}
 		} else {
-			endpoint = args.Host
-		}
-		if args.Port != 0 {
-			endpoint = endpoint + ":" + strconv.Itoa(args.Port)
+			// Default to AWS S3
+			endpoint = "s3.amazonaws.com"
+			isSecure = true
+			awsConfig = &aws.Config{}
 		}
 
 		if len(errors) > 0 {
 			return false, errors
 		}
 
-		// If no keys are provided, we attempt to use IAM
+		// If no keys are provided, use default credential chain (supports EC2 IAM roles, IRSA, etc.)
 		if args.S3AccessKey == "" || args.S3SecretKey == "" {
 
-			sess, err := session.NewSession()
+			sess, err := session.NewSession(awsConfig)
 			if err != nil {
 				newError := ValidationError{
 					Tags:       []string{"DISTRIBUTED_STORAGE_CONFIG"},
@@ -128,29 +218,28 @@ func ValidateStorage(opts Options, storageName string, storageType string, args 
 				return false, errors
 			}
 
-			// Get credentials and set
-			appCreds := ec2rolecreds.NewCredentials(sess)
-			value, err := appCreds.Get()
+			// Get credentials from default credential chain (includes EC2 IAM roles, IRSA, etc.)
+			creds, err := sess.Config.Credentials.Get()
 			if err != nil {
 				newError := ValidationError{
 					Tags:       []string{"DISTRIBUTED_STORAGE_CONFIG"},
 					FieldGroup: fgName,
-					Message:    "No access key or secret key were provided. Attempted to fetch IAM role and failed.",
+					Message:    fmt.Sprintf("No access key or secret key were provided. Attempted to fetch credentials from default chain and failed: %v", err),
 				}
 				errors = append(errors, newError)
 				return false, errors
 			}
 
-			accessKey = value.AccessKeyID
-			secretKey = value.SecretAccessKey
-			token = value.SessionToken
+			accessKey = creds.AccessKeyID
+			secretKey = creds.SecretAccessKey
+			token = creds.SessionToken
 
 		}
 
 		log.Debugf("S3 Storage parameters: ")
 		log.Debugf("hostname: %s, bucket name: %s, TLS enabled: %t", endpoint, bucketName, isSecure)
 
-		if ok, err := validateMinioGateway(opts, storageName, endpoint, accessKey, secretKey, bucketName, token, isSecure, fgName); !ok {
+		if ok, err := validateMinioGateway(opts, storageName, endpoint, "", accessKey, secretKey, bucketName, token, isSecure, fgName); !ok {
 			errors = append(errors, err)
 		}
 
@@ -162,50 +251,115 @@ func ValidateStorage(opts Options, storageName string, storageType string, args 
 		}
 
 		roleArn := args.STSRoleArn
-		sess := session.Must(session.NewSession(&aws.Config{
-			Credentials: awscredentials.NewStaticCredentials(args.STSUserAccessKey, args.STSUserSecretKey, ""),
-		}))
-		svc := sts.New(sess)
+		if roleArn == "" {
+			roleArn = os.Getenv("AWS_ROLE_ARN")
+		}
 		roleToAssumeArn := roleArn
 		durationSeconds := int64(3600)
-		assumeRoleInput := &sts.AssumeRoleInput{
-			RoleArn:         aws.String(roleToAssumeArn),
-			RoleSessionName: aws.String("quay"),
-			DurationSeconds: aws.Int64(durationSeconds),
+
+		webIdentityTokenFile := args.STSWebIdentityTokenFile
+		// Only check the Web Identity Token File variable if no other credentials are present in the config
+		if args.STSUserAccessKey == "" && args.STSUserSecretKey == "" && args.STSWebIdentityTokenFile == "" {
+			webIdentityTokenFile = os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE")
 		}
-		assumeRoleOutput, err := svc.AssumeRole(assumeRoleInput)
+
+		// Get the session name, defaulting to "quay" if not provided
+		sessionName := args.STSRoleSessionName
+		if sessionName == "" {
+			sessionName = os.Getenv("AWS_ROLE_SESSION_NAME")
+		}
+		if sessionName == "" {
+			sessionName = "quay"
+		}
+
+		// Build endpoint configuration for STS and S3
+		var awsConfig *aws.Config
+		endpoint, isSecure, awsConfig, err := buildSTSEndpointConfig(args, args.IsSecure)
 		if err != nil {
 			errors = append(errors, ValidationError{
 				Tags:       []string{"DISTRIBUTED_STORAGE_CONFIG"},
 				FieldGroup: fgName,
-				Message:    "Could not fetch credentials from STS. Error: " + err.Error(),
+				Message:    "Invalid endpoint configuration: " + err.Error(),
 			})
-			break
-		}
-
-		accessKey := *assumeRoleOutput.Credentials.AccessKeyId
-		secretKey := *assumeRoleOutput.Credentials.SecretAccessKey
-		token = *assumeRoleOutput.Credentials.SessionToken
-		bucketName = args.S3Bucket
-		isSecure = true
-
-		if len(args.Host) == 0 {
-			endpoint = "s3.amazonaws.com"
-		} else {
-			endpoint = args.Host
-		}
-		if args.Port != 0 {
-			endpoint = endpoint + ":" + strconv.Itoa(args.Port)
-		}
-
-		if len(errors) > 0 {
 			return false, errors
 		}
+
+		var credentials *sts.Credentials
+		// Prefer using web tokens to authenticate and fallback to access and secret keys
+		if webIdentityTokenFile != "" {
+			sess, err := session.NewSession(awsConfig)
+			if err != nil {
+				errors = append(errors, ValidationError{
+					Tags:       []string{"DISTRIBUTED_STORAGE_CONFIG"},
+					FieldGroup: fgName,
+					Message:    "Could not create AWS session for STS with Web Identity Token: " + err.Error(),
+				})
+				return false, errors
+			}
+			svc := sts.New(sess)
+			webIdentityToken, err := os.ReadFile(webIdentityTokenFile)
+			if err != nil {
+				errors = append(errors, ValidationError{
+					Tags:       []string{"DISTRIBUTED_STORAGE_CONFIG"},
+					FieldGroup: fgName,
+					Message:    "Could not read the STS Web Identity Token File, Error: " + err.Error(),
+				})
+				break
+			}
+			assumeRoleInput := &sts.AssumeRoleWithWebIdentityInput{
+				RoleArn:          aws.String(roleToAssumeArn),
+				RoleSessionName:  aws.String(sessionName),
+				DurationSeconds:  aws.Int64(durationSeconds),
+				WebIdentityToken: aws.String(string(webIdentityToken)),
+			}
+			assumeRoleOutput, err := svc.AssumeRoleWithWebIdentity(assumeRoleInput)
+			if err != nil {
+				errors = append(errors, ValidationError{
+					Tags:       []string{"DISTRIBUTED_STORAGE_CONFIG"},
+					FieldGroup: fgName,
+					Message:    "Could not fetch credentials from STS with Web Identity Token. Error: " + err.Error(),
+				})
+				break
+			}
+			credentials = assumeRoleOutput.Credentials
+		} else {
+			awsConfig.Credentials = awscredentials.NewStaticCredentials(args.STSUserAccessKey, args.STSUserSecretKey, "")
+			sess, err := session.NewSession(awsConfig)
+			if err != nil {
+				errors = append(errors, ValidationError{
+					Tags:       []string{"DISTRIBUTED_STORAGE_CONFIG"},
+					FieldGroup: fgName,
+					Message:    "Could not create AWS session for STS: " + err.Error(),
+				})
+				return false, errors
+			}
+			svc := sts.New(sess)
+			assumeRoleInput := &sts.AssumeRoleInput{
+				RoleArn:         aws.String(roleToAssumeArn),
+				RoleSessionName: aws.String(sessionName),
+				DurationSeconds: aws.Int64(durationSeconds),
+			}
+			assumeRoleOutput, err := svc.AssumeRole(assumeRoleInput)
+			if err != nil {
+				errors = append(errors, ValidationError{
+					Tags:       []string{"DISTRIBUTED_STORAGE_CONFIG"},
+					FieldGroup: fgName,
+					Message:    "Could not fetch credentials from STS. Error: " + err.Error(),
+				})
+				break
+			}
+			credentials = assumeRoleOutput.Credentials
+		}
+
+		accessKey := *credentials.AccessKeyId
+		secretKey := *credentials.SecretAccessKey
+		token = *credentials.SessionToken
+		bucketName = args.S3Bucket
 
 		log.Debugf("STS S3 Storage parameters: ")
 		log.Debugf("hostname: %s, bucket name: %s, TLS enabled: %t", endpoint, bucketName, isSecure)
 
-		if ok, err := validateMinioGateway(opts, storageName, endpoint, accessKey, secretKey, bucketName, token, isSecure, fgName); !ok {
+		if ok, err := validateMinioGateway(opts, storageName, endpoint, "", accessKey, secretKey, bucketName, token, isSecure, fgName); !ok {
 			errors = append(errors, err)
 		}
 
@@ -237,7 +391,7 @@ func ValidateStorage(opts Options, storageName string, storageType string, args 
 		log.Debugf("GCS Storage parameters: ")
 		log.Debugf("hostname: %s, bucket name: %s, TLS enabled: %t", endpoint, bucketName, isSecure)
 
-		if ok, err := validateMinioGateway(opts, storageName, endpoint, accessKey, secretKey, bucketName, token, isSecure, fgName); !ok {
+		if ok, err := validateMinioGateway(opts, storageName, endpoint, "", accessKey, secretKey, bucketName, token, isSecure, fgName); !ok {
 			errors = append(errors, err)
 		}
 
@@ -300,15 +454,23 @@ func ValidateStorage(opts Options, storageName string, storageType string, args 
 		accessKey = args.S3AccessKey
 		secretKey = args.S3SecretKey
 		bucketName = args.S3Bucket
-		isSecure = true
 
-		if len(args.Host) == 0 {
-			endpoint = "s3.amazonaws.com"
+		// Build endpoint from either endpoint_url (boto3) or host+port (boto2)
+		if args.EndpointURL != "" || args.Host != "" {
+			var err error
+			endpoint, isSecure, err = buildEndpoint(args.EndpointURL, args.Host, args.Port, args.IsSecure)
+			if err != nil {
+				errors = append(errors, ValidationError{
+					Tags:       []string{"DISTRIBUTED_STORAGE_CONFIG"},
+					FieldGroup: fgName,
+					Message:    "Invalid endpoint configuration: " + err.Error(),
+				})
+				return false, errors
+			}
 		} else {
-			endpoint = args.Host
-		}
-		if args.Port != 0 {
-			endpoint = endpoint + ":" + strconv.Itoa(args.Port)
+			// Default to AWS S3
+			endpoint = "s3.amazonaws.com"
+			isSecure = true
 		}
 
 		if len(errors) > 0 {
@@ -319,7 +481,7 @@ func ValidateStorage(opts Options, storageName string, storageType string, args 
 		log.Debugf("hostname: %s, bucket name: %s, TLS enabled: %t", endpoint, bucketName, isSecure)
 
 		// Validate bucket settings
-		if ok, err := validateMinioGateway(opts, storageName, endpoint, accessKey, secretKey, bucketName, token, isSecure, fgName); !ok {
+		if ok, err := validateMinioGateway(opts, storageName, endpoint, "", accessKey, secretKey, bucketName, token, isSecure, fgName); !ok {
 			errors = append(errors, err)
 		}
 
@@ -425,7 +587,12 @@ func ValidateStorage(opts Options, storageName string, storageType string, args 
 
 }
 
-func validateMinioGateway(opts Options, storageName, endpoint, accessKey, secretKey, bucketName, token string, isSecure bool, fgName string) (bool, ValidationError) {
+func validateMinioGateway(opts Options, storageName, endpoint, region, accessKey, secretKey, bucketName, token string, isSecure bool, fgName string) (bool, ValidationError) {
+	// verify that we're not in testing mode, if we are just return as we cannot confirm
+	// that real storage is available
+	if opts.Mode == "testing" {
+		return true, ValidationError{}
+	}
 
 	// Set transport
 	tr, err := minio.DefaultTransport(true)
@@ -447,6 +614,7 @@ func validateMinioGateway(opts Options, storageName, endpoint, accessKey, secret
 	// Create client
 	st, err := minio.New(endpoint, &minio.Options{
 		Creds:     credentials.NewStaticV4(accessKey, secretKey, token),
+		Region:    region,
 		Secure:    isSecure,
 		Transport: tr,
 	})
@@ -464,10 +632,15 @@ func validateMinioGateway(opts Options, storageName, endpoint, accessKey, secret
 
 	found, err := st.BucketExists(ctx, bucketName)
 	if err != nil {
+		msg := fmt.Sprintf("Could not connect to storage %s. Error: %s", storageName, err.Error())
+		if errResp := minio.ToErrorResponse(err); errResp.StatusCode != 0 {
+			msg = fmt.Sprintf("Could not connect to storage %s (HTTP error %d). Error: %s",
+				storageName, errResp.StatusCode, err.Error())
+		}
 		newError := ValidationError{
 			Tags:       []string{"DISTRIBUTED_STORAGE_CONFIG"},
 			FieldGroup: fgName,
-			Message:    "Could not connect to storage " + storageName + ". Error: " + err.Error(),
+			Message:    msg,
 		}
 		return false, newError
 	}
@@ -487,7 +660,7 @@ func validateMinioGateway(opts Options, storageName, endpoint, accessKey, secret
 
 func validateAzureGateway(opts Options, endpointURL, storageName, accountName, accountKey, containerName, token, fgName string) (bool, ValidationError) {
 
-	credentials, err := azblob.NewSharedKeyCredential(accountName, accountKey)
+	credential, err := azblob.NewSharedKeyCredential(accountName, accountKey)
 	if err != nil {
 		return false, ValidationError{
 			FieldGroup: fgName,
@@ -496,21 +669,26 @@ func validateAzureGateway(opts Options, endpointURL, storageName, accountName, a
 		}
 	}
 
-	p := azblob.NewPipeline(credentials, azblob.PipelineOptions{})
-	u, err := url.Parse(endpointURL)
-
-	serviceURL := azblob.NewServiceURL(*u, p)
-	containerURL := serviceURL.NewContainerURL(containerName)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	_, err = containerURL.GetAccountInfo(ctx)
+	client, err := azblob.NewClientWithSharedKeyCredential(endpointURL, credential, nil)
 	if err != nil {
 		return false, ValidationError{
 			FieldGroup: fgName,
 			Tags:       []string{"DISTRIBUTED_STORAGE_CONFIG"},
-			Message:    "Could not connect to Azure storage. Error: " + err.Error(),
+			Message:    "Could not create Azure storage client. Error: " + err.Error(),
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Verify the container exists
+	containerClient := client.ServiceClient().NewContainerClient(containerName)
+	_, err = containerClient.GetProperties(ctx, nil)
+	if err != nil {
+		return false, ValidationError{
+			FieldGroup: fgName,
+			Tags:       []string{"DISTRIBUTED_STORAGE_CONFIG"},
+			Message:    "Could not access container in Azure storage. Error: " + err.Error(),
 		}
 	}
 

@@ -20,6 +20,8 @@ export default function NotificationsToolbar(props: NotificationsToolbarProps) {
       <ToolbarContent>
         <DropdownCheckbox
           id="notifications-select-all"
+          data-testid="notifications-selection-dropdown"
+          selectedCountTestId="notifications-selected-count"
           selectedItems={props.selectedItems}
           deSelectAll={props.deselectAll}
           allItemsList={props.allItems}
@@ -41,6 +43,7 @@ export default function NotificationsToolbar(props: NotificationsToolbarProps) {
         </ToolbarGroup>
         <ToolbarItem>
           <Button
+            data-testid="create-notification-btn"
             onClick={() =>
               props.setDrawerContent(DrawerContentType.CreateNotification)
             }
@@ -58,6 +61,7 @@ export default function NotificationsToolbar(props: NotificationsToolbarProps) {
           />
         </ToolbarItem>
         <ToolbarPagination
+          data-testid="notifications-pagination"
           itemsList={props.allItems}
           perPage={props.perPage}
           page={props.page}

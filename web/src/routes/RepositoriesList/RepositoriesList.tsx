@@ -1,13 +1,15 @@
 import {ReactElement, useEffect, useState} from 'react';
 import {
+  Alert,
   PageSection,
-  PageSectionVariants,
   Spinner,
   Title,
   PanelFooter,
   DropdownItem,
+  Flex,
+  FlexItem,
 } from '@patternfly/react-core';
-import {Table, Thead, Tr, Th, Tbody, Td} from '@patternfly/react-table';
+import {Table, Tbody, Td, Th, Thead, Tr} from '@patternfly/react-table';
 import {useRecoilState} from 'recoil';
 import {IRepository} from 'src/resources/RepositoryResource';
 import {Link, useLocation} from 'react-router-dom';
@@ -17,11 +19,7 @@ import {selectedReposState} from 'src/atoms/RepositoryState';
 import {formatDate, formatSize} from 'src/libs/utils';
 import {BulkDeleteModalTemplate} from 'src/components/modals/BulkDeleteModalTemplate';
 import {RepositoryToolBar} from 'src/routes/RepositoriesList/RepositoryToolBar';
-import {
-  addDisplayError,
-  BulkOperationError,
-  isErrorString,
-} from 'src/resources/ErrorHandling';
+import {addDisplayError, BulkOperationError} from 'src/resources/ErrorHandling';
 import RequestError from 'src/components/errors/RequestError';
 import Empty from 'src/components/empty/Empty';
 import {CubesIcon} from '@patternfly/react-icons';
@@ -29,12 +27,18 @@ import {ToolbarButton} from 'src/components/toolbar/ToolbarButton';
 import {QuayBreadcrumb} from 'src/components/breadcrumb/Breadcrumb';
 import ErrorModal from 'src/components/errors/ErrorModal';
 import {useQuayConfig} from 'src/hooks/UseQuayConfig';
+import {useQuayState} from 'src/hooks/UseQuayState';
 import {ToolbarPagination} from 'src/components/toolbar/ToolbarPagination';
 import {RepositoryListColumnNames} from './ColumnNames';
-import {LoadingPage} from 'src/components/LoadingPage';
 import {useCurrentUser} from 'src/hooks/UseCurrentUser';
+import {useSuperuserPermissions} from 'src/hooks/UseSuperuserPermissions';
 import {useRepositories} from 'src/hooks/UseRepositories';
 import {useDeleteRepositories} from 'src/hooks/UseDeleteRepositories';
+import {usePaginatedSortableTable} from '../../hooks/usePaginatedSortableTable';
+import {useFetchOrganizationQuota} from 'src/hooks/UseQuotaManagement';
+import {bytesToHumanReadable} from 'src/resources/QuotaResource';
+import Avatar from 'src/components/Avatar';
+import {generateAvatarFromName} from 'src/libs/avatarUtils';
 
 interface RepoListHeaderProps {
   shouldRender: boolean;
@@ -46,7 +50,7 @@ function RepoListHeader(props: RepoListHeaderProps) {
   return (
     <>
       <QuayBreadcrumb />
-      <PageSection variant={PageSectionVariants.light} hasShadowBottom>
+      <PageSection hasBodyWrapper={false} hasShadowBottom>
         <div className="co-m-nav-title--row">
           <Title headingLevel="h1">Repositories</Title>
         </div>
@@ -65,20 +69,35 @@ export default function RepositoriesList(props: RepositoriesListProps) {
   const location = useLocation();
 
   const quayConfig = useQuayConfig();
+  const {inReadOnlyMode} = useQuayState();
   const {user} = useCurrentUser();
-  const {
-    repos,
-    loading,
-    error,
-    setPerPage,
-    setPage,
-    search,
-    setSearch,
-    searchFilter,
-    page,
-    perPage,
-    totalResults,
-  } = useRepositories(currentOrg);
+  const {isReadOnlySuperUser} = useSuperuserPermissions();
+  const namespaceName = currentOrg || user?.username;
+  const canCreateInNamespace =
+    namespaceName === user?.username
+      ? user?.can_create_repo === true
+      : user?.organizations?.some(
+          (organization) =>
+            organization.name === namespaceName &&
+            organization.can_create_repo === true,
+        ) === true;
+  const canCreateRepository =
+    Boolean(user?.username) &&
+    !inReadOnlyMode &&
+    (!isReadOnlySuperUser || canCreateInNamespace);
+  const isQuotaManagementEnabled =
+    quayConfig?.features?.QUOTA_MANAGEMENT === true &&
+    quayConfig?.features?.EDIT_QUOTA === true;
+
+  // Fetch quota information - use 'self' viewMode for user namespaces, 'organization' for orgs
+  const viewMode = props.isUserOrganization ? 'self' : 'organization';
+  const {organizationQuota} = useFetchOrganizationQuota(
+    currentOrg,
+    viewMode,
+    isQuotaManagementEnabled,
+  );
+  const {repos, loading, error, search, setSearch, searchFilter, truncated} =
+    useRepositories(currentOrg);
 
   repos?.sort((r1, r2) => {
     return r1.last_modified > r2.last_modified ? -1 : 1;
@@ -91,7 +110,56 @@ export default function RepositoriesList(props: RepositoriesListProps) {
       is_public: repo.is_public,
       last_modified: repo.last_modified,
       size: repo.quota_report?.quota_bytes,
+      configured_quota: repo.quota_report?.configured_quota,
     } as RepoListTableItem;
+  });
+
+  // Calculate total quota consumed from all repositories
+  const calculateTotalQuotaConsumed = (): number => {
+    if (!repos || !Array.isArray(repos)) return 0;
+    return repos.reduce((total, repo) => {
+      return total + (repo.quota_report?.quota_bytes || 0);
+    }, 0);
+  };
+
+  const totalQuotaConsumed = calculateTotalQuotaConsumed();
+
+  const formatQuotaDisplay = () => {
+    const consumedHuman = bytesToHumanReadable(totalQuotaConsumed);
+    const consumedDisplay =
+      totalQuotaConsumed > 0
+        ? `${consumedHuman.value} ${consumedHuman.unit}`
+        : '0.00 KiB';
+
+    if (organizationQuota?.limit_bytes) {
+      const totalHuman = bytesToHumanReadable(organizationQuota.limit_bytes);
+      const totalDisplay = `${totalHuman.value} ${totalHuman.unit}`;
+      const percentage = Math.round(
+        (totalQuotaConsumed / organizationQuota.limit_bytes) * 100,
+      );
+      return `${consumedDisplay} (${percentage}%) of ${totalDisplay}`;
+    }
+
+    return consumedDisplay;
+  };
+
+  // Use unified table hook for sorting, filtering, and pagination
+  const {
+    paginatedData: paginatedRepositoryList,
+    filteredData: filteredRepos,
+    getSortableSort,
+    paginationProps,
+  } = usePaginatedSortableTable(repositoryList || [], {
+    columns: {
+      0: (item: RepoListTableItem) =>
+        currentOrg == null ? `${item.namespace}/${item.name}` : item.name, // Name
+      1: (item: RepoListTableItem) => (item.is_public ? 'public' : 'private'), // Visibility
+      2: (item: RepoListTableItem) => item.size || 0, // Size
+      3: (item: RepoListTableItem) => item.last_modified || 0, // Last Modified
+    },
+    initialSort: {columnIndex: 3, direction: 'desc'}, // Default sort: Last Modified descending
+    filter: searchFilter,
+    initialPerPage: 20,
   });
 
   useEffect(() => {
@@ -99,16 +167,6 @@ export default function RepositoriesList(props: RepositoriesListProps) {
       setSearch({...search, query: '', currentOrganization: currentOrg});
     }
   }, [currentOrg]);
-
-  // Filtering Repositories after applied filter
-  const filteredRepos = searchFilter
-    ? repositoryList.filter(searchFilter)
-    : repositoryList;
-
-  const paginatedRepositoryList = filteredRepos?.slice(
-    page * perPage - perPage,
-    page * perPage - perPage + perPage,
-  );
 
   // Select related states
   const [selectedRepoNames, setSelectedRepoNames] =
@@ -239,7 +297,7 @@ export default function RepositoriesList(props: RepositoriesListProps) {
       handleModalToggle={handleDeleteModalToggle}
       handleBulkDeletion={deleteRepositories}
       isModalOpen={isDeleteModalOpen}
-      selectedItems={repositoryList.filter((repo) =>
+      selectedItems={filteredRepos.filter((repo) =>
         selectedRepoNames.some(
           (selected) => repo.namespace + '/' + repo.name === selected,
         ),
@@ -248,41 +306,40 @@ export default function RepositoriesList(props: RepositoriesListProps) {
     />
   );
 
-  // Return component Loading state
-  if (loading) {
-    return (
-      <>
-        <RepoListHeader shouldRender={currentOrg === null} />
-        <LoadingPage />
-      </>
-    );
-  }
-
   // Return component Error state
-  if (isErrorString(error as any)) {
+  if (error) {
     return (
       <>
         <RepoListHeader shouldRender={currentOrg === null} />
-        <RequestError message={error as any} />
+        <RequestError err={error} />
       </>
     );
   }
 
-  // Return component Empty state
-  if (!loading && !repositoryList?.length) {
+  const isAuthenticated = !!user?.username;
+
+  // Return component Empty state - only if there are truly no repositories
+  // If filtered results are empty but repos exist, show the table with toolbar
+  if (!loading && !repos?.length) {
     return (
       <Empty
         icon={CubesIcon}
         title="There are no viewable repositories"
-        body="Either no repositories exist yet or you may not have permission to view any. If you have permission, try creating a new repository."
+        body={
+          isAuthenticated
+            ? 'Either no repositories exist yet or you may not have permission to view any. If you have permission, try creating a new repository.'
+            : 'No public repositories found. Sign in to view your private repositories.'
+        }
         button={
-          <ToolbarButton
-            id=""
-            buttonValue="Create Repository"
-            Modal={createRepoModal}
-            isModalOpen={isCreateRepoModalOpen}
-            setModalOpen={setCreateRepoModalOpen}
-          />
+          canCreateRepository ? (
+            <ToolbarButton
+              id=""
+              buttonValue="Create Repository"
+              Modal={createRepoModal}
+              isModalOpen={isCreateRepoModalOpen}
+              setModalOpen={setCreateRepoModalOpen}
+            />
+          ) : null
         }
       />
     );
@@ -291,22 +348,44 @@ export default function RepositoriesList(props: RepositoriesListProps) {
   return (
     <>
       <RepoListHeader shouldRender={currentOrg === null} />
-      <PageSection variant={PageSectionVariants.light}>
-        <ErrorModal title="Org deletion failed" error={err} setError={setErr} />
+      <PageSection hasBodyWrapper={false}>
+        <ErrorModal
+          title="Repository deletion failed"
+          error={err}
+          setError={setErr}
+        />
+        {truncated && (
+          <Alert
+            variant="info"
+            isInline
+            title="Showing first 10,000 repositories. Filter by organization to narrow results."
+            style={{marginBottom: '1em'}}
+          />
+        )}
+        {isQuotaManagementEnabled && currentOrg && (
+          <div style={{marginBottom: '1em'}}>
+            <Title headingLevel="h4" size="md">
+              Total Quota Consumed: <span>{formatQuotaDisplay()}</span>
+            </Title>
+          </div>
+        )}
         <RepositoryToolBar
           search={search}
           setSearch={setSearch}
-          total={totalResults}
+          total={paginationProps.total}
           currentOrg={currentOrg}
-          pageModal={createRepoModal}
-          showPageButton={true}
+          pageModal={canCreateRepository ? createRepoModal : null}
+          showPageButton={isAuthenticated && !isReadOnlySuperUser}
+          showCreateButton={canCreateRepository}
           buttonText="Create Repository"
           isModalOpen={isCreateRepoModalOpen}
           setModalOpen={setCreateRepoModalOpen}
           isKebabOpen={isKebabOpen}
           setKebabOpen={setKebabOpen}
-          kebabItems={kebabItems}
-          selectedRepoNames={selectedRepoNames}
+          kebabItems={isAuthenticated && !isReadOnlySuperUser ? kebabItems : []}
+          selectedRepoNames={
+            isAuthenticated && !isReadOnlySuperUser ? selectedRepoNames : []
+          }
           deleteModal={deleteRepositoryModal}
           deleteKebabIsOpen={isDeleteModalOpen}
           makePublicModalOpen={makePublicModalOpen}
@@ -315,10 +394,10 @@ export default function RepositoriesList(props: RepositoriesListProps) {
           toggleMakePrivateClick={toggleMakePrivateClick}
           selectAllRepos={selectAllRepos}
           repositoryList={filteredRepos}
-          perPage={perPage}
-          page={page}
-          setPage={setPage}
-          setPerPage={setPerPage}
+          perPage={paginationProps.perPage}
+          page={paginationProps.page}
+          setPage={paginationProps.setPage}
+          setPerPage={paginationProps.setPerPage}
           setSelectedRepoNames={setSelectedRepoNames}
           paginatedRepositoryList={paginatedRepositoryList}
           onSelectRepo={onSelectRepo}
@@ -326,69 +405,112 @@ export default function RepositoriesList(props: RepositoriesListProps) {
         <Table aria-label="Selectable table" variant="compact">
           <Thead>
             <Tr>
-              <Th />
-              <Th>{RepositoryListColumnNames.name}</Th>
-              <Th>{RepositoryListColumnNames.visibility}</Th>
-              {quayConfig?.features.QUOTA_MANAGEMENT &&
-              quayConfig?.features.EDIT_QUOTA ? (
-                <Th>{RepositoryListColumnNames.size}</Th>
+              {isAuthenticated && !isReadOnlySuperUser && <Th />}
+              <Th modifier="wrap" sort={getSortableSort(0)}>
+                {RepositoryListColumnNames.name}
+              </Th>
+              <Th modifier="wrap" sort={getSortableSort(1)}>
+                {RepositoryListColumnNames.visibility}
+              </Th>
+              {isQuotaManagementEnabled ? (
+                <Th modifier="wrap" sort={getSortableSort(2)}>
+                  {RepositoryListColumnNames.size}
+                </Th>
               ) : (
                 <></>
               )}
-              <Th>{RepositoryListColumnNames.lastModified}</Th>
+              <Th modifier="wrap" sort={getSortableSort(3)}>
+                {RepositoryListColumnNames.lastModified}
+              </Th>
             </Tr>
           </Thead>
           <Tbody data-testid="repository-list-table">
-            {repositoryList.length === 0 ? (
-              // Repo table loading icon
-              <Tr>
-                <Td>
-                  <Spinner size="lg" />
-                </Td>
-              </Tr>
+            {filteredRepos.length === 0 ? (
+              loading ? (
+                <Tr>
+                  <Td colSpan={5}>
+                    <Spinner size="lg" />
+                  </Td>
+                </Tr>
+              ) : (
+                <Tr>
+                  <Td colSpan={5}>No repositories found</Td>
+                </Tr>
+              )
             ) : (
               paginatedRepositoryList.map((repo, rowIndex) => (
                 <Tr key={rowIndex}>
-                  <Td
-                    select={{
-                      rowIndex,
-                      onSelect: (_event, isSelecting) =>
-                        onSelectRepo(repo, rowIndex, isSelecting),
-                      isSelected: isRepoSelected(repo),
-                      isDisabled: !isRepoSelectable(repo),
-                    }}
-                  />
+                  {isAuthenticated && !isReadOnlySuperUser && (
+                    <Td
+                      select={{
+                        rowIndex,
+                        onSelect: (_event, isSelecting) =>
+                          onSelectRepo(repo, rowIndex, isSelecting),
+                        isSelected: isRepoSelected(repo),
+                        isDisabled: !isRepoSelectable(repo),
+                      }}
+                    />
+                  )}
                   <Td dataLabel={RepositoryListColumnNames.name}>
-                    {currentOrg == null ? (
-                      <Link
-                        to={getRepoDetailPath(
-                          location.pathname,
-                          repo.namespace,
-                          repo.name,
+                    <Flex alignItems={{default: 'alignItemsCenter'}}>
+                      <FlexItem spacer={{default: 'spacerSm'}}>
+                        <Avatar
+                          avatar={generateAvatarFromName(
+                            currentOrg == null ? repo.namespace : currentOrg,
+                          )}
+                          size="sm"
+                        />
+                      </FlexItem>
+                      <FlexItem>
+                        {currentOrg == null ? (
+                          <Link
+                            to={getRepoDetailPath(
+                              location.pathname,
+                              repo.namespace,
+                              repo.name,
+                            )}
+                          >
+                            {repo.namespace}/{repo.name}
+                          </Link>
+                        ) : (
+                          <Link
+                            to={getRepoDetailPath(
+                              location.pathname,
+                              repo.namespace,
+                              repo.name,
+                            )}
+                          >
+                            {repo.name}
+                          </Link>
                         )}
-                      >
-                        {repo.namespace}/{repo.name}
-                      </Link>
-                    ) : (
-                      <Link
-                        to={getRepoDetailPath(
-                          location.pathname,
-                          repo.namespace,
-                          repo.name,
-                        )}
-                      >
-                        {repo.name}
-                      </Link>
-                    )}
+                      </FlexItem>
+                    </Flex>
                   </Td>
                   <Td dataLabel={RepositoryListColumnNames.visibility}>
                     {repo.is_public ? 'public' : 'private'}
                   </Td>
-                  {quayConfig?.features.QUOTA_MANAGEMENT &&
-                  quayConfig?.features.EDIT_QUOTA ? (
+                  {isQuotaManagementEnabled ? (
                     <Td dataLabel={RepositoryListColumnNames.size}>
-                      {' '}
-                      {formatSize(repo.size)}
+                      {(() => {
+                        const sizeDisplay =
+                          repo.size != null ? formatSize(repo.size) : '';
+
+                        if (repo.configured_quota) {
+                          const percentage =
+                            repo.size != null
+                              ? Math.round(
+                                  (repo.size / repo.configured_quota) * 100,
+                                )
+                              : 0;
+
+                          // Combine size and percentage: "1.5 GiB (45%)" or "N/A (0%)"
+                          const displaySize = sizeDisplay || 'N/A';
+                          return `${displaySize} (${percentage}%)`;
+                        }
+
+                        // No configured quota - just show size or empty
+                        return sizeDisplay;
+                      })()}
                     </Td>
                   ) : (
                     <></>
@@ -402,15 +524,7 @@ export default function RepositoriesList(props: RepositoriesListProps) {
           </Tbody>
         </Table>
         <PanelFooter>
-          <ToolbarPagination
-            total={totalResults}
-            itemsList={filteredRepos}
-            perPage={perPage}
-            page={page}
-            setPage={setPage}
-            setPerPage={setPerPage}
-            bottom={true}
-          />
+          <ToolbarPagination {...paginationProps} bottom={true} />
         </PanelFooter>
       </PageSection>
     </>
@@ -422,9 +536,11 @@ export interface RepoListTableItem {
   name: string;
   is_public: boolean;
   size: number;
-  last_modified: number;
+  last_modified?: number;
+  configured_quota?: number;
 }
 
 interface RepositoriesListProps {
   organizationName: string;
+  isUserOrganization?: boolean;
 }

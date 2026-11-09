@@ -1,8 +1,4 @@
-import {
-  PageSection,
-  PageSectionVariants,
-  PanelFooter,
-} from '@patternfly/react-core';
+import {PageSection, PanelFooter} from '@patternfly/react-core';
 import {CubesIcon} from '@patternfly/react-icons';
 import {useEffect, useState} from 'react';
 import {useRecoilState, useRecoilValue, useResetRecoilState} from 'recoil';
@@ -10,6 +6,7 @@ import {
   searchTagsFilterState,
   searchTagsState,
   selectedTagsState,
+  showSignaturesState,
 } from 'src/atoms/TagListState';
 import Empty from 'src/components/empty/Empty';
 import ErrorBoundary from 'src/components/errors/ErrorBoundary';
@@ -21,42 +18,70 @@ import {
   ManifestByDigestResponse,
   Tag,
   TagsResponse,
+  Label,
   getManifestByDigest,
   getTags,
 } from 'src/resources/TagResource';
 import TagsTable from './TagsTable';
 import {TagsToolbar} from './TagsToolbar';
+import {usePaginatedSortableTable} from '../../../hooks/usePaginatedSortableTable';
+import {enrichTagsWithCosignData, isCosignSignatureTag} from 'src/libs/cosign';
+import {toEpochOrZero} from 'src/libs/utils';
+import {
+  extractLastModified,
+  extractExpires,
+  extractLastPulled,
+} from './tagColumnExtractors';
 
 export default function TagsList(props: TagsProps) {
   const [tags, setTags] = useState<Tag[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [err, setErr] = useState<string>();
+  const [labelCache, setLabelCache] = useState<Record<string, Label[]>>({});
   const resetSelectedTags = useResetRecoilState(selectedTagsState);
   const searchFilter = useRecoilValue(searchTagsFilterState);
   const resetSearch = useResetRecoilState(searchTagsState);
+  const showSignatures = useRecoilValue(showSignaturesState);
 
-  const filteredTags: Tag[] = searchFilter ? tags.filter(searchFilter) : tags;
+  // Filter out signature tags if showSignatures is false
+  const filteredTags = showSignatures
+    ? tags
+    : tags.filter((tag) => !isCosignSignatureTag(tag.name));
 
-  // Pagination related states
-  const [perPage, setPerPage] = useState<number>(20);
-  const [page, setPage] = useState<number>(1);
-  const paginatedTags: Tag[] = filteredTags.slice(
-    (page - 1) * perPage,
-    page * perPage,
-  );
+  // Use unified table hook for sorting, filtering, and pagination
+  const {
+    paginatedData: paginatedTags,
+    sortedData: sortedTags,
+    getSortableSort,
+    paginationProps,
+  } = usePaginatedSortableTable(filteredTags, {
+    columns: {
+      2: (item: Tag) => item.name, // Tag Name
+      4: (item: Tag) => item.size || 0, // Size
+      5: extractLastModified, // Last Modified
+      6: extractExpires, // Expires
+      7: (item: Tag) => item.manifest_digest, // Manifest
+      8: extractLastPulled, // Last Pulled
+      9: (item: Tag) => item.pull_count || 0, // Pull Count
+    },
+    filter: searchFilter,
+    initialPerPage: 20,
+  });
 
   // Control selected tags
   const [selectedTags, setSelectedTags] = useRecoilState(selectedTagsState);
   const selectAllTags = (isSelecting = true) => {
-    setSelectedTags(isSelecting ? tags.map((t) => t.name) : []);
+    setSelectedTags(isSelecting ? sortedTags.map((t) => t.name) : []);
   };
-  const selectTag = (tag: Tag, rowIndex = 0, isSelecting = true) =>
+  const selectTag = (tag: Tag, rowIndex?: number, isSelecting = true) => {
+    // rowIndex parameter is kept for interface compatibility but not used in this implementation
     setSelectedTags((prevSelected) => {
       const otherSelectedtagNames = prevSelected.filter((r) => r !== tag.name);
       return isSelecting
         ? [...otherSelectedtagNames, tag.name]
         : otherSelectedtagNames;
     });
+  };
 
   const loadTags = async () => {
     const getManifest = async (tag: Tag) => {
@@ -64,11 +89,24 @@ export default function TagsList(props: TagsProps) {
         props.organization,
         props.repository,
         tag.manifest_digest,
+        true, // include_modelcard
       );
-      tag.manifest_list = JSON.parse(manifestResp.manifest_data);
+      const manifestList = JSON.parse(manifestResp.manifest_data);
+      // Map is_present onto each child manifest using child_manifests_presence
+      if (manifestList.manifests && tag.child_manifests_presence) {
+        manifestList.manifests = manifestList.manifests.map(
+          (m: {digest: string}) => ({
+            ...m,
+            is_present: tag.child_manifests_presence?.[m.digest] ?? true,
+          }),
+        );
+      }
+      tag.manifest_list = manifestList;
     };
+
     let page = 1;
     let hasAdditional = false;
+    let allTags: Tag[] = [];
     try {
       do {
         const resp: TagsResponse = await getTags(
@@ -81,19 +119,24 @@ export default function TagsList(props: TagsProps) {
             tag.is_manifest_list ? getManifest(tag) : null,
           ),
         );
-        if (page == 1) {
-          setTags(resp.tags);
-        } else {
-          setTags((currentTags) => [...currentTags, ...resp.tags]);
-        }
+
+        allTags = page == 1 ? resp.tags : [...allTags, ...resp.tags];
+
+        // Progressive rendering: update UI with tags as they load
+        setTags(allTags);
+        setLoading(false);
+
         hasAdditional = resp.has_additional;
         page++;
-        setLoading(false);
       } while (hasAdditional);
-    } catch (error: any) {
+      // After all tags are loaded, enrich with Cosign signature data
+      // This requires all tags to be present to build the signature map correctly
+      const enrichedTags = enrichTagsWithCosignData(allTags);
+      setTags(enrichedTags);
+    } catch (error: unknown) {
       console.error(error);
       setLoading(false);
-      setErr(addDisplayError('Unable to get tags', error));
+      setErr(addDisplayError('Unable to get tags', error as Error));
     }
   };
 
@@ -114,7 +157,7 @@ export default function TagsList(props: TagsProps) {
   }
 
   return (
-    <PageSection variant={PageSectionVariants.light}>
+    <PageSection hasBodyWrapper={false}>
       <ErrorBoundary
         hasError={isErrorString(err)}
         fallback={<RequestError message={err} />}
@@ -122,14 +165,14 @@ export default function TagsList(props: TagsProps) {
         <TagsToolbar
           organization={props.organization}
           repository={props.repository}
-          tagCount={filteredTags.length}
+          tagCount={sortedTags.length}
           loadTags={loadTags}
-          TagList={filteredTags}
+          TagList={sortedTags}
           paginatedTags={paginatedTags}
-          perPage={perPage}
-          page={page}
-          setPage={setPage}
-          setPerPage={setPerPage}
+          perPage={paginationProps.perPage}
+          page={paginationProps.page}
+          setPage={paginationProps.setPage}
+          setPerPage={paginationProps.setPerPage}
           selectTag={selectTag}
           repoDetails={props.repoDetails}
         />
@@ -137,23 +180,22 @@ export default function TagsList(props: TagsProps) {
           org={props.organization}
           repo={props.repository}
           tags={paginatedTags}
+          allTags={sortedTags}
+          page={paginationProps.page}
+          perPage={paginationProps.perPage}
           loading={loading}
           selectAllTags={selectAllTags}
           selectedTags={selectedTags}
           selectTag={selectTag}
           loadTags={loadTags}
           repoDetails={props.repoDetails}
+          getSortableSort={getSortableSort}
+          labelCache={labelCache}
+          setLabelCache={setLabelCache}
         />
       </ErrorBoundary>
       <PanelFooter>
-        <ToolbarPagination
-          itemsList={filteredTags}
-          perPage={perPage}
-          page={page}
-          setPage={setPage}
-          setPerPage={setPerPage}
-          bottom={true}
-        />
+        <ToolbarPagination {...paginationProps} bottom={true} />
       </PanelFooter>
     </PageSection>
   );

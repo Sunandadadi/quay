@@ -20,8 +20,12 @@ from flask import (
 from flask_login import current_user
 
 import features
-from _init import ROOT_DIR
-from app import app, authentication, avatar
+from _init import ROOT_DIR, __version__
+from app import (
+    app,
+    authentication,
+    avatar,
+)
 from app import billing as stripe
 from app import (
     build_logs,
@@ -77,7 +81,8 @@ from health.healthcheck import get_healthchecker
 from util.cache import no_cache
 from util.headers import parse_basic_auth
 from util.invoice import renderInvoiceToPdf
-from util.registry.gzipinputstream import GzipInputStream
+from util.metrics.prometheus import ui_page_views
+from util.registry.gzipinputstream import GzipInputStream, UnrecognizedStreamError
 from util.request import crossorigin, get_request_ip
 from util.useremails import send_email_changed
 
@@ -300,7 +305,7 @@ def privacy():
 @no_cache
 def instance_health():
     checker = get_healthchecker(app, config_provider, instance_keys)
-    (data, status_code) = checker.check_instance()
+    data, status_code = checker.check_instance()
     response = jsonify(dict(data=data, status_code=status_code))
     response.status_code = status_code
     return response
@@ -312,7 +317,7 @@ def instance_health():
 @no_cache
 def endtoend_health():
     checker = get_healthchecker(app, config_provider, instance_keys)
-    (data, status_code) = checker.check_endtoend()
+    data, status_code = checker.check_endtoend()
     response = jsonify(dict(data=data, status_code=status_code))
     response.status_code = status_code
     return response
@@ -323,7 +328,7 @@ def endtoend_health():
 @no_cache
 def warning_health():
     checker = get_healthchecker(app, config_provider, instance_keys)
-    (data, status_code) = checker.check_warning()
+    data, status_code = checker.check_warning()
     response = jsonify(dict(data=data, status_code=status_code))
     response.status_code = status_code
     return response
@@ -462,10 +467,25 @@ def logarchive(file_id):
     try:
         path = log_archive.get_file_id_path(file_id)
         data_stream = log_archive._storage.stream_read_file(log_archive._locations, path)
-        return send_file(GzipInputStream(data_stream), mimetype=JSON_MIMETYPE)
     except IOError:
         logger.exception("Could not read archived logs")
         abort(403)
+
+    try:
+        stream = GzipInputStream(data_stream)
+    except UnrecognizedStreamError as e:
+        logger.error(
+            "Archived build logs for %s are neither gzip nor JSON; first bytes: %s",
+            file_id,
+            e.head.hex(),
+        )
+        response = jsonify({"error": "Archived logs are unreadable"})
+        response.status_code = 500
+        return response
+
+    if stream.passthrough:
+        logger.warning("Archived build logs for %s arrived already decoded", file_id)
+    return send_file(stream, mimetype=JSON_MIMETYPE)
 
 
 @web.route("/receipt", methods=["GET"])
@@ -686,10 +706,15 @@ def oauth_local_handler():
         abort(401)
         return
 
+    format_requested = request.args.get("format", "html").lower()
+
     if not request.args.get("scope"):
         return render_page_template_with_routedata("message.html", message="Authorization canceled")
     else:
-        return render_page_template_with_routedata("generatedtoken.html")
+        if format_requested == "json":
+            return jsonify({"access_token": request.args.get("access_token")})
+        else:
+            return render_page_template_with_routedata("generatedtoken.html")
 
 
 @web.route("/oauth/denyapp", methods=["POST"])
@@ -722,8 +747,12 @@ def request_authorization_code():
     scope = request.args.get("scope", None)
     state = request.args.get("state", None)
     assignment_uuid = request.args.get("assignment_uuid", None)
+    format_requested = request.args.get("format", "html").lower()
 
-    if not get_authenticated_user():
+    # get authenticated user
+    user = get_authenticated_user()
+
+    if not user:
         abort(401)
         return
 
@@ -738,15 +767,15 @@ def request_authorization_code():
     if not oauth_app:
         abort(404)
 
-    # check if user is org admin, if not check for user_assignment_id, then check that user belongs that assignment, if none exit with 401
+    # check if user is org admin, if not check for user_assignment_id,
+    # then check that user belongs that assignment, if none exit with 403
     if (
-        not is_org_admin(current_user.db_user(), oauth_app.organization)
-        and get_token_assignment(assignment_uuid, current_user.db_user(), oauth_app.organization)
-        is None
+        not is_org_admin(user, oauth_app.organization)
+        and get_token_assignment(assignment_uuid, user, oauth_app.organization) is None
     ):
         abort(403)
 
-    if not provider.validate_has_scopes(client_id, current_user.db_user().username, scope):
+    if not provider.validate_has_scopes(client_id, user.username, scope):
         if not provider.validate_redirect_uri(client_id, redirect_uri):
             current_app = provider.get_application_for_client_id(client_id)
             if not current_app:
@@ -774,22 +803,40 @@ def request_authorization_code():
             },
         }
 
-        # Show the authorization page.
         has_dangerous_scopes = any([check_scope["dangerous"] for check_scope in scope_info])
-        return render_page_template_with_routedata(
-            "oauthorize.html",
-            scopes=scope_info,
-            has_dangerous_scopes=has_dangerous_scopes,
-            application=oauth_app_view,
-            enumerate=enumerate,
-            response_type=response_type,
-            client_id=client_id,
-            redirect_uri=redirect_uri,
-            scope=scope,
-            csrf_token_val=generate_csrf_token(),
-            state=state,
-            assignment_uuid=assignment_uuid,
-        )
+
+        if format_requested == "json":
+            # Return the authorization data as JSON.
+            return jsonify(
+                {
+                    "scopes": scope_info,
+                    "has_dangerous_scopes": has_dangerous_scopes,
+                    "application": oauth_app_view,
+                    "response_type": response_type,
+                    "client_id": client_id,
+                    "redirect_uri": redirect_uri,
+                    "scope": scope,
+                    "csrf_token_val": generate_csrf_token(),
+                    "state": state,
+                    "assignment_uuid": assignment_uuid,
+                }
+            )
+        else:
+            # Show the authorization page (default behavior).
+            return render_page_template_with_routedata(
+                "oauthorize.html",
+                scopes=scope_info,
+                has_dangerous_scopes=has_dangerous_scopes,
+                application=oauth_app_view,
+                enumerate=enumerate,
+                response_type=response_type,
+                client_id=client_id,
+                redirect_uri=redirect_uri,
+                scope=scope,
+                csrf_token_val=generate_csrf_token(),
+                state=state,
+                assignment_uuid=assignment_uuid,
+            )
 
     if response_type == "token":
         return provider.get_token_response(
@@ -817,12 +864,14 @@ def request_authorization_code():
 @param_required("scope")
 @param_required("username")
 @process_auth_or_cookie
+@csrf_protect()
 def assign_user_to_app():
     response_type = request.args.get("response_type", "code")
     client_id = request.args.get("client_id", None)
     redirect_uri = request.args.get("redirect_uri", None)
     scope = request.args.get("scope", None)
     username = request.args.get("username", None)
+    format_requested = request.args.get("format", "html").lower()
 
     if not features.ASSIGN_OAUTH_TOKEN:
         abort(404)
@@ -859,10 +908,12 @@ def assign_user_to_app():
             "client_id": application.client_id,
         },
     )
-
-    return render_page_template_with_routedata(
-        "message.html", message="Token assigned successfully"
-    )
+    if format_requested == "json":
+        return jsonify({"message": "Token assigned successfully"})
+    else:
+        return render_page_template_with_routedata(
+            "message.html", message="Token assigned successfully"
+        )
 
 
 @web.route("/oauth/access_token", methods=["POST"])
@@ -1105,6 +1156,12 @@ def user_initialize():
 @web.route("/config", methods=["GET", "OPTIONS"])
 @crossorigin(anonymous=False)
 def config():
+    if request.method == "GET":
+        ui_page_views.labels(ui="react").inc()
+    version_number = ""
+    if not features.BILLING:
+        version_number = "Quay %s" % __version__
+
     response = jsonify(
         {
             "config": frontend_visible_config(app.config),
@@ -1113,6 +1170,7 @@ def config():
             "external_login": get_external_login_config(),
             "registry_state": app.config.get("REGISTRY_STATE", "normal"),
             "account_recovery_mode": app.config.get("ACCOUNT_RECOVERY_MODE", False),
+            "version_number": version_number,
         }
     )
     return response

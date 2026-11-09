@@ -76,13 +76,13 @@ OCI_MANIFEST_URLS_KEY = "urls"
 OCI_MANIFEST_ANNOTATIONS_KEY = "annotations"
 OCI_MANIFEST_SUBJECT_KEY = "subject"
 OCI_MANIFEST_ARTIFACT_TYPE_KEY = "artifactType"
-OCI_MANIFEST_ANNOTATIONS_KEY = "annotations"
 
 # Named tuples.
 OCIManifestConfig = namedtuple("OCIManifestConfig", ["size", "digest"])
 OCIManifestDescriptor = namedtuple("OCIManifestDescriptor", ["mediatype", "size", "digest"])
 OCIManifestLayer = namedtuple(
-    "OCIManifestLayer", ["index", "digest", "is_remote", "urls", "compressed_size"]
+    "OCIManifestLayer",
+    ["index", "digest", "is_remote", "urls", "compressed_size", "mediatype", "annotations"],
 )
 
 OCIManifestImageLayer = namedtuple(
@@ -166,6 +166,10 @@ class OCIManifest(ManifestInterface):
             validate_schema(self._parsed, self.get_meta_schema())
         except ValidationError as ve:
             raise MalformedOCIManifest("manifest data does not match schema: %s" % ve)
+
+        for layer in self._parsed["layers"]:
+            if layer["size"] < 0:
+                raise MalformedOCIManifest("invalid layer size")
 
         for layer in self.filesystem_layers:
             if layer.is_remote and not layer.urls:
@@ -295,21 +299,35 @@ class OCIManifest(ManifestInterface):
         not support layers.
         """
         if not self.is_image_manifest:
+            for filesystem_layer in self.filesystem_layers:
+                yield ManifestImageLayer(
+                    layer_id=str(filesystem_layer.digest),
+                    compressed_size=filesystem_layer.compressed_size,
+                    is_remote=filesystem_layer.is_remote,
+                    urls=filesystem_layer.urls,
+                    command=None,
+                    blob_digest=str(filesystem_layer.digest),
+                    created_datetime=None,
+                    author=None,
+                    comment=None,
+                    internal_layer=filesystem_layer,
+                )
             return
 
         for image_layer in self._manifest_image_layers(content_retriever):
             is_remote = image_layer.blob_layer.is_remote if image_layer.blob_layer else False
             urls = image_layer.blob_layer.urls if image_layer.blob_layer else None
+            history = image_layer.history
             yield ManifestImageLayer(
                 layer_id=image_layer.v1_id,
                 compressed_size=image_layer.compressed_size,
                 is_remote=is_remote,
                 urls=urls,
-                command=image_layer.history.command,
+                command=history.command if history else None,
                 blob_digest=image_layer.blob_digest,
-                created_datetime=image_layer.history.created_datetime,
-                author=image_layer.history.author,
-                comment=image_layer.history.comment,
+                created_datetime=history.created_datetime if history else None,
+                author=history.author if history else None,
+                comment=history.comment if history else None,
                 internal_layer=image_layer,
             )
 
@@ -342,9 +360,11 @@ class OCIManifest(ManifestInterface):
                 v1_layer_id = digest_history.hexdigest()
 
                 yield OCIManifestImageLayer(
-                    history=config.synthesized_history
-                    if index == len(self.filesystem_layers) - 1
-                    else None,
+                    history=(
+                        config.synthesized_history
+                        if index == len(self.filesystem_layers) - 1
+                        else None
+                    ),
                     blob_layer=filesystem_layer,
                     blob_digest=str(filesystem_layer.digest),
                     v1_id=v1_layer_id,
@@ -506,6 +526,7 @@ class OCIManifest(ManifestInterface):
         for index, layer in enumerate(self._parsed[OCI_MANIFEST_LAYERS_KEY]):
             content_type = layer[OCI_MANIFEST_MEDIATYPE_KEY]
             is_remote = content_type in OCI_IMAGE_NON_DISTRIBUTABLE_LAYER_CONTENT_TYPES
+            layer_annotations = layer.get(OCI_MANIFEST_ANNOTATIONS_KEY, {})
 
             try:
                 digest = digest_tools.Digest.parse_digest(layer[OCI_MANIFEST_DIGEST_KEY])
@@ -520,6 +541,8 @@ class OCIManifest(ManifestInterface):
                 digest=digest,
                 is_remote=is_remote,
                 urls=layer.get(OCI_MANIFEST_URLS_KEY),
+                mediatype=content_type,
+                annotations=layer_annotations,
             )
 
 
@@ -561,7 +584,7 @@ class OCIManifestBuilder(object):
         """
         self.annotations[key] = value
 
-    def add_layer(self, digest, size, urls=None):
+    def add_layer(self, digest, size, urls=None, annotations=None, mediatype=None):
         """
         Adds a filesystem layer to the manifest.
         """
@@ -572,6 +595,8 @@ class OCIManifestBuilder(object):
                 compressed_size=size,
                 urls=urls,
                 is_remote=bool(urls),
+                annotations=None,
+                mediatype=None,
             )
         )
 

@@ -11,16 +11,18 @@ from random import SystemRandom
 
 import bitmath
 from cryptography.hazmat.primitives import serialization
-from flask import jsonify, make_response, request
+from flask import jsonify, make_response, request, send_file
 
 import features
 from _init import ROOT_DIR
-from app import app, authentication, avatar, config_provider, usermanager
+from app import app, authentication, avatar, config_provider, log_archive, usermanager
 from auth import scopes
 from auth.auth_context import get_authenticated_user
 from auth.permissions import SuperUserPermission
+from data import model
 from data.database import ServiceKeyApprovalType
 from data.logs_model import logs_model
+from data.logs_model.shared import SearchNotConfiguredError
 from data.model import DataModelException, InvalidNamespaceQuota, namespacequota, user
 from data.model.quota import get_registry_size, queue_registry_size_calculation
 from endpoints.api import (
@@ -29,7 +31,9 @@ from endpoints.api import (
     InvalidResponse,
     NotFound,
     Unauthorized,
+    allow_if_any_superuser,
     allow_if_global_readonly_superuser,
+    allow_if_superuser_with_full_access,
     format_date,
     internal_only,
     log_action,
@@ -48,6 +52,7 @@ from endpoints.api import (
 )
 from endpoints.api.build import get_logs_or_log_url
 from endpoints.api.logs import _validate_logs_arguments
+from endpoints.api.mirrorhealth import _CACHE_CONTROL_NO_STORE, get_mirror_health_data
 from endpoints.api.namespacequota import get_quota, limit_view, quota_view
 from endpoints.api.superuser_models_pre_oci import (
     InvalidRepositoryBuildException,
@@ -55,7 +60,10 @@ from endpoints.api.superuser_models_pre_oci import (
     ServiceKeyDoesNotExist,
     pre_oci_model,
 )
+from endpoints.exception import DownstreamIssue
+from util.config.schema import CONFIG_SCHEMA
 from util.parsing import truthy_bool
+from util.registry.gzipinputstream import GzipInputStream, UnrecognizedStreamError
 from util.request import get_request_ip
 from util.useremails import send_confirmation_email, send_recovery_email
 from util.validation import validate_service_key_name
@@ -75,6 +83,7 @@ def get_services():
 
 @resource("/v1/superuser/aggregatelogs")
 @internal_only
+@show_if(features.SUPER_USERS)
 class SuperUserAggregateLogs(ApiResource):
     """
     Resource for fetching aggregated logs for the current user.
@@ -90,11 +99,18 @@ class SuperUserAggregateLogs(ApiResource):
         """
         Returns the aggregated logs for the current system.
         """
-        if SuperUserPermission().can():
-            (start_time, end_time) = _validate_logs_arguments(
+        if allow_if_any_superuser():
+            start_time, end_time = _validate_logs_arguments(
                 parsed_args["starttime"], parsed_args["endtime"]
             )
-            aggregated_logs = logs_model.get_aggregated_log_counts(start_time, end_time)
+            try:
+                aggregated_logs = logs_model.get_aggregated_log_counts(start_time, end_time)
+            except SearchNotConfiguredError as e:
+                return {
+                    "aggregated": [],
+                    "search_unavailable": True,
+                    "message": str(e),
+                }
             return {"aggregated": [log.to_dict() for log in aggregated_logs]}
 
         raise Unauthorized()
@@ -123,12 +139,24 @@ class SuperUserLogs(ApiResource):
         """
         List the usage logs for the current system.
         """
-        if SuperUserPermission().can() or allow_if_global_readonly_superuser():
+        if allow_if_any_superuser():
             start_time = parsed_args["starttime"]
             end_time = parsed_args["endtime"]
 
-            (start_time, end_time) = _validate_logs_arguments(start_time, end_time)
-            log_entry_page = logs_model.lookup_logs(start_time, end_time, page_token=page_token)
+            start_time, end_time = _validate_logs_arguments(start_time, end_time)
+            try:
+                log_entry_page = logs_model.lookup_logs(start_time, end_time, page_token=page_token)
+            except SearchNotConfiguredError as e:
+                return (
+                    {
+                        "start_time": format_date(start_time),
+                        "end_time": format_date(end_time),
+                        "logs": [],
+                        "search_unavailable": True,
+                        "message": str(e),
+                    },
+                    None,
+                )
             return (
                 {
                     "start_time": format_date(start_time),
@@ -187,7 +215,7 @@ class ChangeLog(ApiResource):
         """
         Returns the change log for this installation.
         """
-        if SuperUserPermission().can():
+        if allow_if_any_superuser():
             with open(os.path.join(ROOT_DIR, "CHANGELOG.md"), "r") as f:
                 return {"log": f.read()}
 
@@ -218,7 +246,7 @@ class SuperUserOrganizationList(ApiResource):
         """
         Returns a list of all organizations in the system.
         """
-        if SuperUserPermission().can() or allow_if_global_readonly_superuser():
+        if allow_if_any_superuser():
             if parsed_args["limit"] is not None and parsed_args["limit"] > 100:
                 raise InvalidRequest("Page limit cannot be above 100")
 
@@ -252,7 +280,7 @@ class SuperUserRegistrySize(ApiResource):
         """
         Returns size of the registry
         """
-        if SuperUserPermission().can() or allow_if_global_readonly_superuser():
+        if allow_if_any_superuser():
             registry_size = get_registry_size()
             if registry_size is not None:
                 return {
@@ -327,7 +355,7 @@ class SuperUserUserQuotaList(ApiResource):
     @nickname(["listUserQuotaSuperUser", "listOrganizationQuotaSuperUser"])
     @require_scope(scopes.SUPERUSER)
     def get(self, namespace):
-        if SuperUserPermission().can() or allow_if_global_readonly_superuser():
+        if allow_if_any_superuser():
 
             try:
                 namespace_user = user.get_user_or_org(namespace)
@@ -510,7 +538,7 @@ class SuperUserList(ApiResource):
         """
         Returns a list of all users in the system.
         """
-        if SuperUserPermission().can() or allow_if_global_readonly_superuser():
+        if allow_if_any_superuser():
             if parsed_args["limit"] is not None and parsed_args["limit"] > 100:
                 raise InvalidRequest("Page limit cannot be above 100")
 
@@ -648,7 +676,7 @@ class SuperUserManagement(ApiResource):
         """
         Returns information about the specified user.
         """
-        if SuperUserPermission().can():
+        if allow_if_any_superuser():
             user = pre_oci_model.get_nonrobot_user(username)
             if user is None:
                 raise NotFound()
@@ -849,6 +877,12 @@ class SuperUserOrganizationManagement(ApiResource):
         Deletes the specified organization.
         """
         if SuperUserPermission().can():
+            try:
+                model.organization.get_organization(name)
+            except model.InvalidOrganizationException:
+                raise NotFound()
+
+            log_action("org_delete", name, {"namespace": name})
             pre_oci_model.mark_organization_for_deletion(name)
             return "", 204
 
@@ -946,7 +980,7 @@ class SuperUserServiceKeyManagement(ApiResource):
     @nickname("listServiceKeys")
     @require_scope(scopes.SUPERUSER)
     def get(self):
-        if SuperUserPermission().can() or allow_if_global_readonly_superuser():
+        if allow_if_any_superuser():
             keys = pre_oci_model.list_all_service_keys()
 
             return jsonify(
@@ -992,7 +1026,7 @@ class SuperUserServiceKeyManagement(ApiResource):
             )
 
             # Generate a key with a private key that we *never save*.
-            (private_key, key_id) = pre_oci_model.generate_service_key(
+            private_key, key_id = pre_oci_model.generate_service_key(
                 body["service"], expiration_date, metadata=metadata, name=key_name
             )
             # Auto-approve the service key.
@@ -1071,7 +1105,7 @@ class SuperUserServiceKey(ApiResource):
     @nickname("getServiceKey")
     @require_scope(scopes.SUPERUSER)
     def get(self, kid):
-        if SuperUserPermission().can() or allow_if_global_readonly_superuser():
+        if allow_if_any_superuser():
             try:
                 key = pre_oci_model.get_service_key(kid, approved_only=False, alive_only=False)
                 return jsonify(key.to_dict())
@@ -1214,6 +1248,70 @@ class SuperUserServiceKeyApproval(ApiResource):
         raise Unauthorized()
 
 
+def _token_view(token):
+    """
+    Helper function to format app token data for API responses.
+    """
+    data = {
+        "uuid": token.uuid,
+        "title": token.title,
+        "last_accessed": format_date(token.last_accessed),
+        "created": format_date(token.created),
+        "expiration": format_date(token.expiration),
+    }
+
+    return data
+
+
+@resource("/v1/superuser/apptokens")
+@show_if(features.APP_SPECIFIC_TOKENS)
+@show_if(features.SUPER_USERS)
+class SuperUserAppTokens(ApiResource):
+    """
+    Resource for listing all app specific tokens across all users in the system.
+    """
+
+    @require_fresh_login
+    @nickname("listAllAppTokens")
+    @parse_args()
+    @query_param("expiring", "If true, only returns those tokens expiring soon", type=truthy_bool)
+    @require_scope(scopes.SUPERUSER)
+    def get(self, parsed_args):
+        """
+        Returns a list of all app specific tokens in the system.
+
+        This endpoint is for system-wide auditing by global read-only superusers and
+        full access superusers only. Regular superusers without full access are denied.
+        """
+        # Global readonly superusers can always audit, regular superusers need FULL_ACCESS
+        if allow_if_global_readonly_superuser() or allow_if_superuser_with_full_access():
+            expiring = parsed_args["expiring"]
+
+            if expiring:
+                expiration = app.config.get("APP_SPECIFIC_TOKEN_EXPIRATION")
+                import math
+                from datetime import timedelta
+
+                from util.timedeltastring import convert_to_timedelta
+
+                _DEFAULT_TOKEN_EXPIRATION_WINDOW = "4w"
+                token_expiration = convert_to_timedelta(
+                    expiration or _DEFAULT_TOKEN_EXPIRATION_WINDOW
+                )
+                seconds = math.ceil(token_expiration.total_seconds() * 0.1) or 1
+                soon = timedelta(seconds=seconds)
+                tokens = model.appspecifictoken.get_all_expiring_tokens(soon)
+            else:
+                tokens = model.appspecifictoken.list_all_tokens()
+
+            return {
+                "tokens": [_token_view(token) for token in tokens],
+                "only_expiring": expiring,
+            }
+
+        raise Unauthorized()
+
+
 @resource("/v1/superuser/<build_uuid>/logs")
 @path_param("build_uuid", "The UUID of the build")
 @show_if(features.SUPER_USERS)
@@ -1230,12 +1328,61 @@ class SuperUserRepositoryBuildLogs(ApiResource):
         """
         Return the build logs for the build specified by the build uuid.
         """
-        if SuperUserPermission().can() or allow_if_global_readonly_superuser():
+        if allow_if_any_superuser():
             try:
                 repo_build = pre_oci_model.get_repository_build(build_uuid)
                 return get_logs_or_log_url(repo_build)
             except InvalidRepositoryBuildException as e:
                 raise InvalidResponse(str(e))
+
+        raise Unauthorized()
+
+
+@resource("/v1/superuser/<build_uuid>/logs/archive")
+@path_param("build_uuid", "The UUID of the build")
+@show_if(features.SUPER_USERS)
+class SuperUserRepositoryBuildLogsArchive(ApiResource):
+    """
+    Resource for serving archived build log content for the superuser.
+    The /logarchive/ route checks repository-level permissions, which fails for
+    superusers who are not repo members. This endpoint bypasses that by streaming
+    the archive directly from object storage under superuser authorization.
+    """
+
+    @require_fresh_login
+    @verify_not_prod
+    @nickname("getRepoBuildLogsArchiveSuperUser")
+    @require_scope(scopes.SUPERUSER)
+    def get(self, build_uuid):
+        """
+        Return the archived build log content for the build specified by the build uuid.
+        """
+        if allow_if_any_superuser():
+            try:
+                pre_oci_model.get_repository_build(build_uuid)
+            except InvalidRepositoryBuildException as e:
+                raise InvalidResponse(str(e))
+
+            try:
+                path = log_archive.get_file_id_path(build_uuid)
+                data_stream = log_archive._storage.stream_read_file(log_archive._locations, path)
+            except IOError:
+                logger.exception("Could not read archived build logs")
+                raise InvalidResponse("Archived logs not available")
+
+            try:
+                stream = GzipInputStream(data_stream)
+            except UnrecognizedStreamError as e:
+                logger.error(
+                    "Archived build logs for %s are neither gzip nor JSON; first bytes: %s",
+                    build_uuid,
+                    e.head.hex(),
+                )
+                raise DownstreamIssue("Archived logs are unreadable")
+
+            if stream.passthrough:
+                logger.warning("Archived build logs for %s arrived already decoded", build_uuid)
+            return send_file(stream, mimetype="application/json")
 
         raise Unauthorized()
 
@@ -1257,7 +1404,7 @@ class SuperUserRepositoryBuildStatus(ApiResource):
         """
         Return the status for the builds specified by the build uuids.
         """
-        if SuperUserPermission().can() or allow_if_global_readonly_superuser():
+        if allow_if_any_superuser():
             try:
                 build = pre_oci_model.get_repository_build(build_uuid)
             except InvalidRepositoryBuildException as e:
@@ -1284,7 +1431,7 @@ class SuperUserRepositoryBuildResource(ApiResource):
         """
         Returns information about a build.
         """
-        if SuperUserPermission().can() or allow_if_global_readonly_superuser():
+        if allow_if_any_superuser():
             try:
                 build = pre_oci_model.get_repository_build(build_uuid)
             except InvalidRepositoryBuildException:
@@ -1293,3 +1440,114 @@ class SuperUserRepositoryBuildResource(ApiResource):
             return build.to_dict()
 
         raise Unauthorized()
+
+
+@resource("/v1/superuser/config")
+@show_if(features.SUPER_USERS)
+class SuperUserDumpConfig(ApiResource):
+    # NOTE: any changes made here must also be reflected in the nginx config
+    # this API returns a complete set of options. ! NOTE ! changing options listed
+    # but not documented is not supported
+
+    @require_fresh_login
+    @require_scope(scopes.SUPERUSER)
+    def get(self):
+        cfg = {}
+        warn = {}
+
+        def obfuscate(data, key=None, obf=False):
+            # obfuscate sensitive data
+            if key is not None:
+                return obfuscate({key: data})[key]
+            if isinstance(data, dict):
+                odata = {}
+                for k in data.keys():
+                    if k.lower() in (
+                        "password",
+                        "db_uri",
+                        "secret_key",
+                        "access_key",
+                        "enable_health_debug_secret",
+                        "client_secret",
+                        "s3_access_key",
+                        "s3_secret_key",
+                        "cloudfront_key_id",
+                        "sts_user_access_key",
+                        "sts_user_secret_key",
+                        "ldap_admin_passwd",
+                        "page_token_key",
+                        "security_scanner_v4_psk",
+                        "database_secret_key",
+                    ):
+                        odata[k] = obfuscate(data[k], obf=True)
+                    else:
+                        odata[k] = obfuscate(data[k])
+                return odata
+            elif isinstance(data, list):
+                return list(map(lambda x: obfuscate(x), data))
+            elif isinstance(data, str):
+                if obf:
+                    return f"{('*' * len(data))[:10]} ({len(data)})"
+                return data
+            elif any([isinstance(data, bool), isinstance(data, int)]):
+                return data
+
+        def process_config():
+            for k, v in app.config.items():
+                if not type(v) in (list, dict, tuple, int, str, bool):
+                    continue
+                try:
+                    # obfuscate passwords
+                    if not CONFIG_SCHEMA["properties"].get(k, False) is False:
+                        cfg[k] = obfuscate(v, key=k)
+                    else:
+                        warn[k] = obfuscate(v, key=k)
+                except Exception as procerr:
+                    logger.error(f"Cannot parse config, error {procerr}")
+                    continue
+            try:
+                return dict(config=cfg, warning=warn, env=dict(os.environ), schema=CONFIG_SCHEMA)
+            except TypeError as jsonerr:
+                # we shouldn't populate keys with methods/class/functions
+                # but to ensure we do not raise an Exception
+                logger.error(f"Cannot parse json, error {jsonerr}")
+                return dict(
+                    config=str(cfg), warning=str(warn), env=dict(os.environ), schema=CONFIG_SCHEMA
+                )
+
+        # requesting Scope only doesn't restrict so we need superuserpermissions.can
+        if allow_if_any_superuser():
+            if features.SUPERUSER_CONFIGDUMP:
+                return process_config()
+        raise Unauthorized()
+
+
+@resource("/v1/superuser/mirror/health")
+@show_if(features.REPO_MIRROR)
+@show_if(features.SUPER_USERS)
+class SuperUserRepositoryMirrorHealth(ApiResource):
+    """
+    Resource for checking global repository mirror health from the superuser panel.
+    """
+
+    @require_fresh_login
+    @nickname("getSuperUserRepositoryMirrorHealth")
+    def get(self):
+        """
+        Get a global mirror health summary without repository-identifying samples.
+        """
+        if not allow_if_any_superuser():
+            raise Unauthorized()
+
+        health_data = get_mirror_health_data(
+            detailed=False,
+            include_repository_details=False,
+        )
+
+        status_code = 200 if health_data["healthy"] else 503
+
+        return (
+            health_data,
+            status_code,
+            {"Cache-Control": _CACHE_CONTROL_NO_STORE},
+        )

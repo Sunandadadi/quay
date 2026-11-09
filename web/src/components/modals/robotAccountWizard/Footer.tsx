@@ -19,6 +19,10 @@ export default function Footer(props: FooterProps) {
           variant="primary"
           type="submit"
           onClick={goToNextStep}
+          isDisabled={
+            activeStep.name === 'Robot name and description' &&
+            !props.isDataValid()
+          }
         >
           Next
         </Button>
@@ -38,7 +42,7 @@ export default function Footer(props: FooterProps) {
       {(activeStep.name === 'Robot name and description' ||
         activeStep.name === 'Review and Finish') && (
         <Button
-          data-testid="review-and-finish-btn"
+          data-testid="create-robot-submit"
           isDisabled={!props.isDataValid()}
           variant="secondary"
           onClick={props.onSubmit}
@@ -48,7 +52,12 @@ export default function Footer(props: FooterProps) {
         </Button>
       )}
 
-      <Button variant="link" onClick={close} id="create-robot-cancel">
+      <Button
+        variant="link"
+        onClick={close}
+        id="create-robot-cancel"
+        data-testid="create-robot-cancel"
+      >
         Cancel
       </Button>
     </WizardFooterWrapper>

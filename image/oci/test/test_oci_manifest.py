@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -38,6 +39,72 @@ SAMPLE_MANIFEST = """{
   }
 }"""
 
+SAMPLE_MANIFEST2 = """{
+  "schemaVersion": 2,
+  "config": {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "size": 7023,
+    "digest": "sha256:b5b2b2c507a0944348e0303114d8d93aaaa081732b86451d9bce1f432a537bc7"
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 32654,
+      "digest": "sha256:9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0"
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 16724,
+      "digest": "sha256:3c3a4604a545cdc127456d94e421cd355bca5b528f4a9c1905b15da2eb4a4c6b"
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 73109,
+      "digest": "sha256:ec4b8955958665577945c89419d1af06b5f7636b4ac3da7f12184802ad867736",
+      "annotations": {
+        "com.example.layerkey1": "value1",
+        "com.example.layerkey2": "value2"
+      }
+    }
+  ],
+  "annotations": {
+    "com.example.key1": "value1",
+    "com.example.key2": "value2"
+  }
+}"""
+SAMPLE_MANIFEST2 = """{
+  "schemaVersion": 2,
+  "config": {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "size": 7023,
+    "digest": "sha256:b5b2b2c507a0944348e0303114d8d93aaaa081732b86451d9bce1f432a537bc7"
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 32654,
+      "digest": "sha256:9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0"
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 16724,
+      "digest": "sha256:3c3a4604a545cdc127456d94e421cd355bca5b528f4a9c1905b15da2eb4a4c6b"
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 73109,
+      "digest": "sha256:ec4b8955958665577945c89419d1af06b5f7636b4ac3da7f12184802ad867736",
+      "annotations": {
+        "com.example.layerkey1": "value1",
+        "com.example.layerkey2": "value2"
+      }
+    }
+  ],
+  "annotations": {
+    "com.example.key1": "value1",
+    "com.example.key2": "value2"
+  }
+}"""
 
 SAMPLE_REMOTE_MANIFEST = """{
   "schemaVersion": 2,
@@ -267,3 +334,207 @@ def test_validate_helm_oci_manifest():
     HELM_CHART_LAYER_TYPES = ["application/tar+gzip"]
     register_artifact_type(HELM_CHART_CONFIG_TYPE, HELM_CHART_LAYER_TYPES)
     manifest = OCIManifest(Bytes.for_string_or_unicode(manifest_bytes))
+
+
+def test_get_layers_for_custom_artifact():
+    HELM_CHART_CONFIG_TYPE = "application/vnd.cncf.helm.config.v1+json"
+    HELM_CHART_LAYER_TYPES = ["application/tar+gzip"]
+    register_artifact_type(HELM_CHART_CONFIG_TYPE, HELM_CHART_LAYER_TYPES)
+
+    helm_manifest_bytes = json.dumps(
+        {
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": "application/vnd.cncf.helm.config.v1+json",
+                "digest": "sha256:65a07b841ece031e6d0ec5eb948eacb17aa6d7294cdeb01d5348e86242951487",
+                "size": 141,
+            },
+            "layers": [
+                {
+                    "mediaType": "application/tar+gzip",
+                    "digest": "sha256:d84c9c29e0899862a0fa0f73da4d9f8c8c38e2da5d3258764aa7ba74bb914718",
+                    "size": 3562,
+                }
+            ],
+        }
+    )
+
+    manifest = OCIManifest(Bytes.for_string_or_unicode(helm_manifest_bytes))
+    assert not manifest.is_image_manifest
+
+    retriever = ContentRetrieverForTesting()
+    layers = list(manifest.get_layers(retriever))
+    assert len(layers) == 1
+
+    layer = layers[0]
+    assert (
+        layer.blob_digest
+        == "sha256:d84c9c29e0899862a0fa0f73da4d9f8c8c38e2da5d3258764aa7ba74bb914718"
+    )
+    assert layer.compressed_size == 3562
+    assert layer.is_remote is False
+    assert layer.command is None
+    assert layer.created_datetime is None
+    assert layer.author is None
+    assert layer.comment is None
+    assert layer.urls is None
+
+
+def test_get_layers_for_multi_layer_artifact():
+    CUSTOM_CONFIG = "application/vnd.example.config.v1+json"
+    CUSTOM_LAYER = "application/vnd.example.data.v1+tar"
+    register_artifact_type(CUSTOM_CONFIG, [CUSTOM_LAYER])
+
+    manifest_bytes = json.dumps(
+        {
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": CUSTOM_CONFIG,
+                "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "size": 100,
+            },
+            "layers": [
+                {
+                    "mediaType": CUSTOM_LAYER,
+                    "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                    "size": 1000,
+                },
+                {
+                    "mediaType": CUSTOM_LAYER,
+                    "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                    "size": 2000,
+                },
+            ],
+        }
+    )
+
+    manifest = OCIManifest(Bytes.for_string_or_unicode(manifest_bytes))
+    retriever = ContentRetrieverForTesting()
+    layers = list(manifest.get_layers(retriever))
+
+    assert len(layers) == 2
+    assert (
+        layers[0].blob_digest
+        == "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    )
+    assert layers[0].compressed_size == 1000
+    assert (
+        layers[1].blob_digest
+        == "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    )
+    assert layers[1].compressed_size == 2000
+
+
+def test_get_layers_still_works_for_image_manifest():
+    retriever = ContentRetrieverForTesting.for_config(
+        {
+            "config": {},
+            "rootfs": {"type": "layers", "diff_ids": []},
+            "history": [
+                {"created": "2018-04-03T18:37:09.284840891Z", "created_by": "foo"},
+                {"created": "2018-04-12T18:37:09.284840891Z", "created_by": "bar"},
+                {"created": "2018-04-03T18:37:09.284840891Z", "created_by": "baz"},
+            ],
+            "architecture": "amd64",
+            "os": "linux",
+        },
+        "sha256:b5b2b2c507a0944348e0303114d8d93aaaa081732b86451d9bce1f432a537bc7",
+        7023,
+    )
+
+    manifest = OCIManifest(Bytes.for_string_or_unicode(SAMPLE_MANIFEST))
+    assert manifest.is_image_manifest
+
+    layers = list(manifest.get_layers(retriever))
+    assert len(layers) == 3
+    assert layers[0].command is not None
+
+
+INVALID_LAYER_SIZE_MANIFEST = json.dumps(
+    {
+        "schemaVersion": 2,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": 7023,
+            "digest": "sha256:b5b2b2c507a0944348e0303114d8d93aaaa081732b86451d9bce1f432a537bc7",
+        },
+        "layers": [
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "size": 32654,
+                "digest": "sha256:9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0",
+            },
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "size": -1,
+                "digest": "sha256:3c3a4604a545cdc127456d94e421cd355bca5b528f4a9c1905b15da2eb4a4c6b",
+            },
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "size": 73109,
+                "digest": "sha256:ec4b8955958665577945c89419d1af06b5f7636b4ac3da7f12184802ad867736",
+            },
+        ],
+        "annotations": {"com.example.key1": "value1", "com.example.key2": "value2"},
+    }
+).encode("utf-8")
+
+
+def test_invalid_layer_size_manifest():
+    with pytest.raises(MalformedOCIManifest, match="invalid layer size"):
+        OCIManifest(Bytes.for_string_or_unicode(INVALID_LAYER_SIZE_MANIFEST))
+
+
+MANIFEST_WITH_LAYER_SIZE_0 = json.dumps(
+    {
+        "schemaVersion": 2,
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": 7023,
+            "digest": "sha256:b5b2b2c507a0944348e0303114d8d93aaaa081732b86451d9bce1f432a537bc7",
+        },
+        "layers": [
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "size": 32654,
+                "digest": "sha256:9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0",
+            },
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "size": 0,
+                "digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            },
+            {
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "size": 73109,
+                "digest": "sha256:ec4b8955958665577945c89419d1af06b5f7636b4ac3da7f12184802ad867736",
+            },
+        ],
+        "annotations": {"com.example.key1": "value1", "com.example.key2": "value2"},
+    }
+).encode()
+
+
+def test_manifest_with_layer_size_0():
+    digest = "sha256:" + hashlib.sha256(MANIFEST_WITH_LAYER_SIZE_0).hexdigest()
+    manifest = OCIManifest(Bytes.for_string_or_unicode(MANIFEST_WITH_LAYER_SIZE_0))
+    assert manifest.digest == digest
+    assert manifest.blob_digests == [
+        "sha256:9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0",
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "sha256:ec4b8955958665577945c89419d1af06b5f7636b4ac3da7f12184802ad867736",
+        "sha256:b5b2b2c507a0944348e0303114d8d93aaaa081732b86451d9bce1f432a537bc7",
+    ]
+
+
+def test_manifest_layer_annotations():
+    manifest = OCIManifest(Bytes.for_string_or_unicode(SAMPLE_MANIFEST2))
+    assert manifest.annotations == {"com.example.key1": "value1", "com.example.key2": "value2"}
+
+    for layer in manifest.filesystem_layers:
+        assert hasattr(layer, "annotations")
+        if layer.annotations:
+            assert layer.annotations == {
+                "com.example.layerkey1": "value1",
+                "com.example.layerkey2": "value2",
+            }

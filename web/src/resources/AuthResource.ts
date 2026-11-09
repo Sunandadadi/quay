@@ -22,7 +22,7 @@ export async function loginUser(username: string, password: string) {
     username: username,
     password: password,
   });
-  if (response.data == 'success') {
+  if (response.data.success === true) {
     GlobalAuthState.isLoggedIn = true;
     GlobalAuthState.csrfToken = undefined;
   }
@@ -52,4 +52,38 @@ export async function getUser(username: string) {
 export async function getOrganization(orgName: string) {
   const response = await axios.get(`api/v1/organization/${orgName}`);
   return response;
+}
+
+export async function getExternalLoginAuthUrl(
+  serviceId: string,
+  action = 'login',
+) {
+  const response = await axios.post(`/api/v1/externallogin/${serviceId}`, {
+    kind: action,
+  });
+  assertHttpCode(response.status, 200);
+  return response.data;
+}
+
+export async function detachExternalLogin(serviceId: string) {
+  const response = await axios.post(`/api/v1/detachexternal/${serviceId}`);
+  assertHttpCode(response.status, 200);
+  return response.data;
+}
+
+interface VerifyUserRequest {
+  password: string;
+}
+
+interface VerifyUserResponse {
+  success: boolean;
+}
+
+export async function verifyUser(password: string) {
+  const response = await axios.post<VerifyUserResponse>(
+    '/api/v1/signin/verify',
+    {password} as VerifyUserRequest,
+  );
+  assertHttpCode(response.status, 200);
+  return response.data;
 }

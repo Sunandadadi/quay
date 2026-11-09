@@ -4,21 +4,27 @@ on:
     - cron: '30 5 * * *'
   workflow_dispatch:
     inputs: {}
+
+permissions:
+  contents: read
+
 jobs:
   unit:
     if: github.repository == 'quay/quay'
     name: Run all Test
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     env:
-      ZVSI_FP_NAME: quay-floating-ci
-      ZVSI_INSTANCE_NAME: quay-zvsi-ci
-      ZVSI_VPC: r018-b72c601c-c1d9-42cf-af66-c0f6da4ab982
-      ZVSI_ZONE_NAME: eu-gb-3
-      ZVSI_PROFILE_NAME: bz2-4x16
-      ZVSI_SUBNET: 07a7-8ea5eb5d-d432-47fd-a90c-153ebcb6c2cb
-      ZVSI_IMAGE: r018-000c8ed2-fb20-436a-9b3a-8b4f062b50d2
-      ZVSI_KEY: r018-ee997015-b88c-4500-874c-71f2175a8284
-      ZVSI_RG_ID: 2e818eb391df4774977812b50ff0e8c9
+      ZVSI_FP_NAME: ${{ vars.IBMZ_ZVSI_FP_NAME }}
+      ZVSI_INSTANCE_NAME: ${{ vars.IBMZ_ZVSI_INSTANCE_NAME }}
+      ZVSI_VPC: ${{ vars.IBMZ_ZVSI_VPC }}
+      ZVSI_SG: ${{ vars.IBMZ_ZVSI_SG }}
+      ZVSI_SGR_ID: ${{ vars.IBMZ_ZVSI_SGR_ID }}
+      ZVSI_ZONE_NAME: ${{ vars.IBMZ_ZVSI_ZONE_NAME }}
+      ZVSI_PROFILE_NAME: ${{ vars.IBMZ_ZVSI_PROFILE_NAME }}
+      ZVSI_SUBNET: ${{ vars.IBMZ_ZVSI_SUBNET }}
+      ZVSI_IMAGE: ${{ vars.IBMZ_ZVSI_IMAGE }}
+      ZVSI_KEY: ${{ vars.IBMZ_ZVSI_KEY }}
+      ZVSI_RG_ID: ${{ vars.IBMZ_ZVSI_RG_ID }}
     strategy:
       fail-fast: false
       matrix:
@@ -35,6 +41,9 @@ jobs:
       if: ${{ matrix.platform  == 's390x' }}
       id: ZVSI
       run: |
+        #update the security-group to allow this machine for inbound activity
+        gh_pubilc_ip=$(curl -s https://api.ipify.org)
+        ibmcloud is security-group-rule-update $ZVSI_SG $ZVSI_SGR_ID --vpc $ZVSI_VPC --remote=$gh_pubilc_ip
         #creation of zvsi
         ibmcloud is instance-create $ZVSI_INSTANCE_NAME $ZVSI_VPC $ZVSI_ZONE_NAME $ZVSI_PROFILE_NAME $ZVSI_SUBNET --image $ZVSI_IMAGE --keys $ZVSI_KEY --resource-group-id $ZVSI_RG_ID
         #Bouding the Floating ip to the ZVSI
@@ -69,27 +78,28 @@ jobs:
         -w /
         -e GH_REPOSITORY
         -e GH_REF
-        ubuntu:20.04
+        ubuntu:24.04
         /bin/bash -ec '
         export DEBIAN_FRONTEND=noninteractive;
         apt-get -y update;
-        apt-get -y install libgpgme-dev libldap2-dev libsasl2-dev swig python3.9-dev python3-pip findutils git;
+        apt-get -y install libgpgme-dev libldap2-dev libsasl2-dev swig python3.12-dev python3-pip python3-venv findutils git;
         apt-get -y install libffi-dev libssl-dev libjpeg-dev libpq-dev libxml2-dev libxslt-dev;
         apt-get -y install rustc cargo pkg-config;
         git clone ${GH_REPOSITORY} build;
         cd build && git checkout ${GH_REF};
-        cat requirements-dev.txt | grep tox | xargs pip install;
+        python3 -m venv /opt/venv;
+        cat requirements-dev.txt | grep tox | xargs /opt/venv/bin/pip install;
 
-        tox -e py39-unit;
-        tox -e py39-e2e;
-        tox -e py39-registry;'
+        /opt/venv/bin/tox -e py312-unit;
+        /opt/venv/bin/tox -e py312-e2e;
+        /opt/venv/bin/tox -e py312-registry;'
       env:
         GH_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
         GH_REF: ${{ github.ref }}
 
     - name: Install dependencies and run all tests on ${{ matrix.platform }}
       if: matrix.platform  != 'amd64'
-      uses: appleboy/ssh-action@v0.1.10
+      uses: appleboy/ssh-action@334f9259f2f8eb3376d33fa4c684fff373f2c2a6 # v0.1.10
       env:
         GH_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
         GH_REF: ${{ github.ref }}
@@ -102,27 +112,28 @@ jobs:
         command_timeout: 100m
         script: |
           apt-get update -y
-          apt-get -y install build-essential libgpgme-dev libldap2-dev libsasl2-dev swig python3.9-dev python3-pip findutils git
+          apt-get -y install build-essential libgpgme-dev libldap2-dev libsasl2-dev swig python3.12-dev python3-pip python3-venv findutils git
           apt-get -y install libffi-dev libssl-dev libjpeg-dev libpq-dev libxml2-dev libxslt-dev
           apt-get -y install rustc cargo pkg-config
           rm -rf build
           git clone ${GH_REPOSITORY} build
           cd build && git checkout ${GH_REF}
-          cat requirements-dev.txt | grep tox | xargs python3 -m pip -qq install
+          python3 -m venv /opt/venv
+          cat requirements-dev.txt | grep tox | xargs /opt/venv/bin/pip -qq install
 
           if [[ 's390x' == $(uname -m) ]]; then
             GRPC_LATEST=$(grep "grpcio" requirements.txt |cut -d "=" -f 3)
-            export GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1 && python3 -m pip install -qq grpcio==${GRPC_LATEST}
+            export GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1 && /opt/venv/bin/pip install -qq grpcio==${GRPC_LATEST}
           fi
 
           #Unit
-          tox -e py39-unit
+          /opt/venv/bin/tox -e py312-unit
 
           #e2e
-          tox -e py39-e2e
+          /opt/venv/bin/tox -e py312-e2e
 
           #registry
-          tox -e py39-registry
+          /opt/venv/bin/tox -e py312-registry
 
     - name: Cleanup ZVSI
       if: ${{ steps.ZVSI.conclusion == 'success' && always() }}

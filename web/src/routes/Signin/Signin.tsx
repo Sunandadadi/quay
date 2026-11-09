@@ -1,20 +1,34 @@
-import React, {useState} from 'react';
+import React, {useState, useEffect} from 'react';
 import {
   Alert,
   AlertActionCloseButton,
+  Button,
+  Form,
+  FormGroup,
   LoginForm,
-  LoginPage,
+  Spinner,
+  TextInput,
+  ValidatedOptions,
 } from '@patternfly/react-core';
-import logo from 'src/assets/quay.svg';
 import {GlobalAuthState, loginUser} from 'src/resources/AuthResource';
-import {useNavigate} from 'react-router-dom';
+import {useNavigate, Link, useSearchParams} from 'react-router-dom';
 import {useRecoilState} from 'recoil';
 import {AuthState} from 'src/atoms/AuthState';
-import axios, {getCsrfToken} from 'src/libs/axios';
-import {useQuayConfig} from 'src/hooks/UseQuayConfig';
+import {getCsrfToken} from 'src/libs/axios';
+import {useQuayConfigWithLoading} from 'src/hooks/UseQuayConfig';
 import {AxiosError} from 'axios';
 import './Signin.css';
 import {addDisplayError} from 'src/resources/ErrorHandling';
+import {usePasswordRecovery} from 'src/hooks/UsePasswordRecovery';
+import {useQuayState} from 'src/hooks/UseQuayState';
+import {useExternalLogins} from 'src/hooks/UseExternalLogins';
+import {useExternalLoginAuth} from 'src/hooks/UseExternalLoginAuth';
+import {ExternalLoginButton} from 'src/components/ExternalLoginButton';
+import {LoginPageLayout} from 'src/components/LoginPageLayout';
+import {useQueryClient} from '@tanstack/react-query';
+import {fetchUser} from 'src/resources/UserResource';
+
+type ViewType = 'signin' | 'forgotPassword';
 
 export function Signin() {
   const [username, setUsername] = useState('');
@@ -23,13 +37,141 @@ export function Signin() {
   const [err, setErr] = useState<string>();
   const [, setAuthState] = useRecoilState(AuthState);
 
-  const navigate = useNavigate();
-  const quayConfig = useQuayConfig();
+  const [currentView, setCurrentView] = useState<ViewType>('signin');
+  const [recoveryEmail, setRecoveryEmail] = useState('');
+  const [externalLoginError, setExternalLoginError] = useState<string | null>(
+    null,
+  );
 
-  let logoUrl = logo;
-  if (quayConfig && quayConfig.config?.ENTERPRISE_DARK_LOGO_URL) {
-    logoUrl = `${axios.defaults.baseURL}${quayConfig.config.ENTERPRISE_DARK_LOGO_URL}`;
+  const {inReadOnlyMode, inAccountRecoveryMode} = useQuayState();
+
+  const navigate = useNavigate();
+  const {config: quayConfig, isLoading: configLoading} =
+    useQuayConfigWithLoading();
+  const [searchParams] = useSearchParams();
+  const queryClient = useQueryClient();
+  const {
+    requestRecovery,
+    isLoading: sendingRecovery,
+    error: recoveryError,
+    result: recoverySent,
+    setError: setRecoveryError,
+  } = usePasswordRecovery();
+
+  const {
+    externalLogins,
+    hasExternalLogins,
+    shouldShowDirectLogin,
+    shouldAutoRedirectSSO,
+  } = useExternalLogins();
+
+  const {
+    startExternalLogin,
+    isAuthenticating: isExternalAuth,
+    error: hookError,
+  } = useExternalLoginAuth();
+
+  useEffect(() => {
+    if (shouldAutoRedirectSSO() && externalLogins.length > 0) {
+      const singleProvider = externalLogins[0];
+      const redirectUrl = searchParams.get('redirect_url') || undefined;
+      startExternalLogin(singleProvider, redirectUrl);
+    }
+  }, [shouldAutoRedirectSSO, externalLogins, startExternalLogin, searchParams]);
+
+  // Check for external login errors in URL parameters
+  useEffect(() => {
+    const errorParam = searchParams.get('error');
+    const errorDescription = searchParams.get('error_description');
+
+    if (errorParam) {
+      if (errorDescription) {
+        setExternalLoginError(errorDescription);
+      } else if (errorParam === 'access_denied') {
+        setExternalLoginError('Login was cancelled or access denied');
+      } else {
+        setExternalLoginError(`External login failed: ${errorParam}`);
+      }
+
+      // Clear error parameters from URL
+      const newParams = new URLSearchParams(searchParams);
+      newParams.delete('error');
+      newParams.delete('error_description');
+      const newUrl = `${window.location.pathname}${
+        newParams.toString() ? '?' + newParams.toString() : ''
+      }`;
+      window.history.replaceState({}, '', newUrl);
+    }
+  }, [searchParams]);
+
+  // Capture hook errors
+  useEffect(() => {
+    if (hookError) {
+      setExternalLoginError(hookError);
+    }
+  }, [hookError]);
+
+  // Show loading spinner until config is loaded to prevent flash of unconfigured content
+  if (configLoading) {
+    return (
+      <LoginPageLayout title="" description="">
+        <div style={{textAlign: 'center', padding: '40px'}}>
+          <Spinner size="xl" />
+        </div>
+      </LoginPageLayout>
+    );
   }
+
+  const showForgotPassword = () => {
+    if (!quayConfig) return false;
+    return (
+      quayConfig.features?.MAILING === true &&
+      quayConfig.config?.AUTHENTICATION_TYPE === 'Database' &&
+      shouldShowDirectLogin()
+    );
+  };
+
+  const showCreateAccount = () => {
+    if (!quayConfig) return false;
+    return (
+      !inReadOnlyMode &&
+      quayConfig.features?.USER_CREATION === true &&
+      quayConfig.config?.AUTHENTICATION_TYPE === 'Database' &&
+      shouldShowDirectLogin() &&
+      !quayConfig.features?.INVITE_ONLY_USER_CREATION &&
+      !inAccountRecoveryMode
+    );
+  };
+
+  const showInvitationMessage = () => {
+    if (!quayConfig) return false;
+    return (
+      quayConfig.features?.USER_CREATION === true &&
+      quayConfig.config?.AUTHENTICATION_TYPE === 'Database' &&
+      quayConfig.features?.DIRECT_LOGIN === true &&
+      quayConfig.features?.INVITE_ONLY_USER_CREATION === true
+    );
+  };
+
+  const handleSendRecovery = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!recoveryEmail) return;
+
+    try {
+      await requestRecovery(recoveryEmail);
+    } catch (error) {
+      // Error is handled by the hook
+    }
+  };
+
+  const handleViewChange = (view: ViewType) => {
+    setCurrentView(view);
+    if (view === 'signin') {
+      setRecoveryError(null);
+    } else {
+      setErr(undefined);
+    }
+  };
 
   const onLoginButtonClick = async (
     e: React.MouseEvent<HTMLButtonElement, MouseEvent>,
@@ -37,11 +179,39 @@ export function Signin() {
     e.preventDefault();
     try {
       const response = await loginUser(username, password);
-      if (response.success) {
+      if (response.success === true) {
         setAuthState((old) => ({...old, isSignedIn: true, username: username}));
         await getCsrfToken();
         GlobalAuthState.isLoggedIn = true;
-        navigate('/organization');
+
+        // Fetch fresh user data to check for prompts
+        let user;
+        try {
+          user = await queryClient.fetchQuery(['user'], fetchUser);
+        } catch (fetchErr) {
+          // If fetching user fails, show error and stop navigation
+          setErr(
+            addDisplayError(
+              'Login successful but failed to load user data. Please refresh the page.',
+              fetchErr,
+            ),
+          );
+          return;
+        }
+
+        // If user has prompts (e.g., confirm_username), redirect to updateuser
+        if (user.prompts && user.prompts.length > 0) {
+          navigate('/updateuser');
+          return;
+        }
+
+        // Otherwise, redirect to the intended destination
+        const redirectUrl = searchParams.get('redirect_url');
+        if (redirectUrl) {
+          window.location.href = redirectUrl;
+        } else {
+          navigate('/organization');
+        }
       } else {
         setErr('Invalid login credentials');
       }
@@ -50,8 +220,10 @@ export function Signin() {
         err instanceof AxiosError &&
         err.response &&
         err.response.status === 403;
-      if (authErr && err.response.data.invalidCredentials) {
-        setErr('Invalid login credentials');
+      if (authErr && err.response.data.needsEmailVerification) {
+        setErr('You must verify your email address before you can sign in');
+      } else if (authErr && err.response.data.invalidCredentials) {
+        setErr(err.response.data.message || 'Invalid login credentials');
       } else if (authErr) {
         setErr('CSRF token expired - please refresh');
       } else {
@@ -63,6 +235,7 @@ export function Signin() {
   const errMessage = (
     <Alert
       id="form-error-alert"
+      data-testid="signin-error-alert"
       isInline
       actionClose={<AlertActionCloseButton onClose={() => setErr(null)} />}
       variant="danger"
@@ -70,35 +243,253 @@ export function Signin() {
     />
   );
 
+  const loginButtonLabel = quayConfig?.config?.REGISTRY_TITLE
+    ? `Sign in to ${quayConfig.config.REGISTRY_TITLE}`
+    : 'Sign in';
+
+  const recoveryForm = (
+    <Form onSubmit={handleSendRecovery} className="forgot-password-form">
+      {!sendingRecovery && !recoverySent && (
+        <h4>Please enter the e-mail address for your account to recover it</h4>
+      )}
+
+      {sendingRecovery && (
+        <div style={{textAlign: 'center', margin: '20px 0'}}>
+          <Spinner size="lg" />
+        </div>
+      )}
+
+      {!sendingRecovery && (
+        <>
+          {recoverySent?.status === 'sent' && (
+            <Alert
+              variant="success"
+              isInline
+              title=""
+              style={{marginBottom: '20px'}}
+            >
+              Recovery instructions have been sent to {recoveryEmail} for any
+              accounts associated to the email.
+            </Alert>
+          )}
+
+          {recoverySent?.status === 'org' && (
+            <Alert
+              variant="info"
+              isInline
+              title=""
+              style={{marginBottom: '20px'}}
+            >
+              The e-mail address <code>{recoverySent.orgemail}</code> is
+              assigned to organization <code>{recoverySent.orgname}</code>. To
+              access that organization, an admin user must be used.
+              <br />
+              <br />
+              An e-mail has been sent to <code>
+                {recoverySent.orgemail}
+              </code>{' '}
+              with the full list of admin users.
+            </Alert>
+          )}
+
+          {recoveryError && (
+            <Alert
+              variant="danger"
+              isInline
+              actionClose={
+                <AlertActionCloseButton
+                  onClose={() => setRecoveryError(null)}
+                />
+              }
+              title={recoveryError}
+              style={{marginBottom: '20px'}}
+            />
+          )}
+
+          {!recoverySent && (
+            <>
+              <FormGroup label="" fieldId="recovery-email">
+                <TextInput
+                  isRequired
+                  type="email"
+                  id="recovery-email"
+                  data-testid="signin-recovery-email"
+                  name="recovery-email"
+                  value={recoveryEmail}
+                  onChange={(_event, v) => setRecoveryEmail(v)}
+                  placeholder="Email"
+                  validated={
+                    recoveryEmail &&
+                    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recoveryEmail)
+                      ? ValidatedOptions.error
+                      : ValidatedOptions.default
+                  }
+                />
+              </FormGroup>
+
+              <Button
+                variant="primary"
+                type="submit"
+                isBlock
+                data-testid="signin-send-recovery"
+                isDisabled={
+                  !recoveryEmail ||
+                  !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recoveryEmail) ||
+                  sendingRecovery
+                }
+                style={{marginTop: '20px'}}
+              >
+                Send Recovery Email
+              </Button>
+            </>
+          )}
+        </>
+      )}
+
+      <div style={{textAlign: 'center', marginTop: '16px'}}>
+        <button
+          type="button"
+          className="signin-link-button"
+          data-testid="signin-back-to-login"
+          onClick={() => handleViewChange('signin')}
+        >
+          Back to Sign In
+        </button>
+      </div>
+    </Form>
+  );
+
   const loginForm = (
-    <LoginForm
-      showHelperText={err != null}
-      helperText={errMessage}
-      usernameLabel="Username"
-      usernameValue={username}
-      onChangeUsername={(_event, v) => setUsername(v)}
-      isValidUsername={true}
-      passwordLabel="Password"
-      passwordValue={password}
-      onChangePassword={(_event, v) => setPassword(v)}
-      isValidPassword={true}
-      isRememberMeChecked={rememberMe}
-      onChangeRememberMe={(_event, v) => setRememberMe(v)}
-      onLoginButtonClick={(e) => onLoginButtonClick(e)}
-      loginButtonLabel="Log in"
-    />
+    <>
+      {/* External login error display */}
+      {externalLoginError && (
+        <Alert
+          id="external-login-error-alert"
+          data-testid="external-login-error"
+          isInline
+          actionClose={
+            <AlertActionCloseButton
+              onClose={() => setExternalLoginError(null)}
+            />
+          }
+          variant="danger"
+          title="External login failed"
+          style={{marginBottom: '16px'}}
+        >
+          {externalLoginError}
+        </Alert>
+      )}
+
+      {hasExternalLogins() && (
+        <div className="external-login-section">
+          {externalLogins.map((provider) => (
+            <ExternalLoginButton
+              key={provider.id}
+              provider={provider}
+              redirectUrl={searchParams.get('redirect_url') || undefined}
+              disabled={isExternalAuth}
+              onClearErrors={() => setExternalLoginError(null)}
+            />
+          ))}
+
+          {shouldShowDirectLogin() && (
+            <div className="login-divider">
+              <span>or</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {shouldShowDirectLogin() && (
+        <>
+          <LoginForm
+            showHelperText={err != null}
+            helperText={errMessage}
+            usernameLabel="Username"
+            usernameValue={username}
+            onChangeUsername={(_event, v) => setUsername(v)}
+            isValidUsername={true}
+            passwordLabel="Password"
+            passwordValue={password}
+            onChangePassword={(_event, v) => setPassword(v)}
+            isValidPassword={true}
+            isRememberMeChecked={rememberMe}
+            onChangeRememberMe={(_event, v) => setRememberMe(v)}
+            onLoginButtonClick={(e) => onLoginButtonClick(e)}
+            loginButtonLabel={loginButtonLabel}
+          />
+
+          <div className="signin-form-links">
+            {showCreateAccount() && (
+              <>
+                Don&apos;t have an account?{' '}
+                <Link
+                  to="/createaccount"
+                  data-testid="signin-create-account-link"
+                  style={{
+                    color: 'var(--pf-t--global--text--color--link--default)',
+                  }}
+                >
+                  Create account
+                </Link>
+                <br />
+              </>
+            )}
+
+            {showInvitationMessage() && (
+              <>
+                <span data-testid="signin-invitation-message">
+                  Invitation required to sign up
+                </span>
+                <br />
+              </>
+            )}
+
+            {showForgotPassword() && currentView !== 'forgotPassword' && (
+              <button
+                type="button"
+                className="signin-link-button"
+                data-testid="signin-forgot-password-link"
+                onClick={() => handleViewChange('forgotPassword')}
+              >
+                Forgot Password?
+              </button>
+            )}
+
+            {currentView === 'forgotPassword' && (
+              <button
+                type="button"
+                className="signin-link-button"
+                onClick={() => handleViewChange('signin')}
+              >
+                Back to Sign In
+              </button>
+            )}
+          </div>
+        </>
+      )}
+
+      {!shouldShowDirectLogin() && !hasExternalLogins() && (
+        <Alert
+          variant="info"
+          isInline
+          title="Direct login is disabled"
+          data-testid="no-login-options-alert"
+        >
+          Please contact your administrator for login instructions.
+        </Alert>
+      )}
+    </>
   );
 
   return (
-    <LoginPage
-      className={'pdf-u-background-color-100 pf-v5-u-text-align-left'}
-      brandImgSrc={logoUrl}
-      brandImgAlt="Red Hat Quay"
-      backgroundImgSrc="assets/images/rh_login.jpeg"
-      textContent="Quay builds, analyzes and distributes your container images. Store your containers with added security. Easily build and deploy new containers. Scan containers to provide security."
-      loginTitle="Log in to your account"
+    <LoginPageLayout
+      title={
+        currentView === 'signin' ? 'Log in to your account' : 'Reset Password'
+      }
+      description="Build, analyze and distribute your container images. Store your containers with added security. Easily build and deploy new containers. Scan containers to provide security."
     >
-      {loginForm}
-    </LoginPage>
+      {currentView === 'signin' ? loginForm : recoveryForm}
+    </LoginPageLayout>
   );
 }

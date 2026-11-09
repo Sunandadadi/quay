@@ -1,10 +1,12 @@
 import datetime
 import logging
+import re
 import uuid
 from calendar import timegm
 
 from peewee import fn
 
+import features
 from data.database import (
     Manifest,
     ManifestChild,
@@ -13,13 +15,22 @@ from data.database import (
     Repository,
     RepositoryState,
     Tag,
+    TagPullStatistics,
     User,
+    compute_advisory_lock_id,
+    db_advisory_xact_lock,
     db_random_func,
     db_regex_search,
     db_transaction,
     get_epoch_timestamp_ms,
 )
-from data.model import config, user
+from data.model import (
+    DataModelException,
+    ImmutableTagException,
+    config,
+    immutability,
+    user,
+)
 from data.model.notification import delete_tag_notifications_for_tag
 from image.docker.schema1 import (
     DOCKER_SCHEMA1_CONTENT_TYPES,
@@ -32,6 +43,51 @@ from util.timedeltastring import convert_to_timedelta
 logger = logging.getLogger(__name__)
 
 GC_CANDIDATE_COUNT = 500  # repositories
+
+COSIGN_TAG_SCHEMA_PATTERN = r"^sha256-[a-f0-9]{64}\.(sig|att|sbom)$"
+COSIGN_TAG_SCHEMA_RE = re.compile(COSIGN_TAG_SCHEMA_PATTERN)
+COSIGN_TAG_SCHEMA_PREFIX = "sha256-"
+COSIGN_TAG_SCHEMA_DIGEST_LEN = 64
+COSIGN_TAG_SCHEMA_SUFFIXES = ("sig", "att", "sbom")
+
+
+def is_cosign_tag_schema(tag_name):
+    return bool(COSIGN_TAG_SCHEMA_RE.fullmatch(tag_name))
+
+
+def _lowercase_hex_digest_clause(digest_expr):
+    """True when digest_expr is exactly lowercase hexadecimal (empty after stripping hex digits)."""
+    stripped = digest_expr
+    for ch in "0123456789abcdef":
+        stripped = fn.REPLACE(stripped, ch, "")
+    return stripped == ""
+
+
+def _not_cosign_tag_schema_clause(model=Tag):
+    """
+    SQL clause matching is_cosign_tag_schema without REGEXP (SQLite-safe).
+
+    Requires sha256- prefix, exactly 64 lowercase hex digest chars, and a supported suffix.
+    Uses SUBSTR equality so prefix/suffix checks are case-sensitive (unlike LIKE).
+    Accepts a Tag model or alias so the clause can be used in subqueries.
+    """
+    prefix = COSIGN_TAG_SCHEMA_PREFIX
+    digest_len = COSIGN_TAG_SCHEMA_DIGEST_LEN
+    digest_expr = fn.SUBSTR(model.name, len(prefix) + 1, digest_len)
+    hex_digest = _lowercase_hex_digest_clause(digest_expr)
+    prefix_match = fn.SUBSTR(model.name, 1, len(prefix)) == prefix
+    suffix_clauses = []
+    for suffix in COSIGN_TAG_SCHEMA_SUFFIXES:
+        expected_len = len(prefix) + digest_len + 1 + len(suffix)
+        suffix_start = len(prefix) + digest_len + 1
+        suffix_clauses.append(
+            (fn.LENGTH(model.name) == expected_len)
+            & (fn.SUBSTR(model.name, suffix_start, 1 + len(suffix)) == f".{suffix}")
+        )
+    suffix_match = suffix_clauses[0]
+    for clause in suffix_clauses[1:]:
+        suffix_match = suffix_match | clause
+    return ~(prefix_match & hex_digest & suffix_match)
 
 
 class RetargetTagException(Exception):
@@ -194,6 +250,7 @@ def list_repository_tag_history(
             Manifest.media_type,
             Manifest.layers_compressed_size,
             Manifest.config_media_type,
+            can_use_read_replica=True,
         )
         .join(Manifest)
         .where(Tag.repository == repository_id)
@@ -406,6 +463,7 @@ def retarget_tag(
     now_ms=None,
     raise_on_error=False,
     expiration_seconds=None,
+    immutable_from_label=False,
 ):
     """
     Creates or updates a tag with the specified name to point to the given manifest under its
@@ -451,28 +509,195 @@ def retarget_tag(
     now_ms = now_ms or get_epoch_timestamp_ms()
 
     with db_transaction():
-        # Lookup an existing tag in the repository with the same name and, if present, mark it
-        # as expired.
+        # Acquire an advisory lock keyed on the repository ID to serialize
+        # tag mutations for this repo. Unlike SELECT FOR UPDATE on the
+        # Repository row, advisory locks don't block unrelated reads and
+        # avoid lock-queue pileups under heavy push traffic.
+        lock_id = compute_advisory_lock_id("retarget_tag", manifest.repository_id)
+        db_advisory_xact_lock(lock_id)
+
+        try:
+            repo = (
+                Repository.select(Repository.namespace_user)
+                .where(Repository.id == manifest.repository_id)
+                .get()
+            )
+        except Repository.DoesNotExist:
+            if raise_on_error:
+                raise RetargetTagException("Repository no longer exists")
+            return None
+
         existing_tag = get_tag(manifest.repository_id, tag_name)
         if existing_tag is not None:
-            _, okay = set_tag_end_ms(existing_tag, now_ms)
-
-            # TODO: should we retry here and/or use a for-update?
-            if not okay:
+            if features.IMMUTABLE_TAGS and existing_tag.immutable:
+                if raise_on_error:
+                    raise ImmutableTagException(tag_name, "overwrite", manifest.repository_id)
                 return None
 
-        # Create a new tag pointing to the manifest with a lifetime start of now.
+            delete_tag_notifications_for_tag(existing_tag)
+            displaced_manifest = existing_tag.manifest
+            Tag.update(lifetime_end_ms=now_ms).where(Tag.id == existing_tag.id).execute()
+
+            # Cascade Cosign cleanup for the displaced subject digest. Autoprune
+            # excludes Cosign-schema names, so orphans left by retarget would
+            # otherwise persist forever.
+            if (
+                displaced_manifest is not None
+                and not is_cosign_tag_schema(existing_tag.name)
+                and displaced_manifest.id != manifest.id
+            ):
+                _expire_cosign_sibling_tags(
+                    existing_tag.repository,
+                    displaced_manifest.digest,
+                    now_ms,
+                    subject_manifest=displaced_manifest,
+                    exclude_tag_id=existing_tag.id,
+                )
+
+        # Check if tag should be immutable based on manifest label or policies
+        immutable = False
+        immutable_from_policy = False
+        if features.IMMUTABLE_TAGS:
+            immutable_from_policy = immutability.evaluate_immutability_policies(
+                manifest.repository_id, repo.namespace_user_id, tag_name
+            )
+            immutable = immutable_from_label or immutable_from_policy
+
+        # Compute lifetime_end_ms, clearing it for immutable tags when config disallows
+        lifetime_end_ms = (now_ms + expiration_seconds * 1000) if expiration_seconds else None
+        if (
+            immutable
+            and lifetime_end_ms is not None
+            and not config.app_config.get("FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE", False)
+        ):
+            lifetime_end_ms = None
+
         created = Tag.create(
             name=tag_name,
             repository=manifest.repository_id,
             lifetime_start_ms=now_ms,
-            lifetime_end_ms=(now_ms + expiration_seconds * 1000) if expiration_seconds else None,
+            lifetime_end_ms=lifetime_end_ms,
             reversion=is_reversion,
             manifest=manifest,
             tag_kind=Tag.tag_kind.get_id("tag"),
+            immutable=immutable,
         )
 
-        return created
+        # Capture values for logging and tracking outside the transaction
+        namespace_name = repo.namespace_user.username
+        repo_name = repo.name
+
+    # Mark repo as modified (best-effort, outside transaction)
+    try:
+        from app import model_cache
+
+        tracker = getattr(model_cache, "repo_modification_tracker", None)
+        if tracker:
+            tracker.mark_repo_modified(namespace_name, repo_name)
+    except Exception as e:
+        logger.warning("Failed to mark repo modified for %s/%s: %s", namespace_name, repo_name, e)
+
+    # Best-effort audit log outside the transaction so a logging failure
+    # does not roll back the tag creation.
+    if immutable_from_policy:
+        try:
+            from data.logs_model import logs_model
+
+            logs_model.log_action(
+                "tag_made_immutable_by_policy",
+                namespace_name=namespace_name,
+                repository_name=repo_name,
+                metadata={
+                    "tag": tag_name,
+                    "repo": repo_name,
+                    "namespace": namespace_name,
+                    "immutable": True,
+                },
+            )
+        except Exception:
+            logger.exception("Failed to log tag_made_immutable_by_policy for tag %s", tag_name)
+
+    return created
+
+
+def _expire_cosign_sibling_tags(
+    repository_id, manifest_digest, now_ms, *, subject_manifest=None, exclude_tag_id=None
+):
+    """
+    Expire alive, mutable Cosign tag-schema siblings for the given subject digest.
+
+    When subject_manifest is provided, matching rows are only expired if no other
+    visible, non-Cosign alive tag still references that manifest (excluding
+    exclude_tag_id when set). Returns the number of Cosign tags expired.
+
+    Must use the same ("retarget_tag", repository_id) advisory lock as retarget_tag
+    so the NOT EXISTS check cannot race with a concurrent push that creates a new
+    alive alias on this manifest. Re-acquiring from inside retarget_tag is safe
+    (pg_advisory_xact_lock is re-entrant within a transaction).
+
+    Each matching row gets a distinct lifetime_end_ms (<= now_ms), skipping any
+    end already used by a historical same-named Cosign row, to avoid IntegrityError
+    on Tag's unique (repository, name, lifetime_end_ms) index.
+    """
+    # Serialize with retarget_tag: same namespace+key closes the check-then-act race.
+    # Call sites may pass a Repository row or a raw id; lock key must be the integer id.
+    repo_id = getattr(repository_id, "id", repository_id)
+    lock_id = compute_advisory_lock_id("retarget_tag", repo_id)
+    db_advisory_xact_lock(lock_id)
+    cosign_tag_prefix = manifest_digest.replace(":", "-")
+    cosign_names = [f"{cosign_tag_prefix}.{suffix}" for suffix in COSIGN_TAG_SCHEMA_SUFFIXES]
+    conditions = [
+        Tag.repository == repo_id,
+        Tag.name.in_(cosign_names),
+        Tag.immutable == False,
+        (Tag.lifetime_end_ms >> None) | (Tag.lifetime_end_ms > now_ms),
+    ]
+    if subject_manifest is not None:
+        OtherTag = Tag.alias()
+        other_alive = OtherTag.select(1).where(
+            OtherTag.repository == repo_id,
+            OtherTag.manifest == subject_manifest,
+            OtherTag.hidden == False,
+            _not_cosign_tag_schema_clause(OtherTag),
+            (OtherTag.lifetime_end_ms >> None) | (OtherTag.lifetime_end_ms > now_ms),
+        )
+        if exclude_tag_id is not None:
+            other_alive = other_alive.where(OtherTag.id != exclude_tag_id)
+        conditions.append(~fn.EXISTS(other_alive))
+
+    # Per-row distinct ends: same pattern as remove_tag_from_timemachine for the
+    # unique (repository, name, lifetime_end_ms) index. Skip end values already
+    # used by a historical same-named row (e.g. prior generation expired at now_ms).
+    # Candidates stay <= now_ms so tags remain expired relative to alive filters.
+    matching_tags = list(Tag.select(Tag.id, Tag.name).where(*conditions))
+    updated = 0
+    increment = 0
+    for tag in matching_tags:
+        while True:
+            candidate_end = now_ms - increment
+            occupied = (
+                Tag.select(Tag.id)
+                .where(
+                    Tag.repository == repo_id,
+                    Tag.name == tag.name,
+                    Tag.lifetime_end_ms == candidate_end,
+                    Tag.id != tag.id,
+                )
+                .exists()
+            )
+            if not occupied:
+                break
+            increment += 1
+        updated += Tag.update(lifetime_end_ms=candidate_end).where(Tag.id == tag.id).execute()
+        increment += 1
+    if updated > 0:
+        logger.info(
+            "Expired %s Cosign sibling tag(s) for digest %s in repository %s",
+            updated,
+            manifest_digest,
+            repo_id,
+        )
+    return updated
 
 
 def delete_tag(repository_id, tag_name):
@@ -480,19 +705,27 @@ def delete_tag(repository_id, tag_name):
     Deletes the alive tag with the given name in the specified repository and returns the deleted
     tag.
     If the tag did not exist, returns None.
+    Raises ImmutableTagException if the tag is immutable.
     """
     tag = get_tag(repository_id, tag_name)
     if tag is None:
         return None
 
+    if features.IMMUTABLE_TAGS and tag.immutable:
+        raise ImmutableTagException(tag_name, "delete", repository_id)
+
     return _delete_tag(tag, get_epoch_timestamp_ms())
 
 
-def _delete_tag(tag, now_ms):
-    """
-    Deletes the given tag by marking it as expired.
-    """
+def _delete_tag(tag, now_ms, expire_cosign=True):
     with db_transaction():
+        # Clear pull statistics so re-pushed tags start fresh
+        if features.IMAGE_PULL_STATS:
+            TagPullStatistics.delete().where(
+                TagPullStatistics.repository == tag.repository,
+                TagPullStatistics.tag_name == tag.name,
+            ).execute()
+
         # clean notifications for tag expiry
         delete_tag_notifications_for_tag(tag)
 
@@ -504,6 +737,16 @@ def _delete_tag(tag, now_ms):
         if updated != 1:
             return None
 
+        # clean up cosign tags derived from the deleted image digest
+        if expire_cosign and not is_cosign_tag_schema(tag.name) and tag.manifest is not None:
+            _expire_cosign_sibling_tags(
+                tag.repository,
+                tag.manifest.digest,
+                now_ms,
+                subject_manifest=tag.manifest,
+                exclude_tag_id=tag.id,
+            )
+
         reset_child_manifest_expiration(tag.repository, tag.manifest)
         return tag
 
@@ -513,16 +756,43 @@ def delete_tags_for_manifest(manifest):
     Deletes all tags pointing to the given manifest.
 
     Returns the list of tags deleted.
+    Raises ImmutableTagException if any tag is immutable.
     """
-    query = Tag.select().where(Tag.manifest == manifest)
-    query = filter_to_alive_tags(query)
-
-    tags = list(query)
     now_ms = get_epoch_timestamp_ms()
 
     with db_transaction():
+        # Read alive tags inside the transaction so a tag retargeted/created onto
+        # this manifest between an earlier read and Cosign expiry cannot be missed.
+        query = filter_to_alive_tags(Tag.select().where(Tag.manifest == manifest))
+        tags = list(query)
+
+        if features.IMMUTABLE_TAGS:
+            for tag in tags:
+                if tag.immutable:
+                    raise ImmutableTagException(tag.name, "delete", tag.repository_id)
+
         for tag in tags:
-            _delete_tag(tag, now_ms)
+            _delete_tag(tag, now_ms, expire_cosign=False)
+
+        # Expire Cosign siblings once after all aliases on this subject are removed.
+        # `manifest` may be a Manifest row or a raw manifest id (registry_model passes _db_id).
+        # Pass subject_manifest so the NOT EXISTS guard applies if any alive
+        # non-Cosign alias remains (e.g. concurrent create visible mid-transaction).
+        subject_tag = next(
+            (
+                tag
+                for tag in tags
+                if not is_cosign_tag_schema(tag.name) and tag.manifest is not None
+            ),
+            None,
+        )
+        if subject_tag is not None:
+            _expire_cosign_sibling_tags(
+                subject_tag.repository,
+                subject_tag.manifest.digest,
+                now_ms,
+                subject_manifest=subject_tag.manifest,
+            )
 
     return tags
 
@@ -579,17 +849,53 @@ def set_tag_expiration_for_manifest(manifest_id, expiration_datetime):
     return tags
 
 
+def set_tags_immutability_for_manifest(manifest_id, immutable):
+    """
+    Sets immutability on all alive tags pointing to the manifest.
+
+    Returns the count of updated tags.
+    """
+    now_ms = get_epoch_timestamp_ms()
+    update_fields = {Tag.immutable: immutable}
+
+    # Clear expiration when making immutable and config disallows coexistence
+    if immutable and not config.app_config.get("FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE", False):
+        update_fields[Tag.lifetime_end_ms] = None
+
+    return (
+        Tag.update(update_fields)
+        .where(
+            Tag.manifest == manifest_id,
+            Tag.hidden == False,  # noqa: E712
+            (Tag.lifetime_end_ms >> None) | (Tag.lifetime_end_ms > now_ms),
+        )
+        .execute()
+    )
+
+
 def change_tag_expiration(tag_id, expiration_datetime):
     """
     Changes the expiration of the specified tag to the given expiration datetime.
 
     If the expiration datetime is None, then the tag is marked as not expiring. Returns a tuple of
     the previous expiration timestamp in seconds (if any), and whether the operation succeeded.
+
+    Raises ImmutableTagException if trying to set expiration on an immutable tag when
+    FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE is False.
     """
     try:
         tag = Tag.get(id=tag_id)
     except Tag.DoesNotExist:
         return (None, False)
+
+    # Block setting expiration on immutable tags if config disallows
+    if (
+        features.IMMUTABLE_TAGS
+        and tag.immutable
+        and expiration_datetime is not None
+        and not config.app_config.get("FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE", False)
+    ):
+        raise ImmutableTagException(tag.name, "set expiration on", tag.repository_id)
 
     new_end_ms = None
     min_expire_sec = convert_to_timedelta(config.app_config.get("LABELED_EXPIRATION_MINIMUM", "1h"))
@@ -615,13 +921,21 @@ def lookup_unrecoverable_tags(repo):
     Returns the tags in a repository that are expired and past their time machine recovery period.
     """
     expired_clause = get_epoch_timestamp_ms() - (Namespace.removed_tag_expiration_s * 1000)
-    return (
+    query = (
         Tag.select()
         .join(Repository)
         .join(Namespace, on=(Repository.namespace_user == Namespace.id))
         .where(Tag.repository == repo)
         .where(~(Tag.lifetime_end_ms >> None), Tag.lifetime_end_ms <= expired_clause)
     )
+
+    # Defense-in-depth: never GC immutable tags when they should not expire
+    if features.IMMUTABLE_TAGS and not config.app_config.get(
+        "FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE", False
+    ):
+        query = query.where(Tag.immutable == False)  # noqa: E712
+
+    return query
 
 
 def set_tag_end_ms(tag, end_ms):
@@ -655,7 +969,7 @@ def find_repository_with_garbage(limit_to_gc_policy_s):
 
     try:
         candidates = (
-            Tag.select(Tag.repository)
+            Tag.select(Tag.repository, can_use_read_replica=True)
             .join(Repository)
             .join(Namespace, on=(Repository.namespace_user == Namespace.id))
             .where(
@@ -667,11 +981,18 @@ def find_repository_with_garbage(limit_to_gc_policy_s):
             )
             .limit(GC_CANDIDATE_COUNT)
             .distinct()
-            .alias("candidates")
         )
 
+        # Skip repos where the only expired tags are immutable and should not expire
+        if features.IMMUTABLE_TAGS and not config.app_config.get(
+            "FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE", False
+        ):
+            candidates = candidates.where(Tag.immutable == False)  # noqa: E712
+
+        candidates = candidates.alias("candidates")
+
         found = (
-            Tag.select(candidates.c.repository_id)
+            Tag.select(candidates.c.repository_id, can_use_read_replica=True)
             .from_(candidates)
             .order_by(db_random_func())
             .get()
@@ -693,7 +1014,7 @@ def get_tags_within_timemachine_window(repo_id, tag_name, manifest_id, timemachi
 
     now_ms = get_epoch_timestamp_ms()
     return (
-        Tag.select(Tag.id)
+        Tag.select(Tag.id, Tag.immutable)
         .where(Tag.name == tag_name)
         .where(Tag.repository == repo_id)
         .where(Tag.manifest == manifest_id)
@@ -729,25 +1050,67 @@ def remove_tag_from_timemachine(
         if alive_tag is None:
             return False
 
-        # Expire the tag past the time machine window and set hidden=true to
-        # prevent it from appearing in tag history
-        updated = (
-            Tag.update(lifetime_end_ms=now_ms - time_machine_ms)
-            .where(Tag.id == alive_tag)
-            .where(Tag.lifetime_end_ms == alive_tag.lifetime_end_ms)
-            .execute()
-        )
-        if updated != 1:
+        # Check if the tag is immutable - skip deletion if so
+        if features.IMMUTABLE_TAGS and alive_tag.immutable:
+            logger.info(
+                "Skipping permanent deletion of immutable tag '%s' in repository %s",
+                tag_name,
+                repo_id,
+            )
             return False
-        else:
-            updated = True
+
+        with db_transaction():
+            # Clear pull statistics for permanently deleted tag
+            if features.IMAGE_PULL_STATS:
+                TagPullStatistics.delete().where(
+                    TagPullStatistics.repository == repo_id,
+                    TagPullStatistics.tag_name == tag_name,
+                ).execute()
+
+            # Expire the tag past the time machine window and set hidden=true to
+            # prevent it from appearing in tag history
+            updated = (
+                Tag.update(lifetime_end_ms=now_ms - time_machine_ms)
+                .where(Tag.id == alive_tag)
+                .where(Tag.lifetime_end_ms == alive_tag.lifetime_end_ms)
+                .execute()
+            )
+            if updated != 1:
+                return False
+            else:
+                updated = True
     else:
         # Update all tags with matching name and manifest with a expiry outside the time machine
         # window
         with db_transaction():
-            for tag in get_tags_within_timemachine_window(
-                repo_id, tag_name, manifest_id, time_machine_ms
-            ):
+            # Clear pull statistics for permanently deleted tags
+            if features.IMAGE_PULL_STATS:
+                TagPullStatistics.delete().where(
+                    TagPullStatistics.repository == repo_id,
+                    TagPullStatistics.tag_name == tag_name,
+                ).execute()
+
+            # Collect all tags first to check immutability before any updates
+            tags_to_update = list(
+                get_tags_within_timemachine_window(repo_id, tag_name, manifest_id, time_machine_ms)
+            )
+
+            # Filter out immutable tags and log
+            if features.IMMUTABLE_TAGS:
+                mutable_tags = []
+                for tag in tags_to_update:
+                    if tag.immutable:
+                        logger.info(
+                            "Skipping permanent deletion of immutable tag '%s' in repository %s",
+                            tag_name,
+                            repo_id,
+                        )
+                    else:
+                        mutable_tags.append(tag)
+                tags_to_update = mutable_tags
+
+            # Update all mutable tags
+            for tag in tags_to_update:
                 Tag.update(lifetime_end_ms=now_ms - time_machine_ms - increment).where(
                     Tag.id == tag
                 ).execute()
@@ -800,6 +1163,8 @@ def fetch_paginated_autoprune_repo_tags_by_number(
                 Tag.repository_id == repo_id,
                 (Tag.lifetime_end_ms >> None) | (Tag.lifetime_end_ms > now_ms),
                 Tag.hidden == False,
+                Tag.immutable == False,
+                _not_cosign_tag_schema_clause(),
             )
             # TODO: Ignoring type error for now, but it seems order_by doesn't
             # return anything to be modified by offset. Need to investigate
@@ -807,7 +1172,7 @@ def fetch_paginated_autoprune_repo_tags_by_number(
         )
 
         if exclude_tags and len(exclude_tags) > 0:
-            query.where(Tag.name.not_in([tag.name for tag in exclude_tags]))
+            query = query.where(Tag.name.not_in([tag.name for tag in exclude_tags]))
 
         if tag_pattern is not None:
             query = db_regex_search(
@@ -846,6 +1211,8 @@ def fetch_paginated_autoprune_repo_tags_older_than_ms(
             (Tag.lifetime_end_ms >> None) | (Tag.lifetime_end_ms > now_ms),
             (now_ms - Tag.lifetime_start_ms) > tag_lifetime_ms,
             Tag.hidden == False,
+            Tag.immutable == False,
+            _not_cosign_tag_schema_clause(),
         )
         if tag_pattern is not None:
             query = db_regex_search(
@@ -890,3 +1257,58 @@ def fetch_repo_tags_for_image_expiry_expiry_event(repo_id, days, notified_tags):
         raise Exception(
             f"Error fetching repository tags repository id: {repo_id} with error as: {str(err)}"
         )
+
+
+def is_tag_immutable(repository_id: int, tag_name: str) -> bool | None:
+    """
+    Returns whether the tag with the given name is immutable.
+
+    Returns None if the tag does not exist.
+    """
+    tag = get_tag(repository_id, tag_name)
+    if tag is None:
+        return None
+    return tag.immutable
+
+
+def set_tag_immutable(
+    repository_id: int, tag_name: str, immutable: bool
+) -> tuple[bool | None, bool]:
+    """
+    Sets the immutability status of a tag.
+
+    Returns (previous_immutable, success) tuple.
+
+    Raises DataModelException if trying to make an expiring tag immutable when
+    FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE is False.
+    """
+    tag = get_tag(repository_id, tag_name)
+    if tag is None:
+        return (None, False)
+
+    # Block making expiring tag immutable if config disallows coexistence
+    if (
+        immutable
+        and tag.lifetime_end_ms is not None
+        and not config.app_config.get("FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE", False)
+    ):
+        raise DataModelException(
+            f"Cannot make tag '{tag_name}' immutable: tag has expiration set. "
+            "Clear expiration first or enable FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE."
+        )
+
+    previous_immutable = tag.immutable
+
+    if previous_immutable == immutable:
+        return (previous_immutable, True)
+
+    updated = (
+        Tag.update(immutable=immutable)
+        .where(Tag.id == tag.id)
+        .where(Tag.immutable == previous_immutable)  # optimistic locking
+        .execute()
+    )
+    if updated != 1:
+        return (None, False)
+
+    return (previous_immutable, True)

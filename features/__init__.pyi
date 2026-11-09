@@ -46,6 +46,9 @@ BUILD_SUPPORT: FeatureNameValue
 # Feature Flag: Whether emails are enabled.
 MAILING: FeatureNameValue
 
+# Feature Flag: Whether organizations can share email addresses with other users/orgs.
+ORG_SHARED_EMAIL: FeatureNameValue
+
 # Feature Flag: Whether users can be created (by non-super users).
 USER_CREATION: FeatureNameValue
 
@@ -94,12 +97,6 @@ USER_METADATA: FeatureNameValue
 # Feature Flag: Whether to support signing
 SIGNING: FeatureNameValue
 
-# Feature Flag: Whether to enable support for App repositories.
-APP_REGISTRY: FeatureNameValue
-
-# Feature Flag: Whether app registry is in a read-only mode.
-READONLY_APP_REGISTRY: FeatureNameValue
-
 # Feature Flag: If set to true, the _catalog endpoint returns public repositories. Otherwise,
 # only private repositories can be returned.
 PUBLIC_CATALOG: FeatureNameValue
@@ -125,6 +122,9 @@ SECURITY_NOTIFICATIONS: FeatureNameValue
 # Repository mirror
 REPO_MIRROR: FeatureNameValue
 
+# Organization-level repository mirror
+ORG_MIRROR: FeatureNameValue
+
 # Site key and secret key for using recaptcha.
 RECAPTCHA: FeatureNameValue
 
@@ -139,6 +139,9 @@ NONSUPERUSER_TEAM_SYNCING_SETUP: FeatureNameValue
 
 # Feature Flag: Whether users can view and change their tag expiration.
 CHANGE_TAG_EXPIRATION: FeatureNameValue
+
+# Feature Flag: Whether tag immutability is enabled.
+IMMUTABLE_TAGS: FeatureNameValue
 
 # Feature Flag: If enabled, users can create and use app specific tokens to login via the CLI.
 APP_SPECIFIC_TOKENS: FeatureNameValue
@@ -192,7 +195,10 @@ SECURITY_SCANNER_NOTIFY_ON_NEW_INDEX: FeatureNameValue
 EXTENDED_REPOSITORY_NAMES: FeatureNameValue
 
 QUOTA_MANAGEMENT: FeatureNameValue
+QUOTA_NOTIFICATIONS: FeatureNameValue
 EDIT_QUOTA: FeatureNameValue
+
+IMAGE_PULL_STATS: FeatureNameValue
 
 QUOTA_SUPPRESS_FAILURES: FeatureNameValue
 
@@ -200,7 +206,11 @@ HELM_OCI_SUPPORT: FeatureNameValue
 
 PROXY_CACHE: FeatureNameValue
 
+PROXY_CACHE_BLOB_DOWNLOAD: FeatureNameValue
+
 RESTRICTED_USERS: FeatureNameValue
+
+SPAM_DETECTION: FeatureNameValue
 
 # Feature Flag: If set to true, enables reconciler for RH marketplace
 ENTITLEMENT_RECONCILIATION: FeatureNameValue
@@ -222,3 +232,16 @@ ASSIGN_OAUTH_TOKEN: FeatureNameValue
 
 # Feature Flag: If set to true, supports setting notifications on image expiry
 IMAGE_EXPIRY_TRIGGER: FeatureNameValue
+
+UI_MODELCARD: FeatureNameValue
+
+OTEL_TRACING: FeatureNameValue
+
+# Feature Flag: If set to true, enables programmatic bootstrap token provisioning.
+PROGRAMMATIC_BOOTSTRAP: FeatureNameValue
+
+# Feature Flag: If set to true, enables scoped robot Management API tokens.
+ROBOT_API_TOKENS: FeatureNameValue
+
+# Feature Flag: If set to true, enables federated exchange for robot API tokens.
+ROBOT_API_TOKEN_EXCHANGE: FeatureNameValue

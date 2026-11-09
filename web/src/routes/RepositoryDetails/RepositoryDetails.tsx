@@ -7,29 +7,34 @@ import {
   DrawerHead,
   DrawerPanelContent,
   PageSection,
-  PageSectionVariants,
   Tab,
   TabTitleText,
   Tabs,
   Title,
 } from '@patternfly/react-core';
 import {useEffect, useRef, useState} from 'react';
-import {useLocation, useNavigate, useSearchParams} from 'react-router-dom';
-import {AlertVariant} from 'src/atoms/AlertState';
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useSearchParams,
+} from 'react-router-dom';
+import {AlertVariant, useUI} from 'src/contexts/UIContext';
 import {QuayBreadcrumb} from 'src/components/breadcrumb/Breadcrumb';
 import Conditional from 'src/components/empty/Conditional';
 import ErrorBoundary from 'src/components/errors/ErrorBoundary';
 import RequestError from 'src/components/errors/RequestError';
 import CreateRobotAccountModal from 'src/components/modals/CreateRobotAccountModal';
-import {useAlerts} from 'src/hooks/UseAlerts';
 import {useQuayConfig} from 'src/hooks/UseQuayConfig';
 import {useRepository} from 'src/hooks/UseRepository';
 import {useFetchTeams} from 'src/hooks/UseTeams';
+import {useCurrentUser} from 'src/hooks/UseCurrentUser';
 import {
   parseOrgNameFromUrl,
   parseRepoNameFromUrl,
   validateTeamName,
 } from 'src/libs/utils';
+import {isRedirecting} from 'src/libs/axios';
 import {addDisplayError, isErrorString} from 'src/resources/ErrorHandling';
 import {Entity} from 'src/resources/UserResource';
 import {CreateTeamModal} from '../OrganizationsList/Organization/Tabs/DefaultPermissions/createPermissionDrawer/CreateTeamModal';
@@ -42,13 +47,16 @@ import TagHistory from './TagHistory/TagHistory';
 import TagsList from './Tags/TagsList';
 import {DrawerContentType} from './Types';
 import UsageLogs from '../UsageLogs/UsageLogs';
+import {Mirroring} from './Mirroring/Mirroring';
+import Information from './Information/Information';
 
 enum TabIndex {
-  Tags = 'tags',
   Information = 'information',
+  Tags = 'tags',
   TagHistory = 'history',
   Builds = 'builds',
   Logs = 'logs',
+  Mirroring = 'mirroring',
   Settings = 'settings',
 }
 
@@ -61,34 +69,58 @@ function getTabIndex(tab: string) {
 
 export default function RepositoryDetails() {
   const config = useQuayConfig();
-  const [activeTabKey, setActiveTabKey] = useState(TabIndex.Tags);
+  const {user, loading: userLoading} = useCurrentUser();
+  const [activeTabKey, setActiveTabKey] = useState(TabIndex.Information);
   const navigate = useNavigate();
   const location = useLocation();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [searchParams] = useSearchParams();
   const [drawerContent, setDrawerContent] = useState<DrawerContentType>(
     DrawerContentType.None,
   );
   const [isCreateRobotModalOpen, setIsCreateRobotModalOpen] = useState(false);
   const [selectedEntity, setSelectedEntity] = useState<Entity>(null);
-  const {addAlert} = useAlerts();
+  const {addAlert} = useUI();
   const [err, setErr] = useState<string>();
-
   const drawerRef = useRef<HTMLDivElement>();
 
   const organization = parseOrgNameFromUrl(location.pathname);
   const repository = parseRepoNameFromUrl(location.pathname);
+
+  // Only fetch repository AFTER user state is known
+  // This prevents API calls from firing for anonymous users before we can block them
+  const shouldFetchRepo = !userLoading;
   const {repoDetails, errorLoadingRepoDetails} = useRepository(
     organization,
     repository,
+    shouldFetchRepo,
   );
 
-  // state variables for Create Team
   const [teamName, setTeamName] = useState('');
   const [teamDescription, setTeamDescription] = useState('');
   const [isTeamModalOpen, setIsTeamModalOpen] = useState<boolean>(false);
 
-  const {teams} = useFetchTeams(organization);
+  // Only fetch teams AFTER user state is known (same as repo)
+  const {teams} = useFetchTeams(organization, shouldFetchRepo);
   const setupBuildTriggerUuid = searchParams.get('setupTrigger');
+
+  useEffect(() => {
+    if (errorLoadingRepoDetails) {
+      setErr(
+        addDisplayError(
+          'Unable to get repository',
+          errorLoadingRepoDetails as Error,
+        ),
+      );
+    }
+  }, [errorLoadingRepoDetails]);
+
+  if (isRedirecting()) {
+    return null;
+  }
+
+  if (user?.anonymous && !repoDetails) {
+    return null;
+  }
 
   const createRobotModal = (
     <CreateRobotAccountModal
@@ -172,17 +204,6 @@ export default function RepositoryDetails() {
     ),
   };
 
-  useEffect(() => {
-    if (errorLoadingRepoDetails) {
-      setErr(
-        addDisplayError(
-          'Unable to get repository',
-          errorLoadingRepoDetails as Error,
-        ),
-      );
-    }
-  }, [errorLoadingRepoDetails]);
-
   return (
     <>
       <Conditional if={isCreateRobotModalOpen}>{createRobotModal}</Conditional>
@@ -212,13 +233,13 @@ export default function RepositoryDetails() {
         >
           <DrawerContentBody>
             <QuayBreadcrumb />
-            <PageSection variant={PageSectionVariants.light}>
+            <PageSection hasBodyWrapper={false}>
               <Title data-testid="repo-title" headingLevel="h1">
                 {repository}
               </Title>
             </PageSection>
             <PageSection
-              variant={PageSectionVariants.light}
+              hasBodyWrapper={false}
               padding={{default: 'noPadding'}}
             >
               <ErrorBoundary
@@ -233,8 +254,20 @@ export default function RepositoryDetails() {
                   usePageInsets={true}
                 >
                   <Tab
+                    eventKey={TabIndex.Information}
+                    title={<TabTitleText>Information</TabTitleText>}
+                    {...({} as any)}
+                  >
+                    <Information
+                      organization={organization}
+                      repository={repository}
+                      repoDetails={repoDetails}
+                    />
+                  </Tab>
+                  <Tab
                     eventKey={TabIndex.Tags}
                     title={<TabTitleText>Tags</TabTitleText>}
+                    {...({} as any)}
                   >
                     <TagsList
                       organization={organization}
@@ -245,6 +278,7 @@ export default function RepositoryDetails() {
                   <Tab
                     eventKey={TabIndex.TagHistory}
                     title={<TabTitleText>Tag history</TabTitleText>}
+                    {...({} as any)}
                   >
                     <TagHistory
                       org={organization}
@@ -255,12 +289,60 @@ export default function RepositoryDetails() {
                   <Tab
                     eventKey={TabIndex.Logs}
                     title={<TabTitleText>Logs</TabTitleText>}
+                    isHidden={
+                      !repoDetails?.can_write && !repoDetails?.can_admin
+                    }
+                    {...({} as any)}
                   >
                     <UsageLogs
                       organization={organization}
                       repository={repository}
                       type="repository"
                     />
+                  </Tab>
+                  <Tab
+                    eventKey={TabIndex.Mirroring}
+                    title={<TabTitleText>Mirroring</TabTitleText>}
+                    data-testid="mirroring-tab"
+                    isHidden={
+                      !config?.features?.REPO_MIRROR || !repoDetails?.can_admin
+                    }
+                    {...({} as any)}
+                  >
+                    {repoDetails?.state !== 'MIRROR' ? (
+                      <div>
+                        This repository&apos;s state is{' '}
+                        <strong>{repoDetails?.state}</strong>.{' '}
+                        {repoDetails?.state === 'ORG_MIRROR' ? (
+                          <>
+                            Mirroring is managed at the organization level. Use
+                            the{' '}
+                            <Link
+                              to={`/organization/${repoDetails?.namespace}?tab=Mirroring`}
+                            >
+                              organization mirroring settings
+                            </Link>{' '}
+                            to manage mirroring configuration.
+                          </>
+                        ) : (
+                          <>
+                            Use the{' '}
+                            <Link
+                              to={`/repository/${repoDetails?.namespace}/${repoDetails?.name}?tab=settings`}
+                            >
+                              Settings tab
+                            </Link>{' '}
+                            and change it to <strong>Mirror</strong> to manage
+                            its mirroring configuration.
+                          </>
+                        )}
+                      </div>
+                    ) : (
+                      <Mirroring
+                        namespace={organization}
+                        repoName={repository}
+                      />
+                    )}
                   </Tab>
                   <Tab
                     eventKey={TabIndex.Builds}
@@ -270,6 +352,7 @@ export default function RepositoryDetails() {
                       repoDetails?.state !== 'NORMAL' ||
                       (!repoDetails?.can_write && !repoDetails?.can_admin)
                     }
+                    {...({} as any)}
                   >
                     <Builds
                       org={organization}
@@ -282,6 +365,7 @@ export default function RepositoryDetails() {
                     eventKey={TabIndex.Settings}
                     title={<TabTitleText>Settings</TabTitleText>}
                     isHidden={!repoDetails?.can_admin}
+                    {...({} as any)}
                   >
                     <Settings
                       org={organization}

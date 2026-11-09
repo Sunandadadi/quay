@@ -6,6 +6,7 @@ import psutil
 
 from app import authentication, build_logs, instance_keys, storage
 from health.models_pre_oci import pre_oci_model as model
+from health.storage_engines import check_storage_engines
 
 logger = logging.getLogger(__name__)
 
@@ -68,16 +69,29 @@ def _check_redis(app):
 def _check_storage(app):
     """
     Returns the status of storage, as accessed from this instance.
+
+    Validates all configured storage engines. Only fails if a preferred engine is unavailable;
+    non-preferred engine failures are reported as warnings.
     """
     if app.config.get("REGISTRY_STATE", "normal") == "readonly":
         return (True, "Storage check disabled for readonly mode")
 
+    return check_storage_engines(storage, app.config["HTTPCLIENT"])
+
+
+def _check_preferred_storage(app):
+    """
+    HEALTH_CHECKER_INSTANCE_CHECK_PREFERRED_STORAGE
+    """
+    if app.config.get("REGISTRY_STATE", "normal") == "readonly":
+        return (True, "Preferred storage check disabled for readonly mode")
+
     try:
-        storage.validate(storage.preferred_locations, app.config["HTTPCLIENT"])
+        storage.validate([storage.preferred_locations[0]], app.config["HTTPCLIENT"])
         return (True, None)
     except Exception as ex:
         logger.exception("Storage check failed with exception %s", ex)
-        return (False, "Storage check failed with exception %s" % ex)
+        return (False, "Preferred storage check failed with exception %s" % ex)
 
 
 def _check_auth(app):
@@ -183,6 +197,8 @@ def check_all_services(app, skip, for_instance=False):
     if for_instance:
         services = dict(_INSTANCE_SERVICES)
         services.update(_GLOBAL_SERVICES)
+        if app.config.get("HEALTH_CHECKER_INSTANCE_CHECK_PREFERRED_STORAGE"):
+            services["preferred_storage"] = _check_preferred_storage
     else:
         services = _GLOBAL_SERVICES
 

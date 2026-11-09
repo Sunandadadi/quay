@@ -18,6 +18,7 @@ from botocore.credentials import (
 )
 from botocore.signers import CloudFrontSigner
 from cachetools.func import lru_cache
+from cryptography import exceptions as crypto_exceptions
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -391,7 +392,7 @@ class _CloudStorage(BaseStorageV2):
                     botocore.exceptions.ConnectionClosedError,
                     IOError,
                 ) as e:
-                    logger.warn(
+                    logger.warning(
                         "Error when writing to stream in stream_write_internal at path %s: %s",
                         path,
                         e,
@@ -439,8 +440,8 @@ class _CloudStorage(BaseStorageV2):
         obj = self.get_cloud_bucket().Object(path)
         try:
             obj.load()
-            obj.delete()
-            return
+            resp = obj.delete()
+            return resp.get("VersionId")
         except botocore.exceptions.ClientError as s3r:
             if not s3r.response["Error"]["Code"] in _MISSING_KEY_ERROR_CODES:
                 raise
@@ -754,6 +755,63 @@ class _CloudStorage(BaseStorageV2):
                                 "Blob not found in uploads folder with key %s", obj_info["Key"]
                             )
 
+    def clean_orphaned_multipart_uploads(self, deletion_date_threshold):
+        """
+        Lists and deletes all orphaned multipart uploads that are older than the provided threshold.
+        The threshold must be large enough so we don't clean up multipart uploads that are potentially
+        in progress.
+        """
+        self._initialize_cloud_conn()
+        paginator = self.get_cloud_conn().get_paginator("list_multipart_uploads")
+        deleted = 0
+
+        root_prefix = self._init_path()
+        if root_prefix and not root_prefix.endswith("/"):
+            root_prefix = root_prefix + "/"
+
+        page_iterator = paginator.paginate(Bucket=self._bucket_name, Prefix=root_prefix)
+        for page in page_iterator:
+            # check if there are any multipart uploads
+            if "Uploads" in page:
+                for upload in page["Uploads"]:
+                    # if the upload is older than the designated deletion time
+                    if upload["Initiated"] <= datetime.now(timezone.utc) - deletion_date_threshold:
+                        try:
+                            logger.info(
+                                "Aborting stale multipart upload: uploadid=%s, key=%s, initiated=%s",
+                                upload["UploadId"],
+                                upload["Key"],
+                                upload["Initiated"],
+                            )
+                            self.get_cloud_conn().abort_multipart_upload(
+                                Bucket=self._bucket_name,
+                                Key=upload["Key"],
+                                UploadId=upload["UploadId"],
+                            )
+                            logger.info(
+                                "Deleted stale multipart upload with upload id %s and key %s",
+                                upload["UploadId"],
+                                upload["Key"],
+                            )
+                            deleted = deleted + 1
+                        except botocore.exceptions.ClientError as s3r:
+                            if (
+                                s3r.response["Error"]["Code"]
+                                in ("NoSuchUpload",) + _MISSING_KEY_ERROR_CODES
+                            ):
+                                logger.debug(
+                                    "Multipart upload with upload id %s not found",
+                                    upload["UploadId"],
+                                )
+                            else:
+                                logger.exception(
+                                    "Got error when attempting to clean up stale multipart upload: key=%s, uploadid=%s, exception=%s",
+                                    upload["Key"],
+                                    upload["UploadId"],
+                                    str(s3r),
+                                )
+        return deleted
+
 
 class S3Storage(_CloudStorage):
     REGIONS = {
@@ -911,6 +969,7 @@ class GoogleCloudStorage(_CloudStorage):
         secret_key,
         bucket_name,
         boto_timeout=60,
+        minimum_chunk_size_mb=None,
         signature_version=None,
     ):
         # GCS does not support ListObjectV2
@@ -933,6 +992,10 @@ class GoogleCloudStorage(_CloudStorage):
             bucket_name,
             access_key,
             secret_key,
+        )
+
+        self.minimum_chunk_size = (
+            (minimum_chunk_size_mb if minimum_chunk_size_mb is not None else 5) * 1024 * 1024
         )
 
         # Workaround for setting GCS cors at runtime with boto
@@ -986,50 +1049,6 @@ class GoogleCloudStorage(_CloudStorage):
             .replace("AWSAccessKeyId", "GoogleAccessId")
         )
 
-    def _stream_write_internal(
-        self,
-        path,
-        fp,
-        content_type=None,
-        content_encoding=None,
-        cancel_on_error=True,
-        size=filelike.READ_UNTIL_END,
-    ):
-        """
-        Writes the data found in the file-like stream to the given path, with optional limit on
-        size. Note that this method returns a *tuple* of (bytes_written, write_error) and should.
-
-        *not* raise an exception (such as IOError) if a problem uploading occurred. ALWAYS check
-        the returned tuple on calls to this method.
-        """
-        # Minimum size of upload part size on S3 is 5MB
-        self._initialize_cloud_conn()
-        path = self._init_path(path)
-        obj = self.get_cloud_bucket().Object(path)
-
-        extra_args = {}
-        if content_type is not None:
-            extra_args["ContentType"] = content_type
-
-        if content_encoding is not None:
-            extra_args["ContentEncoding"] = content_encoding
-
-        if size != filelike.READ_UNTIL_END:
-            fp = filelike.StreamSlice(fp, 0, size)
-
-        with BytesIO() as buf:
-            # Stage the bytes into the buffer for use with the multipart upload file API
-            bytes_staged = self.stream_write_to_fp(fp, buf, size)
-            buf.seek(0)
-
-            # TODO figure out how to handle cancel_on_error=False
-            try:
-                obj.put(Body=buf, **extra_args)
-            except Exception as ex:
-                return 0, ex
-
-        return bytes_staged, None
-
     def complete_chunked_upload(self, uuid, final_path, storage_metadata):
         self._initialize_cloud_conn()
 
@@ -1053,6 +1072,8 @@ class RadosGWStorage(_CloudStorage):
         region_name=None,
         signature_version=None,
         port=None,
+        # Chunk sizes
+        minimum_chunk_size_mb=None,
         maximum_chunk_size_mb=None,
         server_side_assembly=True,
     ):
@@ -1079,8 +1100,18 @@ class RadosGWStorage(_CloudStorage):
         )
 
         chunk_size = (
-            maximum_chunk_size_mb if maximum_chunk_size_mb is not None else 32
-        )  # 32mb default, as used in Docker registry:2
+            maximum_chunk_size_mb if maximum_chunk_size_mb is not None else 100
+        )  # 100 MiB, as with IBM Storage driver
+
+        # For very big layers over 100 GiB, chunk size of 5 MiB is not enough.
+        # S3 supports up to 10000 parts in a multipart upload, with 5 MiB chunk
+        # we can only upload up to 50 GiB files. If a layer is bigger than that,
+        # storage will return a 400 and upload will fail.
+        # This makes minimum chunk size configurable for both RADOS and OCS storage.
+        self.minimum_chunk_size = (
+            (minimum_chunk_size_mb if minimum_chunk_size_mb is not None else 5) * 1024 * 1024
+        )
+
         self.maximum_chunk_size = chunk_size * 1024 * 1024
 
         self.server_side_assembly = server_side_assembly
@@ -1151,7 +1182,7 @@ class CloudFrontedS3Storage(S3Storage):
         **kwargs,
     ):
         super(CloudFrontedS3Storage, self).__init__(
-            context, storage_path, s3_bucket, *args, **kwargs
+            context, storage_path, s3_bucket, s3_region=s3_region, *args, **kwargs
         )
 
         self.s3_region = s3_region
@@ -1196,6 +1227,7 @@ class CloudFrontedS3Storage(S3Storage):
         logger.debug(
             'Returning CloudFront URL for path "%s" with IP "%s": %s',
             path,
+            request_ip,
             signed_url,
         )
         return signed_url
@@ -1207,6 +1239,32 @@ class CloudFrontedS3Storage(S3Storage):
     @lru_cache(maxsize=1)
     def _get_rsa_signer(self):
         private_key = self.cloudfront_privatekey
+
+        try:
+            # Test if SHA1 signing works with this system's crypto policy
+            private_key.sign(b"test", padding.PKCS1v15(), hashes.SHA1())
+        except crypto_exceptions.UnsupportedAlgorithm:
+            # SHA1 blocked by system crypto policy (e.g., RHEL9).
+            # Fall back to pure-Python rsa library which bypasses OpenSSL.
+            import rsa as rsa_lib
+
+            pn = private_key.private_numbers()
+            rsa_key = rsa_lib.PrivateKey(
+                n=pn.public_numbers.n,
+                e=pn.public_numbers.e,
+                d=pn.d,
+                p=pn.p,
+                q=pn.q,
+            )
+            logger.warning(
+                "SHA1 not supported by system crypto policy for RSA signing. "
+                "Using pure-Python RSA for CloudFront URL signing."
+            )
+
+            def handler(message):
+                return rsa_lib.sign(message, rsa_key, "SHA-1")
+
+            return handler
 
         def handler(message):
             return private_key.sign(message, padding.PKCS1v15(), hashes.SHA1())
@@ -1245,28 +1303,39 @@ class STSS3Storage(S3Storage):
         maximum_chunk_size_gb=None,
         signature_version="s3v4",
     ):
-        sts_client = boto3.client(
-            "sts", aws_access_key_id=sts_user_access_key, aws_secret_access_key=sts_user_secret_key
-        )
-        assumed_role = sts_client.assume_role(RoleArn=sts_role_arn, RoleSessionName="quay")
-        credentials = assumed_role["Credentials"]
-        deferred_refreshable_credentials = DeferredRefreshableCredentials(
-            refresh_using=create_assume_role_refresher(
-                sts_client, {"RoleArn": sts_role_arn, "RoleSessionName": "quay"}
-            ),
-            method="sts-assume-role",
-        )
+        if sts_user_access_key == "" or sts_user_secret_key == "":
+            sts_client = boto3.client("sts")
+        else:
+            sts_client = boto3.client(
+                "sts",
+                aws_access_key_id=sts_user_access_key,
+                aws_secret_access_key=sts_user_secret_key,
+            )
 
         # !! NOTE !! connect_kwargs here initializes the S3Storage Class not the s3 connection (mis leading re-use of the name)
         connect_kwargs = {
-            "s3_access_key": credentials["AccessKeyId"],
-            "s3_secret_key": credentials["SecretAccessKey"],
-            "aws_session_token": credentials["SessionToken"],
             "s3_region": s3_region,
             "endpoint_url": endpoint_url,
             "maximum_chunk_size_gb": maximum_chunk_size_gb,
-            "deferred_refreshable_credentials": deferred_refreshable_credentials,
             "signature_version": signature_version,
         }
+        if sts_role_arn is not None:
+            assumed_role = sts_client.assume_role(RoleArn=sts_role_arn, RoleSessionName="quay")
+            credentials = assumed_role["Credentials"]
+            deferred_refreshable_credentials = DeferredRefreshableCredentials(
+                refresh_using=create_assume_role_refresher(
+                    sts_client, {"RoleArn": sts_role_arn, "RoleSessionName": "quay"}
+                ),
+                method="sts-assume-role",
+            )
+
+            connect_kwargs.update(
+                {
+                    "s3_access_key": credentials["AccessKeyId"],
+                    "s3_secret_key": credentials["SecretAccessKey"],
+                    "aws_session_token": credentials["SessionToken"],
+                    "deferred_refreshable_credentials": deferred_refreshable_credentials,
+                }
+            )
 
         super().__init__(context, storage_path, s3_bucket, **connect_kwargs)

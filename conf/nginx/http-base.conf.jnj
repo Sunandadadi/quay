@@ -19,6 +19,8 @@ include /etc/nginx/mime.types;
 
 default_type application/octet-stream;
 
+server_tokens off;
+
 access_log /var/log/nginx/access.log;
 error_log /var/log/nginx/error.log;
 client_body_temp_path /tmp/nginx 1 2;
@@ -42,6 +44,18 @@ gzip_types text/plain text/xml text/css
 map $proxy_protocol_addr $proper_forwarded_for {
   ""      $proxy_add_x_forwarded_for;
   default $proxy_protocol_addr;
+}
+
+map $realip_remote_addr $quay_original_remote_addr {
+  ""      $remote_addr;
+  default $realip_remote_addr;
+}
+
+map $quay_original_remote_addr $quay_bootstrap_renewal_location {
+  default remote;
+  127.0.0.1 local;
+  ::1 local;
+  ~*^::ffff:127\.0\.0\.1$ local;
 }
 
 map $http_x_forwarded_proto $proper_scheme {

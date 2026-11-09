@@ -52,6 +52,13 @@ CONFIG_SCHEMA = {
             "x-example": ["TLSv1.1", "TLSv1.2"],
             "x-reference": "http://nginx.org/en/docs/http/ngx_http_ssl_module.html#ssl_protocols",
         },
+        "SSL_ECDH_CURVES": {
+            "type": "array",
+            "description": "If specified, the nginx-defined list of elliptic curves and post-quantum key exchange groups",
+            "x-example": ["X25519MLKEM768", "X25519", "prime256v1"],
+            "items": {"type": "string", "minLength": 1},
+            "x-reference": "http://nginx.org/en/docs/http/ngx_http_ssl_module.html#ssl_ecdh_curve",
+        },
         # User-visible configuration.
         "REGISTRY_TITLE": {
             "type": "string",
@@ -823,18 +830,6 @@ CONFIG_SCHEMA = {
             "description": "Whether to collect and support user metadata. Defaults to False",
             "x-example": False,
         },
-        # Feature Flag: Support App Registry.
-        "FEATURE_APP_REGISTRY": {
-            "type": "boolean",
-            "description": "Whether to enable support for App repositories. Defaults to False",
-            "x-example": False,
-        },
-        # Feature Flag: Read only app registry.
-        "FEATURE_READONLY_APP_REGISTRY": {
-            "type": "boolean",
-            "description": "Whether to App repositories are read-only. Defaults to False",
-            "x-example": True,
-        },
         # Feature Flag: Public Reposiotires in _catalog Endpoint.
         "FEATURE_PUBLIC_CATALOG": {
             "type": "boolean",
@@ -1070,6 +1065,14 @@ CONFIG_SCHEMA = {
                             "x-example": "quay-sourcetype",
                             "default": "access_combined",
                         },
+                        "timeout": {
+                            "type": "number",
+                            "description": "Timeout in seconds for HTTP requests to Splunk HEC endpoint. Prevents requests from hanging indefinitely when Splunk is unresponsive.",
+                            "x-example": 10,
+                            "default": 10,
+                            "minimum": 1,
+                            "maximum": 15,
+                        },
                     },
                     "required": ["host", "hec_token"],
                 },
@@ -1161,6 +1164,12 @@ CONFIG_SCHEMA = {
             "type": "string",
             "description": "The time after which a fresh login requires users to reenter their password",
             "x-example": "5m",
+        },
+        "SESSION_TIMEOUT": {
+            "type": "string",
+            "description": "The lifetime for permanent browser sessions. Used when FEATURE_PERMANENT_SESSIONS is enabled.",
+            "pattern": "^[0-9]+(w|m|d|h|s)$",
+            "x-example": "24h",
         },
         # Webhook blacklist.
         "WEBHOOK_HOSTNAME_BLACKLIST": {

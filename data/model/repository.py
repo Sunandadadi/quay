@@ -9,8 +9,8 @@ from cachetools.func import ttl_cache
 from peewee import JOIN, SQL, Case, IntegrityError, fn
 
 import data
+import features
 from data.database import (
-    ApprTag,
     BlobUpload,
     DeletedRepository,
     ExternalNotificationEvent,
@@ -126,13 +126,23 @@ class _RepositoryExistsException(Exception):
 
 
 def create_repository(
-    namespace, name, creating_user, visibility="private", repo_kind="image", description=None
+    namespace,
+    name,
+    creating_user,
+    visibility="private",
+    repo_kind="image",
+    description=None,
+    proxy_cache=False,
 ):
     namespace_user = User.get(username=namespace)
     yesterday = datetime.now() - timedelta(days=1)
 
     try:
         with db_transaction():
+            if features.ORG_MIRROR:
+                # Lock the org row to serialize against concurrent org mirror config creation
+                db_for_update(User.select().where(User.id == namespace_user.id)).get()
+
             # Check if the repository exists to avoid an IntegrityError if possible.
             existing = get_repository(namespace, name)
             if existing is not None:
@@ -154,7 +164,8 @@ def create_repository(
 
             # Note: We put the admin create permission under the transaction to ensure it is created.
             if creating_user and not creating_user.organization:
-                admin = Role.get(name="admin")
+                rolename = "admin" if proxy_cache == False else "read"
+                admin = Role.get(name=rolename)
                 RepositoryPermission.create(user=creating_user, repository=repo, role=admin)
     except _RepositoryExistsException as ree:
         try:
@@ -360,32 +371,6 @@ def get_visible_repositories(
     return query
 
 
-def get_app_repository(namespace_name, repository_name):
-    """
-    Find an application repository.
-    """
-    try:
-        return _basequery.get_existing_repository(
-            namespace_name, repository_name, kind_filter="application"
-        )
-    except Repository.DoesNotExist:
-        return None
-
-
-def get_app_search(lookup, search_fields=None, username=None, limit=50):
-    if search_fields is None:
-        search_fields = set([SEARCH_FIELDS.name.name])
-
-    return get_filtered_matching_repositories(
-        lookup,
-        filter_username=username,
-        search_fields=search_fields,
-        repo_kind="application",
-        offset=0,
-        limit=limit,
-    )
-
-
 def _get_namespace_user(username):
     try:
         return User.get(username=username)
@@ -528,7 +513,7 @@ def _get_sorted_matching_repositories(
 
         select_fields.append(computed_score)
         query = (
-            Repository.select(*select_fields)
+            Repository.select(*select_fields, can_use_read_replica=True)
             .join(RepositorySearchScore)
             .where(clause)
             .where(Repository.state != RepositoryState.MARKED_FOR_DELETION)
@@ -766,4 +751,4 @@ def get_size_during_upload(repo_id: int):
         )
     ).get()
 
-    return query.size_bytes if query.size_bytes is not None else 0
+    return int(query.size_bytes) if query.size_bytes is not None else 0

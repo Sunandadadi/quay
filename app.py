@@ -9,6 +9,8 @@ from flask import Flask, Request, request
 from flask_login import LoginManager
 from flask_mail import Mail
 from flask_principal import Principal
+from opentelemetry.instrumentation.flask import FlaskInstrumentor
+from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -46,32 +48,46 @@ from path_converters import (
     V1CreateRepositoryPathConverter,
 )
 from storage import Storage
+from storage.upstreamproxy import UpstreamProxy
 from util import get_app_url
 from util.config import URLSchemeAndHostname
 from util.config.configutil import generate_secret_key
 from util.greenlet_tracing import enable_tracing
 from util.ipresolver import IPResolver
 from util.label_validator import LabelValidator
+from util.locking import GlobalLock
 from util.log import filter_logs
 from util.marketplace import MarketplaceSubscriptionApi, MarketplaceUserApi
+from util.metrics.otel import init_exporter
 from util.metrics.prometheus import PrometheusPlugin
 from util.names import urn_generator
+from util.profiling.pyroscope import init_pyroscope
+from util.pullmetrics import PullMetricsBuilderModule
 from util.repomirror.api import RepoMirrorAPI
 from util.saas.analytics import Analytics
 from util.saas.exceptionlog import Sentry
 from util.security.instancekeys import InstanceKeys
+from util.timedeltastring import convert_to_timedelta
 from util.tufmetadata.api import TUFMetadataAPI
 
 OVERRIDE_CONFIG_YAML_FILENAME = os.path.join(OVERRIDE_CONFIG_DIRECTORY, "config.yaml")
 OVERRIDE_CONFIG_PY_FILENAME = os.path.join(OVERRIDE_CONFIG_DIRECTORY, "config.py")
 
 OVERRIDE_CONFIG_KEY = "QUAY_OVERRIDE_CONFIG"
+DEFAULT_SESSION_TIMEOUT = "31d"
 
 DOCKER_V2_SIGNINGKEY_FILENAME = "docker_v2.pem"
 INIT_SCRIPTS_LOCATION = "/conf/init/"
 
 app = Flask(__name__)
+
 logger = logging.getLogger(__name__)
+
+
+def configure_app_session_lifetime(flask_app):
+    session_timeout = flask_app.config.get("SESSION_TIMEOUT", DEFAULT_SESSION_TIMEOUT)
+    flask_app.permanent_session_lifetime = convert_to_timedelta(session_timeout)
+
 
 # Instantiate the configuration.
 is_testing = IS_TESTING
@@ -93,18 +109,42 @@ else:
 # Load the override config via the provider.
 config_provider.update_app_config(app.config)
 
+# Check if TESTING is properly set
+if app.config.get("TESTING", False):
+    logger.warning(
+        "🟡🟡🟡 Detected TESTING: true on startup. TESTING property is either missing from config.yaml or set to 'true'."
+    )
+    logger.warning(
+        "🟡🟡🟡 Quay starting in TESTING mode, some functionality such as e-mail sending will not be available."
+    )
+
 # Update any configuration found in the override environment variable.
 environ_config = json.loads(os.environ.get(OVERRIDE_CONFIG_KEY, "{}"))
 app.config.update(environ_config)
+
+configure_app_session_lifetime(app)
 
 # Fix remote address handling for Flask.
 if app.config.get("PROXY_COUNT", 1):
     app.wsgi_app = ProxyFix(app.wsgi_app)  # type: ignore[method-assign]
 
-# Allow user to define a custom storage preference for the local instance.
-_distributed_storage_preference = os.environ.get("QUAY_DISTRIBUTED_STORAGE_PREFERENCE", "").split()
-if _distributed_storage_preference:
-    app.config["DISTRIBUTED_STORAGE_PREFERENCE"] = _distributed_storage_preference
+
+def apply_storage_replication_config(config):
+    """Apply env var override and validate storage replication settings."""
+    pref = os.environ.get("QUAY_DISTRIBUTED_STORAGE_PREFERENCE", "").split()
+    if pref:
+        config["DISTRIBUTED_STORAGE_PREFERENCE"] = pref
+
+    if not config.get("DISTRIBUTED_STORAGE_PREFERENCE") and config.get(
+        "FEATURE_STORAGE_REPLICATION", False
+    ):
+        raise Exception(
+            "Missing storage preference for geo-replication. Set DISTRIBUTED_STORAGE_PREFERENCE "
+            "in config.yaml or the QUAY_DISTRIBUTED_STORAGE_PREFERENCE environment variable."
+        )
+
+
+apply_storage_replication_config(app.config)
 
 # Generate a secret key if none was specified.
 if app.config["SECRET_KEY"] is None:
@@ -174,9 +214,11 @@ def _request_start():
 DEFAULT_FILTER = lambda x: "[FILTERED]"
 FILTERED_VALUES = [
     {"key": ["password"], "fn": DEFAULT_FILTER},
+    {"key": ["subject_token"], "fn": DEFAULT_FILTER},
     {"key": ["upstream_registry_password"], "fn": DEFAULT_FILTER},
     {"key": ["upstream_registry_username"], "fn": DEFAULT_FILTER},
     {"key": ["user", "password"], "fn": DEFAULT_FILTER},
+    {"key": ["user", "repeatPassword"], "fn": DEFAULT_FILTER},
     {"key": ["blob"], "fn": lambda x: x[0:8]},
 ]
 
@@ -188,7 +230,10 @@ def _request_end(resp):
     except HTTPException:
         jsonbody = None
 
-    values = request.values.to_dict()
+    try:
+        values = request.values.to_dict()
+    except HTTPException:
+        values = None
 
     if isinstance(jsonbody, dict):
         filter_logs(jsonbody, FILTERED_VALUES)
@@ -250,8 +295,10 @@ log_archive = LogArchive(app, storage)
 analytics = Analytics(app)
 billing = Billing(app)
 sentry = Sentry(app)
+init_pyroscope(app)
 build_logs = BuildLogs(app)
 userevents = UserEventsBuilderModule(app)
+pullmetrics = PullMetricsBuilderModule(app)
 label_validator = LabelValidator(app)
 build_canceller = BuildCanceller(app)
 
@@ -265,6 +312,9 @@ authentication = UserAuthentication(app, config_provider, OVERRIDE_CONFIG_DIRECT
 usermanager = UserManager(app, authentication)
 
 image_replication_queue = WorkQueue(app.config["REPLICATION_QUEUE_NAME"], tf, has_namespace=False)
+proxy_cache_blob_queue = WorkQueue(
+    app.config["PROXY_CACHE_BLOB_QUEUE_NAME"], tf, has_namespace=True
+)
 dockerfile_build_queue = WorkQueue(
     app.config["DOCKERFILE_BUILD_QUEUE_NAME"], tf, has_namespace=True
 )
@@ -291,6 +341,12 @@ all_queues = [
     namespace_gc_queue,
 ]
 
+# initialize upstream proxy downloader instance
+upstream_proxy = None
+if app.config.get("FEATURE_PROXY_CACHE", False) and instance_keys is not None:
+    logger.debug("Initializing upstream proxy downloader")
+    upstream_proxy = UpstreamProxy(app, instance_keys)
+
 url_scheme_and_hostname = URLSchemeAndHostname(
     app.config["PREFERRED_URL_SCHEME"], app.config["SERVER_HOSTNAME"]
 )
@@ -315,19 +371,16 @@ if os.path.exists(_v2_key_path):
 else:
     docker_v2_signing_key = JsonWebKey.generate_key("RSA", 2048, is_private=True)
 
-# Check if georeplication is turned on and whether env. variables exist:
-if os.environ.get("QUAY_DISTRIBUTED_STORAGE_PREFERENCE") is None and app.config.get(
-    "FEATURE_STORAGE_REPLICATION", False
-):
-    raise Exception(
-        "Missing storage preference, did you perhaps forget to define QUAY_DISTRIBUTED_STORAGE_PREFERENCE variable?"
-    )
-
 # Configure the database.
 if app.config.get("DATABASE_SECRET_KEY") is None and app.config.get("SETUP_COMPLETE", False):
     raise Exception("Missing DATABASE_SECRET_KEY in config; did you perhaps forget to add it?")
 
 database.configure(app.config)
+
+# Configure global locking
+# For testing in CI we mock GlobalLock anyway, so we'll skip global initialization if TESTING is set:
+if not app.config.get("TESTING", False):
+    GlobalLock.configure(app.config)
 
 model.config.app_config = app.config
 model.config.store = storage
@@ -349,3 +402,14 @@ def load_user(user_uuid):
 
 
 get_app_url = partial(get_app_url, app.config)
+
+if features.OTEL_TRACING:
+    FlaskInstrumentor().instrument_app(
+        app,
+        excluded_urls=app.config.get("OTEL_TRACING_EXCLUDED_URLS", None),
+    )
+    Psycopg2Instrumentor().instrument()
+    # Detect if running under gunicorn with preload_app
+    # When QUAY_HOTRELOAD is false, gunicorn configs set preload_app=True
+    is_preload = os.getenv("QUAY_HOTRELOAD", "false") == "false"
+    init_exporter(app.config, is_gunicorn_preload=is_preload)

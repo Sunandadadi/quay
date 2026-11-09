@@ -460,3 +460,54 @@ export function uploadFile(url: string, dockerfileContent: string) {
     request.send(dockerfileContent);
   });
 }
+
+// Superuser build logs - system-wide access by UUID
+export interface ISuperuserBuildLog {
+  message: string;
+  timestamp?: string;
+  type?: string;
+}
+
+export interface ISuperuserBuild {
+  id: string;
+  uuid: string;
+  status: any;
+  started: string;
+  completed?: string;
+  logs: ISuperuserBuildLog[];
+  repository?: {
+    namespace: string;
+    name: string;
+  };
+  phase?: string;
+  error?: string;
+}
+
+// Fetch build by UUID (superuser only) - includes logs from separate endpoint
+export async function fetchBuildLogsSuperuser(
+  buildUuid: string,
+  signal?: AbortSignal,
+): Promise<ISuperuserBuild> {
+  const [buildResponse, logsResponse] = await Promise.all([
+    axios.get(`/api/v1/superuser/${buildUuid}/build`, {signal}),
+    axios.get(`/api/v1/superuser/${buildUuid}/logs`, {signal}),
+  ]);
+
+  let logs = logsResponse.data.logs || [];
+  if (!isNullOrUndefined(logsResponse.data.logs_url)) {
+    const logsUrl = logsResponse.data.logs_url;
+    const apiOrigin = axios.defaults.baseURL || window.location.origin;
+    const isSameOrigin =
+      logsUrl.startsWith('/') || logsUrl.startsWith(apiOrigin);
+    const archiveUrl = isSameOrigin
+      ? `/api/v1/superuser/${buildUuid}/logs/archive`
+      : logsUrl;
+    const archived = await fetchArchivedBuildLogs(archiveUrl);
+    logs = archived.logs || [];
+  }
+
+  return {
+    ...buildResponse.data,
+    logs,
+  };
+}

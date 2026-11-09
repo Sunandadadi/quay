@@ -80,3 +80,13 @@ export const childManifestSizeState = atomFamily({
   key: 'childManifestDigest',
   default: null,
 });
+
+export const showSignaturesState = atom({
+  key: 'showSignaturesState',
+  default: false,
+});
+
+export const expandedViewState = atom({
+  key: 'expandedViewState',
+  default: false,
+});

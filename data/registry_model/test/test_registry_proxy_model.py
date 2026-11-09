@@ -1,4 +1,6 @@
 import json
+import os
+import random
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
@@ -9,13 +11,17 @@ from app import storage
 from data.database import (
     ImageStorage,
     ImageStorageLocation,
+    ImageStoragePlacement,
     Manifest,
     ManifestBlob,
     ManifestChild,
+    MediaType,
     Tag,
+    db_transaction,
     get_epoch_timestamp_ms,
 )
 from data.model import (
+    ImmutableTagException,
     QuotaExceededException,
     TagDoesNotExist,
     namespacequota,
@@ -31,15 +37,24 @@ from data.model.storage import get_layer_path
 from data.model.user import get_user
 from data.registry_model import registry_model
 from data.registry_model.datatypes import Manifest as ManifestType
-from data.registry_model.registry_proxy_model import ProxyModel
+from data.registry_model.registry_proxy_model import (
+    ProxyModel,
+    get_proxy_cache_config_for_org,
+)
 from data.registry_model.test import testdata
 from digest.digest_tools import sha256_digest
 from image.docker.schema1 import DOCKER_SCHEMA1_MANIFEST_CONTENT_TYPE
 from image.docker.schema2 import (
+    DOCKER_SCHEMA2_CONFIG_CONTENT_TYPE,
+    DOCKER_SCHEMA2_LAYER_CONTENT_TYPE,
     DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
     DOCKER_SCHEMA2_MANIFESTLIST_CONTENT_TYPE,
 )
-from image.docker.schema2.manifest import DockerSchema2ManifestBuilder
+from image.docker.schema2.manifest import (
+    DockerSchema2Manifest,
+    DockerSchema2ManifestBuilder,
+)
+from image.docker.schema2.test.test_config import CONFIG_DIGEST, CONFIG_SIZE
 from image.shared import ManifestException
 from image.shared.schemas import parse_manifest_from_bytes
 from proxy.fixtures import proxy_manifest_response  # noqa: F401,F403
@@ -93,6 +108,13 @@ UBI8_8_4_MANIFEST_SCHEMA2 = r"""{
 }"""
 
 
+def _get_digest(content_bytes):
+    """
+    Helper function that creates blobs with proper digests
+    """
+    return sha256_digest(content_bytes)
+
+
 @pytest.fixture
 def create_repo():
     def _create_repo(orgname, reponame, user):
@@ -124,11 +146,12 @@ def test_registry_proxy_model_init_only_query_db_once(initialized_db):
         )
 
 
+@pytest.mark.xdist_group("registry_proxy_serial")
 class TestLookUpRepositoryWithRepoCreationVisibilityFlag:
     orgname = "quayio-cache"
-    upstream_repository = "app-sre/ubi8-ubi"
-    upstream_registry = "quay.io"
-    tag = "8.4"
+    upstream_repository = "library/nginx"
+    upstream_registry = "docker.io"
+    tag = "latest"
 
     @pytest.fixture(autouse=True)
     def setup(self, app):
@@ -167,6 +190,7 @@ class TestLookUpRepositoryWithRepoCreationVisibilityFlag:
             assert repo_ref.is_public is True
 
 
+@pytest.mark.xdist_group("registry_proxy_serial")
 class TestRegistryProxyModelGetSchema1ParsedManifest:
     upstream_registry = "quay.io"
     upstream_repository = "app-sre/ubi8-ubi"
@@ -257,6 +281,7 @@ class TestRegistryProxyModelGetSchema1ParsedManifest:
             )
 
 
+@pytest.mark.xdist_group("registry_proxy_serial")
 class TestRegistryProxyModelCreateManifestAndRetargetTag:
     upstream_registry = "quay.io"
     upstream_repository = "app-sre/ubi8-ubi"
@@ -319,6 +344,110 @@ class TestRegistryProxyModelCreateManifestAndRetargetTag:
         assert manifest.internal_manifest_bytes.as_unicode() == UBI8_8_4_MANIFEST_SCHEMA2
         assert manifest.digest == UBI8_8_4_DIGEST
         assert manifest.id == first_manifest.id
+
+    @patch("data.registry_model.registry_proxy_model.proxy_cache_blob_queue.put")
+    @patch.object(ProxyModel, "_create_blob")
+    def test__create_placeholder_blobs_direct(self, mock_create_blob, mock_queue_put, create_repo):
+        # Configure mock to return (blob, newly_created) tuple
+        mock_blob = MagicMock()
+        mock_blob.id = 123
+        mock_blob.image_size = 1000
+        mock_create_blob.return_value = (mock_blob, True)
+
+        repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
+        input_manifest = parse_manifest_from_bytes(
+            Bytes.for_string_or_unicode(UBI8_8_4_MANIFEST_SCHEMA2),
+            DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+        )
+        proxy_model = ProxyModel(
+            self.orgname,
+            self.upstream_repository,
+            self.user,
+        )
+        manifest_id = 123
+        repo_id = repo_ref.id
+        username = self.user.username
+        orgname = self.orgname
+        # Call the private method directly
+        proxy_model._create_placeholder_blobs(input_manifest, manifest_id, repo_id)
+
+        # Should call _create_blob for config and each layer
+        expected_blob_calls = 1 + len(input_manifest.manifest_dict["layers"])
+        assert mock_create_blob.call_count == expected_blob_calls
+        # Should call queue.put for each layer
+        assert mock_queue_put.call_count == len(input_manifest.manifest_dict["layers"])
+        # Check that the digests match what is expected
+        expected_digests = [layer["digest"] for layer in input_manifest.manifest_dict["layers"]]
+        expected_digests.append(input_manifest.config.digest)
+        actual_digests = [call.args[0] for call in mock_create_blob.call_args_list]
+
+        # Check the payloads sent to the queue for each layer
+        for i, layer in enumerate(input_manifest.manifest_dict["layers"]):
+            args, kwargs = mock_queue_put.call_args_list[i]
+            # First arg is a list: [username, repo_id, layer_digest]
+            assert args[0] == [self.orgname, str(repo_id), str(layer["digest"])]
+            # Second arg is a JSON string with the payload
+            payload = json.loads(args[1])
+            assert payload == {
+                "digest": str(layer["digest"]),
+                "repo_id": repo_id,
+                "username": username,
+                "namespace": orgname,
+            }
+            # available_after should be 0
+            assert kwargs["available_after"] == 0
+
+    @patch("data.registry_model.registry_proxy_model.proxy_cache_blob_queue.put")
+    @patch.object(ProxyModel, "_create_blob")
+    def test__create_placeholder_blobs_with_none_user(
+        self, mock_create_blob, mock_queue_put, create_repo
+    ):
+        """Test that _create_placeholder_blobs handles None user for public repositories (PROJQUAY-9346)"""
+        # Configure mock to return (blob, newly_created) tuple
+        mock_blob = MagicMock()
+        mock_blob.id = 123
+        mock_blob.image_size = 1000
+        mock_create_blob.return_value = (mock_blob, True)
+
+        repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
+        input_manifest = parse_manifest_from_bytes(
+            Bytes.for_string_or_unicode(UBI8_8_4_MANIFEST_SCHEMA2),
+            DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+        )
+        # Create ProxyModel with None user (simulates public repository access)
+        proxy_model = ProxyModel(
+            self.orgname,
+            self.upstream_repository,
+            None,  # This is the key test - None user
+        )
+        manifest_id = 123
+        repo_id = repo_ref.id
+        orgname = self.orgname
+
+        # Call the private method directly - this should not fail with AttributeError
+        proxy_model._create_placeholder_blobs(input_manifest, manifest_id, repo_id)
+
+        # Should call _create_blob for config and each layer
+        expected_blob_calls = 1 + len(input_manifest.manifest_dict["layers"])
+        assert mock_create_blob.call_count == expected_blob_calls
+        # Should call queue.put for each layer
+        assert mock_queue_put.call_count == len(input_manifest.manifest_dict["layers"])
+
+        # Check the payloads sent to the queue for each layer - username should be None
+        for i, layer in enumerate(input_manifest.manifest_dict["layers"]):
+            args, kwargs = mock_queue_put.call_args_list[i]
+            # First arg is a list: [namespace, repo_id, layer_digest]
+            assert args[0] == [self.orgname, str(repo_id), str(layer["digest"])]
+            # Second arg is a JSON string with the payload
+            payload = json.loads(args[1])
+            assert payload == {
+                "digest": str(layer["digest"]),
+                "repo_id": repo_id,
+                "username": None,  # This should be None for public repositories
+                "namespace": orgname,
+            }
+            # available_after should be 0
+            assert kwargs["available_after"] == 0
 
     @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
     def test_create_placeholder_blobs_for_new_manifest(self, create_repo):
@@ -394,6 +523,78 @@ class TestRegistryProxyModelCreateManifestAndRetargetTag:
         assert expected_count == created_count
 
     @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_accept_proxying_of_manifests_which_contain_duplicate_identical_child_manifests(
+        self, create_repo
+    ):
+        """
+        Verifies that a manifest with multiple identical child manifests (allowed per OCI spec) are properly stored
+        in the database and no longer throw a unique constraint error.
+        """
+        repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
+
+        # create child manifest, we're using UBI manifest
+        ubi_image = parse_manifest_from_bytes(
+            Bytes.for_string_or_unicode(testdata.UBI8_LINUX_AMD64["manifest"]),
+            testdata.UBI8_LINUX_AMD64["content-type"],
+            sparse_manifest_support=True,
+        )
+
+        # create needed manifests
+        oci_manifest = {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {
+                    "mediaType": testdata.UBI8_LINUX_AMD64["content-type"],
+                    "digest": ubi_image.digest,
+                    "size": len(testdata.UBI8_LINUX_AMD64["manifest"]),
+                    "platform": {
+                        "architecture": "amd64",
+                        "os": "linux",
+                    },
+                },
+                {
+                    "mediaType": testdata.UBI8_LINUX_AMD64["content-type"],
+                    "digest": ubi_image.digest,
+                    "size": len(testdata.UBI8_LINUX_AMD64["manifest"]),
+                    "platform": {
+                        "architecture": "amd64",
+                        "os": "linux",
+                    },
+                },
+            ],
+        }
+
+        oci_manifest_bytes = parse_manifest_from_bytes(
+            Bytes.for_string_or_unicode(json.dumps(oci_manifest)),
+            "application/vnd.oci.image.index.v1+json",
+            sparse_manifest_support=True,
+        )
+
+        proxy_model = ProxyModel(
+            self.orgname,
+            self.upstream_registry,
+            self.user,
+        )
+
+        child_manifest, _ = proxy_model._create_manifest_with_temp_tag(repo_ref, ubi_image)
+
+        assert child_manifest
+
+        # create the OCI image index
+        index, _ = proxy_model._create_manifest_and_retarget_tag(
+            repo_ref, oci_manifest_bytes, self.tag
+        )
+
+        assert index
+
+        manifest_children = ManifestChild.select(ManifestChild.child_manifest_id).where(
+            ManifestChild.manifest == index.id
+        )
+
+        assert manifest_children.count() == 1
+
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
     def test_create_temp_tags_for_newly_created_sub_manifests_on_manifest_list(self, create_repo):
         repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
         input_manifest = parse_manifest_from_bytes(
@@ -420,6 +621,73 @@ class TestRegistryProxyModelCreateManifestAndRetargetTag:
         assert all(
             [t.name != self.tag for t in tags]
         ), "sub manifest tags must have temp tag name, not parent manifest name"
+
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_lookup_manifest_with_allow_hidden_and_allow_dead_in_create_manifest_with_temp_tag(
+        self, create_repo
+    ):
+        """
+        Test that _create_manifest_with_temp_tag calls oci.manifest.lookup_manifest
+        with allow_hidden=True, allow_dead=True when looking up child manifests.
+
+        This test specifically covers the change on line 586 where
+        oci.manifest.lookup_manifest is called with these specific parameters.
+        """
+        repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
+        input_manifest = parse_manifest_from_bytes(
+            Bytes.for_string_or_unicode(testdata.UBI8_LATEST["manifest"]),
+            testdata.UBI8_LATEST["content-type"],
+            sparse_manifest_support=True,
+        )
+        proxy_model = ProxyModel(
+            self.orgname,
+            self.upstream_repository,
+            self.user,
+        )
+
+        # Mock oci.manifest.lookup_manifest to verify it's called with correct parameters
+        with patch(
+            "data.registry_model.registry_proxy_model.oci.manifest.lookup_manifest"
+        ) as mock_lookup:
+            # Mock the lookup to return None (simulating manifest not found)
+            mock_lookup.return_value = None
+
+            # Mock oci.tag.create_temporary_tag_if_necessary
+            with patch(
+                "data.registry_model.registry_proxy_model.oci.tag.create_temporary_tag_if_necessary"
+            ) as mock_create_tag:
+                mock_tag = MagicMock()
+                mock_create_tag.return_value = mock_tag
+
+                # Mock oci.manifest.connect_manifests
+                with patch(
+                    "data.registry_model.registry_proxy_model.oci.manifest.connect_manifests"
+                ):
+                    manifest, tag = proxy_model._create_manifest_with_temp_tag(
+                        repo_ref, input_manifest
+                    )
+
+                    # Verify that lookup_manifest was called with allow_hidden=True, allow_dead=True
+                    # for each child manifest in the manifest list
+                    expected_calls = []
+                    for child in input_manifest.child_manifests(content_retriever=None):
+                        expected_calls.append(
+                            (
+                                (repo_ref.id, child.digest),
+                                {"allow_hidden": True, "allow_dead": True},
+                            )
+                        )
+
+                    # Check that lookup_manifest was called the expected number of times
+                    assert mock_lookup.call_count == len(expected_calls)
+
+                    # Verify each call had the correct parameters
+                    for i, call in enumerate(mock_lookup.call_args_list):
+                        args, kwargs = call
+                        assert args[0] == repo_ref.id  # repository_id
+                        assert args[1] == expected_calls[i][0][1]  # child.digest
+                        assert kwargs["allow_hidden"] is True
+                        assert kwargs["allow_dead"] is True
 
     @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
     def test_connect_existing_manifest_to_manifest_list(self, create_repo):
@@ -455,7 +723,341 @@ class TestRegistryProxyModelCreateManifestAndRetargetTag:
         )
         assert conn_count == 1
 
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_retarget_tag_returns_existing_immutable_tag(self, create_repo):
+        """
+        Test that when retarget_tag raises ImmutableTagException for an immutable tag,
+        the proxy model returns the existing immutable tag instead of failing.
+        """
+        repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
+        input_manifest = parse_manifest_from_bytes(
+            Bytes.for_string_or_unicode(UBI8_8_4_MANIFEST_SCHEMA2),
+            DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+        )
+        proxy_model = ProxyModel(
+            self.orgname,
+            self.upstream_repository,
+            self.user,
+        )
 
+        # First create the manifest and tag normally
+        manifest, tag = proxy_model._create_manifest_and_retarget_tag(
+            repo_ref, input_manifest, self.tag
+        )
+        assert manifest is not None
+        assert tag is not None
+
+        # Make the tag immutable
+        db_tag = oci.tag.get_tag(repo_ref.id, self.tag)
+        Tag.update(immutable=True).where(Tag.id == db_tag.id).execute()
+        # Refetch to get updated immutable flag
+        db_tag_immutable = oci.tag.get_tag(repo_ref.id, self.tag)
+        assert db_tag_immutable.immutable is True
+
+        # Now try to retarget the same tag with a different manifest - should return existing
+        # Since the tag is immutable, it should catch the exception and return existing
+        with patch(
+            "data.registry_model.registry_proxy_model.oci.tag.retarget_tag",
+            side_effect=ImmutableTagException(self.tag, "retarget", repo_ref.id),
+        ):
+            # Mock get_tag to return the immutable tag
+            with patch(
+                "data.registry_model.registry_proxy_model.oci.tag.get_tag",
+                return_value=db_tag_immutable,
+            ):
+                manifest2, tag2 = proxy_model._create_manifest_and_retarget_tag(
+                    repo_ref, input_manifest, self.tag
+                )
+                assert manifest2 is not None
+                assert tag2 is not None
+                # The returned tag should be the existing immutable tag
+                assert tag2.name == self.tag
+
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_retarget_tag_raises_if_not_immutable(self, create_repo):
+        """
+        Test that when retarget_tag raises ImmutableTagException but the existing tag
+        is not actually immutable, the exception is re-raised.
+        """
+        repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
+        input_manifest = parse_manifest_from_bytes(
+            Bytes.for_string_or_unicode(UBI8_8_4_MANIFEST_SCHEMA2),
+            DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+        )
+        proxy_model = ProxyModel(
+            self.orgname,
+            self.upstream_repository,
+            self.user,
+        )
+
+        # First create the manifest and tag normally
+        manifest, tag = proxy_model._create_manifest_and_retarget_tag(
+            repo_ref, input_manifest, self.tag
+        )
+        assert manifest is not None
+        assert tag is not None
+
+        db_tag = oci.tag.get_tag(repo_ref.id, self.tag)
+        # Keep tag mutable (immutable=False)
+
+        # Now try to retarget - if exception is raised but tag is not immutable, should re-raise
+        with patch(
+            "data.registry_model.registry_proxy_model.oci.tag.retarget_tag",
+            side_effect=ImmutableTagException(self.tag, "retarget", repo_ref.id),
+        ):
+            with patch(
+                "data.registry_model.registry_proxy_model.oci.tag.get_tag",
+                return_value=db_tag,
+            ):
+                with pytest.raises(ImmutableTagException):
+                    proxy_model._create_manifest_and_retarget_tag(
+                        repo_ref, input_manifest, self.tag
+                    )
+
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_exception_cleanup_only_deletes_newly_created_blobs(self, create_repo):
+        """
+        Verify that exception cleanup only deletes ManifestBlob rows created in the current
+        attempt, preserving pre-existing blob references.
+        """
+        repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
+        # Initial manifest
+        ubi8_4_image = parse_manifest_from_bytes(
+            Bytes.for_string_or_unicode(UBI8_8_4_MANIFEST_SCHEMA2),
+            DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+        )
+
+        proxy_model = ProxyModel(
+            self.orgname,
+            self.upstream_repository,
+            self.user,
+        )
+
+        # First, create a manifest successfully to establish pre-existing blobs
+        initial_manifest, _ = proxy_model._create_manifest_with_temp_tag(repo_ref, ubi8_4_image)
+        assert initial_manifest is not None
+
+        # Count pre-existing ManifestBlob rows
+        pre_existing_blobs = list(
+            ManifestBlob.select().where(ManifestBlob.manifest == initial_manifest.id)
+        )
+        pre_existing_count = len(pre_existing_blobs)
+        assert pre_existing_count > 0  # Should have blobs from first manifest
+
+        # Now create a second manifest that will share some blobs and add new ones.
+        layer_bytes = random.randbytes(2048)
+        layer_bytes_digest = _get_digest(layer_bytes)
+        config_layer = {
+            "architecture": "amd64",
+            "os": "linux",
+            "rootfs": {
+                "type": "layers",
+                "diff_ids": [
+                    str(ubi8_4_image.filesystem_layers[0].digest),
+                    str(ubi8_4_image.filesystem_layers[1].digest),
+                    layer_bytes_digest,
+                ],
+            },
+        }
+
+        config_json_str = json.dumps(config_layer)
+        config_bytes = Bytes.for_string_or_unicode(config_json_str)
+        config_digest = _get_digest(config_bytes.as_encoded_str())
+
+        test_manifest = {
+            "schemaVersion": 2,
+            "mediaType": DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+            "config": {
+                "mediaType": DOCKER_SCHEMA2_CONFIG_CONTENT_TYPE,
+                "size": len(config_json_str),
+                "digest": config_digest,
+            },
+            "layers": [
+                {
+                    "mediaType": DOCKER_SCHEMA2_LAYER_CONTENT_TYPE,
+                    "size": ubi8_4_image.filesystem_layers[0].compressed_size,
+                    "digest": str(ubi8_4_image.filesystem_layers[0].digest),
+                },
+                {
+                    "mediaType": DOCKER_SCHEMA2_LAYER_CONTENT_TYPE,
+                    "size": ubi8_4_image.filesystem_layers[1].compressed_size,
+                    "digest": str(ubi8_4_image.filesystem_layers[1].digest),
+                },
+                # New layer added
+                {
+                    "mediaType": DOCKER_SCHEMA2_LAYER_CONTENT_TYPE,
+                    "size": len(layer_bytes),
+                    "digest": layer_bytes_digest,
+                },
+            ],
+        }
+
+        second_manifest = parse_manifest_from_bytes(
+            Bytes.for_string_or_unicode(json.dumps(test_manifest)),
+            DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+        )
+
+        # We'll force an exception after placeholder blobs are created
+        with patch(
+            "data.registry_model.registry_proxy_model.oci.tag.retarget_tag",
+            side_effect=Exception("Simulated failure during tag operation"),
+        ):
+            with pytest.raises(Exception, match="Simulated failure"):
+                proxy_model._create_manifest_and_retarget_tag(repo_ref, second_manifest, self.tag)
+
+        # Verify pre-existing ManifestBlob rows are still intact
+        remaining_blobs = list(
+            ManifestBlob.select().where(ManifestBlob.manifest == initial_manifest.id)
+        )
+        assert (
+            len(remaining_blobs) == pre_existing_count
+        ), "Pre-existing ManifestBlob rows should not be deleted during cleanup"
+
+        # Verify the blobs are the same ones
+        remaining_blob_ids = {b.blob_id for b in remaining_blobs}
+        original_blob_ids = {b.blob_id for b in pre_existing_blobs}
+        assert (
+            remaining_blob_ids == original_blob_ids
+        ), "Exact same blob references should remain after cleanup"
+
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_exception_triggers_quota_rollback(self, create_repo):
+        """
+        Verify that when an exception occurs during manifest creation, quota is rolled back
+        for the blobs that were added.
+        """
+        repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
+        input_manifest = parse_manifest_from_bytes(
+            Bytes.for_string_or_unicode(UBI8_8_4_MANIFEST_SCHEMA2),
+            DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+        )
+        proxy_model = ProxyModel(
+            self.orgname,
+            self.upstream_repository,
+            self.user,
+        )
+
+        # Track quota updates by patching update_quota
+        quota_calls = []
+
+        def track_quota(repo_id, manifest_id, blob_sizes, operation):
+            quota_calls.append(
+                {"repo_id": repo_id, "manifest_id": manifest_id, "operation": operation}
+            )
+
+        with patch(
+            "data.registry_model.registry_proxy_model.update_quota", side_effect=track_quota
+        ):
+            # Force exception after blobs are created but before tag completes
+            with patch(
+                "data.registry_model.registry_proxy_model.oci.tag.create_temporary_tag_if_necessary",
+                side_effect=Exception("Simulated failure during tag creation"),
+            ):
+                with pytest.raises(Exception, match="Simulated failure"):
+                    proxy_model._create_manifest_with_temp_tag(repo_ref, input_manifest)
+
+        # Verify quota was called with both ADD and SUBTRACT operations
+        add_calls = [c for c in quota_calls if c["operation"].value == "add"]
+        subtract_calls = [c for c in quota_calls if c["operation"].value == "subtract"]
+
+        assert len(add_calls) > 0, "Should have ADD quota calls for created blobs"
+        assert (
+            len(subtract_calls) == 1
+        ), "Should have exactly one SUBTRACT quota call for rollback (batched)"
+        # SUBTRACT should be the last call (after all ADDs)
+        assert quota_calls[-1] in subtract_calls, "SUBTRACT should be the final operation"
+
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_exception_with_manifest_list_no_blob_cleanup(self, create_repo):
+        """
+        Verify that when an exception occurs with a manifest list (which doesn't create blobs),
+        no blob cleanup is attempted.
+        """
+        repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
+
+        # First create the child manifests that the list will reference
+        child_manifest = parse_manifest_from_bytes(
+            Bytes.for_string_or_unicode(UBI8_8_4_MANIFEST_SCHEMA2),
+            DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+        )
+        proxy_model = ProxyModel(
+            self.orgname,
+            self.upstream_repository,
+            self.user,
+        )
+        proxy_model._create_manifest_with_temp_tag(repo_ref, child_manifest)
+
+        # Now create a manifest list
+        input_list = parse_manifest_from_bytes(
+            Bytes.for_string_or_unicode(testdata.UBI8_LATEST["manifest"]),
+            testdata.UBI8_LATEST["content-type"],
+            sparse_manifest_support=True,
+        )
+
+        # Mock ManifestBlob.delete() to track if cleanup is attempted
+        original_delete = ManifestBlob.delete
+
+        def track_delete():
+            # This should not be called for manifest lists since no blobs are created
+            raise AssertionError("ManifestBlob.delete() should not be called for manifest lists")
+
+        with patch.object(ManifestBlob, "delete", side_effect=track_delete):
+            # Force exception during tag operation (after manifest list is created)
+            with patch(
+                "data.registry_model.registry_proxy_model.oci.tag.create_temporary_tag_if_necessary",
+                side_effect=Exception("Simulated failure during tag creation"),
+            ):
+                with pytest.raises(Exception, match="Simulated failure"):
+                    proxy_model._create_manifest_with_temp_tag(repo_ref, input_list)
+
+        # If we get here without AssertionError, it means delete() was not called
+        # which is correct behavior for manifest lists (created_blobs is empty)
+
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_exception_before_blob_creation_no_cleanup(self, create_repo):
+        """
+        Verify that when an exception occurs before any blobs are created,
+        no cleanup is attempted.
+        """
+        repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
+        input_manifest = parse_manifest_from_bytes(
+            Bytes.for_string_or_unicode(UBI8_8_4_MANIFEST_SCHEMA2),
+            DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE,
+        )
+        proxy_model = ProxyModel(
+            self.orgname,
+            self.upstream_repository,
+            self.user,
+        )
+
+        # Mock _create_placeholder_blobs to fail before creating any blobs
+        with patch.object(
+            proxy_model,
+            "_create_placeholder_blobs",
+            side_effect=Exception("Simulated failure before blob creation"),
+        ):
+            # Mock ManifestBlob.delete() to ensure cleanup is not attempted
+            delete_called = {"called": False}
+
+            original_delete = ManifestBlob.delete
+
+            def track_delete():
+                delete_called["called"] = True
+                return original_delete()
+
+            with patch.object(ManifestBlob, "delete", side_effect=track_delete):
+                with pytest.raises(Exception, match="Simulated failure before blob creation"):
+                    proxy_model._create_manifest_and_retarget_tag(
+                        repo_ref, input_manifest, self.tag
+                    )
+
+        # Verify delete was not called since created_blobs is empty
+        assert not delete_called[
+            "called"
+        ], "ManifestBlob.delete() should not be called when no blobs were created"
+
+
+@pytest.mark.xdist_group("registry_proxy_serial")
 class TestRegistryProxyModelLookupManifestByDigest:
     upstream_registry = "quay.io"
     upstream_repository = "app-sre/ubi8-ubi"
@@ -977,6 +1579,7 @@ class TestRegistryProxyModelLookupManifestByDigest:
         assert tag.lifetime_end_ms == first_tag.lifetime_end_ms
 
 
+@pytest.mark.xdist_group("registry_proxy_serial")
 class TestRegistryProxyModelGetRepoTag:
     upstream_registry = "quay.io"  # alternatively, use quay.io/someorg
     upstream_repository = "app-sre/ubi8-ubi"
@@ -1247,6 +1850,78 @@ class TestRegistryProxyModelGetRepoTag:
         assert tag is not None
         assert tag.lifetime_end_ms == first_tag.lifetime_end_ms
 
+    def test_missing_layers_in_proxy_cache(self, proxy_manifest_response):
+        """
+        Test to verify that layers are missing in proxy cache when they exist locally
+        but were not explicitly requested by the client.
+
+        Note: this is not an expected behavior. The fix is expected with (PROJQUAY-8440)
+        """
+        proxy_mock = proxy_manifest_response(
+            UBI8_8_4_DIGEST, UBI8_8_4_MANIFEST_SCHEMA2, DOCKER_SCHEMA2_MANIFEST_CONTENT_TYPE
+        )
+
+        with patch(
+            "data.registry_model.registry_proxy_model.Proxy", MagicMock(return_value=proxy_mock)
+        ):
+            proxy_model = ProxyModel(
+                self.orgname,
+                self.upstream_repository,
+                self.user,
+            )
+
+            manifest = DockerSchema2Manifest(
+                Bytes.for_string_or_unicode(self.create_manifest_with_valid_layers())
+            )
+
+        assert manifest is not None
+        assert len(manifest.filesystem_layers) == 4
+        missing_layers = []
+        for layer in manifest.filesystem_layers:
+            exists = (
+                ImageStorage.select().where(ImageStorage.content_checksum == layer.digest).exists()
+            )
+            if not exists:
+                missing_layers.append(layer.digest)
+
+        # Assert that we have missing layers
+        assert len(missing_layers) > 0
+
+    def create_manifest_with_valid_layers(self):
+        return json.dumps(
+            {
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "config": {
+                    "mediaType": "application/vnd.docker.container.image.v1+json",
+                    "size": CONFIG_SIZE,
+                    "digest": CONFIG_DIGEST,
+                },
+                "layers": [
+                    {
+                        "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                        "size": 1234,
+                        "digest": "sha256:ec4b8955958665577945c89419d1af06b5f7636b4ac3da7f12184802ad867736",
+                    },
+                    {
+                        "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                        "size": 32654,
+                        "digest": "sha256:e692418e4cbaf90ca69d05a66403747baa33ee08806650b51fab815ad7fc331f",
+                    },
+                    {
+                        "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                        "size": 16724,
+                        "digest": "sha256:3c3a4604a545cdc127456d94e421cd355bca5b528f4a9c1905b15da2eb4a4c6b",
+                    },
+                    {
+                        "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                        "size": 73109,
+                        "digest": "sha256:ec4b8955958665577945c89419d1af06b5f7636b4ac3da7f12184802ad867736",
+                    },
+                ],
+            }
+        ).encode("utf-8")
+
 
 class TestPruningLRUProxiedImagesToAllowBlobUpload:
     upstream_registry = "docker.io"
@@ -1355,3 +2030,277 @@ class TestPruningLRUProxiedImagesToAllowBlobUpload:
         assert proxy_model._check_image_upload_possible_or_prune(repo_ref, input_manifest) is None
         first_tag = oci.tag.get_tag(repo_ref.id, "8.4")
         assert first_tag is None
+
+
+@patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+@patch("data.registry_model.registry_proxy_model.get_proxy_cache_config_for_org")
+def test_proxy_cache_create_blob_uses_lock(mock_get_config, initialized_db):
+    """
+    Verifies that proxy cache uses the locking mechanism.
+    """
+    # mock proxy cache configuration
+    mock_config = MagicMock()
+    mock_config.upstream_registry = "quay.io"
+    mock_config.upstream_registry_namespace = None
+    mock_config.expiration_s = 3600
+    mock_get_config.return_value = mock_config
+
+    repo = create_repository("devtable", "proxy_lock_test", None)
+    assert repo is not None
+    media_type, _ = MediaType.get_or_create(name="application/vnd.oci.image.manifest.v1+json")
+
+    blob_content = random.randbytes(1024)
+    blob_digest = _get_digest(blob_content)
+
+    manifest_bytes = '{"schemaVersion": 2}'
+    manifest = Manifest.create(
+        repository=repo,
+        digest=_get_digest(manifest_bytes.encode("utf-8")),
+        manifest_bytes=manifest_bytes,
+        media_type=media_type,
+    )
+
+    # enable proxy mode
+    proxy_model = ProxyModel("devtable", "proxy_lock_test", None)
+
+    # call _create_blob
+    proxy_model._create_blob(
+        digest=blob_digest,
+        size=len(blob_content),
+        manifest_id=manifest.id,
+        repo_id=repo.id,
+    )
+
+    # verify that the blob was created
+    assert ImageStorage.select().where(ImageStorage.content_checksum == blob_digest).exists()
+    assert (
+        ManifestBlob.select()
+        .where(
+            ManifestBlob.manifest == manifest,
+            ManifestBlob.repository == repo,
+        )
+        .exists()
+    )
+
+
+@pytest.mark.xdist_group("registry_proxy_serial")
+@patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+class TestGetRepoBlobByDigestMissingFromStorage:
+    orgname = "quayio-cache"
+    upstream_repository = "app-sre/ubi8-ubi"
+    upstream_registry = "quay.io"
+
+    @pytest.fixture(autouse=True)
+    def setup(self, app, create_repo):
+        self.user = get_user("devtable")
+        self.org = create_organization(self.orgname, f"{self.orgname}@devtable.com", self.user)
+        self.org.save()
+        self.config = create_proxy_cache_config(
+            org_name=self.orgname,
+            upstream_registry=self.upstream_registry,
+            expiration_s=3600,
+        )
+        self.repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
+
+    def test_does_not_refetch_blob_present_in_storage(self):
+        """
+        When a blob has a placement record and the file exists in storage,
+        the proxy model should NOT re-download it.
+        """
+        content = b"test blob content that exists"
+        digest = str(sha256_digest(content))
+        blob = store_blob_record_and_temp_link(
+            self.orgname,
+            self.upstream_repository,
+            digest,
+            ImageStorageLocation.get(name="local_us"),
+            len(content),
+            120,
+        )
+        layer_path = get_layer_path(blob)
+        storage.put_content(["local_us"], layer_path, content)
+
+        manifest_bytes = json.dumps(
+            {
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "config": {
+                    "mediaType": "application/vnd.docker.container.image.v1+json",
+                    "size": len(content),
+                    "digest": digest,
+                },
+                "layers": [],
+            }
+        )
+        media_type, _ = MediaType.get_or_create(
+            name="application/vnd.docker.distribution.manifest.v2+json"
+        )
+        from data.database import Repository
+
+        repo = Repository.get(id=self.repo_ref.id)
+        manifest = Manifest.create(
+            repository=repo,
+            digest=_get_digest(manifest_bytes.encode("utf-8")),
+            manifest_bytes=manifest_bytes,
+            media_type=media_type,
+        )
+        ManifestBlob.create(
+            manifest=manifest,
+            repository=repo,
+            blob=blob,
+        )
+
+        assert storage.exists(["local_us"], layer_path)
+
+        proxy_model = ProxyModel(
+            self.orgname,
+            self.upstream_repository,
+            self.user,
+        )
+
+        with patch.object(proxy_model, "_download_blob") as mock_download:
+            result = proxy_model.get_repo_blob_by_digest(
+                self.repo_ref, digest, include_placements=True
+            )
+            mock_download.assert_not_called()
+            assert result is not None
+            assert result.digest == digest
+
+
+@pytest.mark.xdist_group("registry_proxy_serial")
+class TestGetUpstreamBlobProxyUrl:
+    orgname = "quayio-cache"
+    upstream_repository = "app-sre/ubi8-ubi"
+    upstream_registry = "quay.io"
+    digest = "sha256:" + "a" * 64
+
+    @pytest.fixture(autouse=True)
+    def setup(self, app, create_repo):
+        self.user = get_user("devtable")
+        self.org = create_organization(self.orgname, f"{self.orgname}@devtable.com", self.user)
+        self.org.save()
+        self.config = create_proxy_cache_config(
+            org_name=self.orgname,
+            upstream_registry=self.upstream_registry,
+            expiration_s=3600,
+        )
+        self.repo_ref = create_repo(self.orgname, self.upstream_repository, self.user)
+        self.proxy_model = ProxyModel(self.orgname, self.upstream_repository, self.user)
+
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_returns_none_when_upstream_proxy_is_none(self):
+        """
+        When the upstream proxy feature is disabled (upstream_proxy=None),
+        the method returns None so the caller can raise BlobUnknown.
+        """
+        result = self.proxy_model.get_upstream_blob_proxy_url(
+            self.orgname, self.upstream_repository, self.digest, None
+        )
+        assert result is None
+
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_returns_none_when_repo_does_not_exist(self):
+        """
+        When the requested repository does not exist locally,
+        the method returns None.
+        """
+        mock_upstream_proxy = MagicMock()
+        result = self.proxy_model.get_upstream_blob_proxy_url(
+            self.orgname, "nonexistent/repo", self.digest, mock_upstream_proxy
+        )
+        assert result is None
+
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_enqueues_background_download_on_cache_miss(self):
+        """
+        When no download job exists for the blob, a new job is enqueued.
+        """
+        mock_upstream_proxy = MagicMock()
+        mock_upstream_proxy.create_upstream_proxy_url.return_value = (
+            "https://quay.test/_upstream_proxy/token/..."
+        )
+
+        with (
+            patch.object(self.proxy_model, "_lookup_blob_by_digest", return_value=MagicMock()),
+            patch("data.registry_model.registry_proxy_model.proxy_cache_blob_queue") as mock_queue,
+        ):
+            mock_queue.alive.return_value = False
+            self.proxy_model.get_upstream_blob_proxy_url(
+                self.orgname, self.upstream_repository, self.digest, mock_upstream_proxy
+            )
+            assert mock_queue.put.call_count == 1
+
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_does_not_enqueue_duplicate_job_when_download_in_progress(self):
+        """
+        When a download job already exists in the queue for the blob,
+        no duplicate job is enqueued.
+        """
+        mock_upstream_proxy = MagicMock()
+        mock_upstream_proxy.create_upstream_proxy_url.return_value = (
+            "https://quay.test/_upstream_proxy/token/..."
+        )
+
+        with patch("data.registry_model.registry_proxy_model.proxy_cache_blob_queue") as mock_queue:
+            mock_queue.alive.return_value = True
+            self.proxy_model.get_upstream_blob_proxy_url(
+                self.orgname, self.upstream_repository, self.digest, mock_upstream_proxy
+            )
+            mock_queue.put.assert_not_called()
+
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_returns_upstream_proxy_url(self):
+        """
+        When the repo exists and upstream_proxy is set, the method returns
+        the URL produced by create_upstream_proxy_url.
+        """
+        expected_url = (
+            "https://quay.test/_upstream_proxy/token/https/quay.io/v2/app-sre/ubi8-ubi/blobs/"
+            + self.digest
+        )
+        mock_upstream_proxy = MagicMock()
+        mock_upstream_proxy.create_upstream_proxy_url.return_value = expected_url
+
+        with (
+            patch.object(self.proxy_model, "_lookup_blob_by_digest", return_value=MagicMock()),
+            patch("data.registry_model.registry_proxy_model.proxy_cache_blob_queue") as mock_queue,
+        ):
+            mock_queue.alive.return_value = False
+            result = self.proxy_model.get_upstream_blob_proxy_url(
+                self.orgname, self.upstream_repository, self.digest, mock_upstream_proxy
+            )
+
+        assert result == expected_url
+
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_returns_None_on_unknown_blobs(self):
+        """
+        Verifies that we get a None on blobs that do not exist and are not placeholder blobs.
+        """
+        mock_upstream_proxy = MagicMock()
+
+        result = self.proxy_model.get_upstream_blob_proxy_url(
+            self.orgname, self.upstream_repository, self.digest, mock_upstream_proxy
+        )
+
+        assert result is None
+
+    @patch("data.registry_model.registry_proxy_model.Proxy", MagicMock())
+    def test_do_not_enqueue_blobs_for_download_if_cache_worker_is_turned_off(self, app):
+        """
+        Verifies that we don't enqueue blobs for subsequent download unless
+        FEATURE_PROXY_CACHE_BLOB_DOWNLOAD is explicitly set to false.
+
+        to do: remove or refactor once FEATURE_PROXY_CACHE_BLOB_DOWNLOAD is removed as a flag.
+        """
+        mock_upstream_proxy = MagicMock()
+        mock_upstream_proxy.create_upstream_proxy_url.return_value = (
+            "https://quay.test/_upstream_proxy/token/..."
+        )
+
+        with patch("data.registry_model.registry_proxy_model.proxy_cache_blob_queue") as mock_queue:
+            with patch.dict(app.config, {"FEATURE_PROXY_CACHE_BLOB_DOWNLOAD": False}):
+                self.proxy_model.get_upstream_blob_proxy_url(
+                    self.orgname, self.upstream_repository, self.digest, mock_upstream_proxy
+                )
+                mock_queue.put.assert_not_called()

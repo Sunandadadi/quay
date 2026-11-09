@@ -1,13 +1,29 @@
 import json
 import logging
 import ssl
+from calendar import timegm
+from datetime import datetime
 
 from splunklib import client
+from splunklib.binding import AuthenticationError  # type: ignore[import]
 
 from data.logs_model.logs_producer import LogSendException
 from data.logs_model.logs_producer.interface import LogProducerInterface
+from data.model import config
+from data.model.log import ACTIONS_ALLOWED_WITHOUT_AUDIT_LOGGING
 
 logger = logging.getLogger(__name__)
+
+
+def _splunk_json_serialize(obj):
+    """
+    Custom JSON serializer for Splunk log entries.
+    Converts datetime objects to Unix epoch timestamps instead of
+    using str() which produces ambiguous ISO strings without timezone info.
+    """
+    if isinstance(obj, datetime):
+        return timegm(obj.utctimetuple())
+    return str(obj)
 
 
 class SplunkLogsProducer(LogProducerInterface):
@@ -25,6 +41,7 @@ class SplunkLogsProducer(LogProducerInterface):
         verify_ssl=True,
         index_prefix=None,
         ssl_ca_path=None,
+        **kwargs,  # Ignore extra config params (search_timeout, max_results, etc.)
     ):
         connect_args = {
             "host": host,
@@ -59,15 +76,25 @@ class SplunkLogsProducer(LogProducerInterface):
             self.index = service.indexes.create(index_prefix)
             logger.info("Created new splunk index %s", self.index)
         except ConnectionRefusedError as e:
-            raise Exception(
-                "Connection to Splunk refused, check if Splunk instance is available: %s" % e
-            )
+            strict_logging_disabled = config.app_config.get("ALLOW_WITHOUT_STRICT_LOGGING")
+            if strict_logging_disabled:
+                logger.exception("Unable to configure Splunk instance: %s", e)
+            else:
+                raise Exception(
+                    "Connection to Splunk refused, check if Splunk instance is available: %s" % e
+                )
+        except Exception as e:
+            strict_logging_disabled = config.app_config.get("ALLOW_WITHOUT_STRICT_LOGGING")
+            if strict_logging_disabled:
+                logger.exception("Unable to configure Splunk instance: %s", e)
+            else:
+                raise
 
     def send(self, log):
         try:
-            log_data = json.dumps(log, sort_keys=True, default=str, ensure_ascii=False).encode(
-                "utf-8"
-            )
+            log_data = json.dumps(
+                log, sort_keys=True, default=_splunk_json_serialize, ensure_ascii=False
+            ).encode("utf-8")
             self.index.submit(log_data, sourcetype="access_combined", host="quay")
         except Exception as e:
             logger.exception("SplunkLogsProducer exception sending log to Splunk: %s", e)

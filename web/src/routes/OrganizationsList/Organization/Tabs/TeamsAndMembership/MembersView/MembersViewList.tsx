@@ -3,7 +3,6 @@ import {Link, useSearchParams} from 'react-router-dom';
 import {
   Label,
   PageSection,
-  PageSectionVariants,
   PanelFooter,
   Popover,
   Spinner,
@@ -12,11 +11,10 @@ import {useEffect, useState} from 'react';
 import MembersViewToolbar from './MembersViewToolbar';
 import {useFetchMembers} from 'src/hooks/UseMembers';
 import {IMemberTeams, IMembers} from 'src/resources/MembersResource';
-import {useAlerts} from 'src/hooks/UseAlerts';
-import {AlertVariant} from 'src/atoms/AlertState';
+import {AlertVariant, useUI} from 'src/contexts/UIContext';
 import {getTeamMemberPath} from 'src/routes/NavigationPath';
 import {ToolbarPagination} from 'src/components/toolbar/ToolbarPagination';
-import Conditional from 'src/components/empty/Conditional';
+import {usePaginatedSortableTable} from '../../../../../../hooks/usePaginatedSortableTable';
 
 export const memberViewColumnNames = {
   username: 'User name',
@@ -26,22 +24,40 @@ export const memberViewColumnNames = {
 
 export default function MembersViewList(props: MembersViewListProps) {
   const {
-    filteredMembers,
-    paginatedMembers,
+    members: allMembers,
     loading,
     error,
-    page,
-    setPage,
-    perPage,
-    setPerPage,
     search,
     setSearch,
   } = useFetchMembers(props.organizationName);
 
+  const searchFilter =
+    search.query !== ''
+      ? (member: IMembers) =>
+          member.name.toLowerCase().includes(search.query.toLowerCase())
+      : undefined;
+
+  const {
+    paginatedData: paginatedMembers,
+    filteredData: filteredMembers,
+    getSortableSort,
+    paginationProps,
+  } = usePaginatedSortableTable(allMembers || [], {
+    columns: {
+      1: (item: IMembers) => item.name, // User name
+      2: (item: IMembers) =>
+        item.teams?.map((team) => team.name).join(', ') || '', // Teams (preserve original order for sorting)
+      3: (item: IMembers) => item.repositories?.length || 0, // Direct repository permissions count
+    },
+    filter: searchFilter,
+    initialPerPage: 20,
+    initialSort: {columnIndex: 1, direction: 'asc'}, // Default sort: User name ascending
+  });
+
   const [selectedMembers, setSelectedMembers] = useState<IMembers[]>([]);
   const [isPopoverOpen, setPopoverOpen] = useState(false);
   const [searchParams] = useSearchParams();
-  const {addAlert} = useAlerts();
+  const {addAlert} = useUI();
 
   useEffect(() => {
     if (error) {
@@ -138,17 +154,17 @@ export default function MembersViewList(props: MembersViewListProps) {
 
   return (
     <>
-      <PageSection variant={PageSectionVariants.light}>
+      <PageSection hasBodyWrapper={false}>
         <MembersViewToolbar
           selectedMembers={selectedMembers}
           deSelectAll={() => setSelectedMembers([])}
           allItems={filteredMembers}
           paginatedItems={paginatedMembers}
           onItemSelect={onSelectMember}
-          page={page}
-          setPage={setPage}
-          perPage={perPage}
-          setPerPage={setPerPage}
+          page={paginationProps.page}
+          setPage={paginationProps.setPage}
+          perPage={paginationProps.perPage}
+          setPerPage={paginationProps.setPerPage}
           search={search}
           setSearch={setSearch}
           searchOptions={[memberViewColumnNames.username]}
@@ -159,9 +175,13 @@ export default function MembersViewList(props: MembersViewListProps) {
           <Thead>
             <Tr>
               <Th />
-              <Th>{memberViewColumnNames.username}</Th>
-              <Th>{memberViewColumnNames.teams}</Th>
-              <Th>{memberViewColumnNames.directRepositoryPermissions}</Th>
+              <Th sort={getSortableSort(1)}>
+                {memberViewColumnNames.username}
+              </Th>
+              <Th sort={getSortableSort(2)}>{memberViewColumnNames.teams}</Th>
+              <Th sort={getSortableSort(3)}>
+                {memberViewColumnNames.directRepositoryPermissions}
+              </Th>
             </Tr>
           </Thead>
           <Tbody>
@@ -196,10 +216,10 @@ export default function MembersViewList(props: MembersViewListProps) {
         <PanelFooter>
           <ToolbarPagination
             itemsList={filteredMembers}
-            perPage={perPage}
-            page={page}
-            setPage={setPage}
-            setPerPage={setPerPage}
+            perPage={paginationProps.perPage}
+            page={paginationProps.page}
+            setPage={paginationProps.setPage}
+            setPerPage={paginationProps.setPerPage}
             bottom={true}
           />
         </PanelFooter>

@@ -1,9 +1,7 @@
 import {
   PageSection,
-  PageSectionVariants,
-  TextContent,
-  Text,
-  TextVariants,
+  Content,
+  ContentVariants,
   Spinner,
   Dropdown,
   MenuToggleElement,
@@ -25,9 +23,9 @@ import {BulkDeleteModalTemplate} from 'src/components/modals/BulkDeleteModalTemp
 import Conditional from 'src/components/empty/Conditional';
 import {BulkOperationError, addDisplayError} from 'src/resources/ErrorHandling';
 import RequestError from 'src/components/errors/RequestError';
-import {useAlerts} from 'src/hooks/UseAlerts';
-import {AlertVariant} from 'src/atoms/AlertState';
+import {AlertVariant, useUI} from 'src/contexts/UIContext';
 import ErrorModal from 'src/components/errors/ErrorModal';
+import {usePaginatedSortableTable} from '../../../../../hooks/usePaginatedSortableTable';
 
 export const permissionColumnNames = {
   repoCreatedBy: 'Repository Created By',
@@ -48,22 +46,38 @@ export default function DefaultPermissionsList(
     loading,
     errorLoadingPermissions,
     defaultPermissions,
-    paginatedPermissions,
-    filteredPermissions,
-    page,
-    setPage,
-    perPage,
-    setPerPage,
     search,
     setSearch,
   } = useFetchDefaultPermissions(props.orgName);
+
+  const searchFilter =
+    search.query !== ''
+      ? (permission: IDefaultPermission) =>
+          permission.createdBy.includes(search.query)
+      : undefined;
+
+  const {
+    paginatedData: paginatedPermissions,
+    filteredData: filteredPermissions,
+    getSortableSort,
+    paginationProps,
+  } = usePaginatedSortableTable(defaultPermissions || [], {
+    columns: {
+      1: (item: IDefaultPermission) => item.createdBy, // Repository Created By
+      2: (item: IDefaultPermission) => item.appliedTo, // Permission Applied To
+      3: (item: IDefaultPermission) => item.permission, // Permission
+    },
+    filter: searchFilter,
+    initialPerPage: 20,
+    initialSort: {columnIndex: 1, direction: 'asc'}, // Default sort: Repository Created By ascending
+  });
 
   const [selectedPermissions, setSelectedPermissions] = useState<
     IDefaultPermission[]
   >([]);
   const [bulkDeleteModalIsOpen, setBulkDeleteModalIsOpen] = useState(false);
   const [err, setError] = useState<string[]>();
-  const {addAlert} = useAlerts();
+  const {addAlert} = useUI();
 
   const onSelectPermission = (
     permission: IDefaultPermission,
@@ -162,35 +176,35 @@ export default function DefaultPermissionsList(
 
   return (
     <>
-      <PageSection variant={PageSectionVariants.light}>
+      <PageSection hasBodyWrapper={false}>
         <ErrorModal
           title="Default permission deletion failed"
           error={err}
           setError={setError}
         />
-        <TextContent>
-          <Text component={TextVariants.p}>
+        <Content>
+          <Content component={ContentVariants.p}>
             The Default permissions panel defines permissions that should be
             granted automatically to a repository when it is created, in
             addition to the default of the repository&apos;s creator.
             Permissions are assigned based on the user who created the
             repository.
-          </Text>
-          <Text component={TextVariants.p}>
+          </Content>
+          <Content component={ContentVariants.p}>
             Note: Permissions added here do not automatically get added to
             existing repositories.
-          </Text>
-        </TextContent>
+          </Content>
+        </Content>
         <DefaultPermissionsToolbar
           selectedItems={selectedPermissions}
           deSelectAll={() => setSelectedPermissions([])}
           allItems={filteredPermissions}
           paginatedItems={paginatedPermissions}
           onItemSelect={onSelectPermission}
-          page={page}
-          setPage={setPage}
-          perPage={perPage}
-          setPerPage={setPerPage}
+          page={paginationProps.page}
+          setPage={paginationProps.setPage}
+          perPage={paginationProps.perPage}
+          setPerPage={paginationProps.setPerPage}
           search={search}
           setSearch={setSearch}
           searchOptions={[permissionColumnNames.repoCreatedBy]}
@@ -217,9 +231,15 @@ export default function DefaultPermissionsList(
             <Thead>
               <Tr>
                 <Th />
-                <Th>{permissionColumnNames.repoCreatedBy}</Th>
-                <Th>{permissionColumnNames.permAppliedTo}</Th>
-                <Th>{permissionColumnNames.permission}</Th>
+                <Th sort={getSortableSort(1)}>
+                  {permissionColumnNames.repoCreatedBy}
+                </Th>
+                <Th sort={getSortableSort(2)}>
+                  {permissionColumnNames.permAppliedTo}
+                </Th>
+                <Th sort={getSortableSort(3)}>
+                  {permissionColumnNames.permission}
+                </Th>
                 <Th />
               </Tr>
             </Thead>

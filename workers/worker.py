@@ -8,14 +8,49 @@ from functools import wraps
 from random import randint
 from threading import Event
 
+import sentry_sdk
 from apscheduler.schedulers.background import BackgroundScheduler
-from raven import Client
+from prometheus_client import Gauge, Histogram
+from sentry_sdk.integrations.flask import FlaskIntegration
+from sentry_sdk.integrations.logging import LoggingIntegration
+from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
+from sentry_sdk.integrations.stdlib import StdlibIntegration
 
+import features
 from app import app
 from data.database import UseThenDisconnect
 from util.log import logfile_path
+from util.saas.exceptionlog import _sentry_before_send_ignore_known
 
 logger = logging.getLogger(__name__)
+
+WORKER_DURATION_BUCKETS = (
+    60,
+    300,
+    600,
+    1800,
+    3600,
+    7200,
+    14400,
+    28800,
+    43200,
+    57600,
+    86400,
+    float("inf"),
+)
+
+worker_operation_duration = Histogram(
+    "quay_worker_operation_duration_seconds",
+    "Duration of worker operations in seconds",
+    labelnames=["worker", "operation"],
+    buckets=WORKER_DURATION_BUCKETS,
+)
+
+worker_operation_in_progress = Gauge(
+    "quay_worker_operation_in_progress",
+    "Whether a worker operation is currently running",
+    labelnames=["worker", "operation"],
+)
 
 
 def with_exponential_backoff(backoff_multiplier=10, max_backoff=3600, max_retries=10):
@@ -60,11 +95,48 @@ class Worker(object):
         self._operations = []
         self._stop = Event()
         self._terminated = Event()
-        self._raven_client = None
+
+        worker_name = "%s:worker-%s" % (socket.gethostname(), self.__class__.__name__)
 
         if app.config.get("EXCEPTION_LOG_TYPE", "FakeSentry") == "Sentry":
-            worker_name = "%s:worker-%s" % (socket.gethostname(), self.__class__.__name__)
-            self._raven_client = Client(app.config.get("SENTRY_DSN", ""), name=worker_name)
+            sentry_dsn = app.config.get("SENTRY_DSN", "")
+            if sentry_dsn:
+                try:
+                    integrations = []
+
+                    # Always include logging integration
+                    integrations.append(
+                        LoggingIntegration(level=logging.INFO, event_level=logging.ERROR)
+                    )
+
+                    # Only add Flask and SQLAlchemy integrations if OpenTelemetry is not enabled
+                    if not getattr(features, "OTEL_TRACING", False):
+                        integrations.extend(
+                            [
+                                FlaskIntegration(transaction_style="endpoint"),
+                                SqlalchemyIntegration(),
+                                StdlibIntegration(),
+                            ]
+                        )
+                    else:
+                        logger.info(
+                            "OpenTelemetry enabled - using minimal Sentry integrations for worker"
+                        )
+
+                    sentry_sdk.init(
+                        dsn=sentry_dsn,
+                        environment=app.config.get("SENTRY_ENVIRONMENT", "production"),
+                        traces_sample_rate=app.config.get("SENTRY_TRACES_SAMPLE_RATE", 0.1),
+                        profiles_sample_rate=app.config.get("SENTRY_PROFILES_SAMPLE_RATE", 0.1),
+                        sample_rate=app.config.get("SENTRY_SAMPLE_RATE", 0.1),
+                        integrations=integrations,
+                        default_integrations=False,
+                        auto_session_tracking=True,
+                        before_send=_sentry_before_send_ignore_known,
+                    )
+                    sentry_sdk.set_tag("worker", worker_name)
+                except Exception as e:
+                    logger.warning("Failed to initialize Sentry: %s", str(e))
 
     def is_healthy(self):
         return not self._stop.is_set()
@@ -79,16 +151,29 @@ class Worker(object):
         pass
 
     def add_operation(self, operation_func, operation_sec):
+        worker_name = self.__class__.__name__
+        operation_name = operation_func.__name__
+
+        duration_metric = worker_operation_duration.labels(
+            worker=worker_name, operation=operation_name
+        )
+        in_progress_metric = worker_operation_in_progress.labels(
+            worker=worker_name, operation=operation_name
+        )
+
         @wraps(operation_func)
         def _operation_func():
+            in_progress_metric.inc()
+            start = time.monotonic()
             try:
                 with UseThenDisconnect(app.config):
                     return operation_func()
             except Exception:
                 logger.exception("Operation raised exception")
-                if self._raven_client:
-                    logger.debug("Logging exception to Sentry")
-                    self._raven_client.captureException()
+                sentry_sdk.capture_exception()
+            finally:
+                duration_metric.observe(time.monotonic() - start)
+                in_progress_metric.dec()
 
         self._operations.append((_operation_func, operation_sec))
 
@@ -116,7 +201,8 @@ class Worker(object):
 
         self._sched.start()
         for operation_func, operation_sec in self._operations:
-            start_date = datetime.now() + timedelta(seconds=0.001)
+            # Allow time for app initialization before the first job run
+            start_date = datetime.now() + timedelta(seconds=5)
             if app.config.get("STAGGER_WORKERS"):
                 start_date += timedelta(seconds=randint(1, operation_sec))
             logger.debug("First run scheduled for %s", start_date)

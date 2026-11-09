@@ -14,14 +14,24 @@ from data.model.user import get_user
 from endpoints.api import api
 from endpoints.api.appspecifictokens import *
 from endpoints.api.billing import *
+from endpoints.api.bootstrap import BootstrapTokenRenew
 from endpoints.api.build import *
+from endpoints.api.capabilities import *
 from endpoints.api.discovery import *
 from endpoints.api.globalmessages import *  # type: ignore[no-redef]
+from endpoints.api.immutability_policy import *
 from endpoints.api.logs import *  # type: ignore[no-redef]
-from endpoints.api.manifest import *  # type: ignore[no-redef]
+from endpoints.api.manifest import *
 from endpoints.api.mirror import *  # type: ignore[no-redef]
+from endpoints.api.mirrorhealth import RepositoryMirrorHealth
+from endpoints.api.namespacenotification import *
 from endpoints.api.namespacequota import *
+from endpoints.api.org_mirror import *  # type: ignore[no-redef]
 from endpoints.api.organization import *  # type: ignore[assignment,no-redef]
+from endpoints.api.organization_application_tokens import (
+    OrganizationApplicationToken,
+    OrganizationApplicationTokens,
+)
 from endpoints.api.permission import *  # type: ignore[no-redef]
 from endpoints.api.policy import *
 from endpoints.api.prototype import *
@@ -30,6 +40,14 @@ from endpoints.api.repository import *  # type: ignore[no-redef]
 from endpoints.api.repositorynotification import *  # type: ignore
 from endpoints.api.repotoken import *
 from endpoints.api.robot import *  # type: ignore[no-redef]
+from endpoints.api.robot_application_tokens import (
+    OrganizationRobotMintableScopes,
+    OrganizationRobotToken,
+    OrganizationRobotTokens,
+    UserRobotMintableScopes,
+    UserRobotToken,
+    UserRobotTokens,
+)
 from endpoints.api.search import *  # type: ignore
 from endpoints.api.secscan import *
 from endpoints.api.signing import *  # type: ignore[no-redef]
@@ -37,7 +55,7 @@ from endpoints.api.subscribe import *  # type: ignore[no-redef]
 from endpoints.api.suconfig import *  # type: ignore[no-redef]
 from endpoints.api.superuser import *  # type: ignore
 from endpoints.api.tag import *  # type: ignore[no-redef]
-from endpoints.api.team import *
+from endpoints.api.team import *  # type: ignore[assignment]
 from endpoints.api.test.shared import conduct_api_call
 from endpoints.api.trigger import *
 from endpoints.api.user import *  # type: ignore[assignment,no-redef]
@@ -63,7 +81,27 @@ NOTIFICATION_PARAMS = {
 TOKEN_PARAMS = {"token_uuid": "someuuid"}
 TRIGGER_PARAMS = {"repository": "devtable/simple", "trigger_uuid": "someuuid"}
 MANIFEST_PARAMS = {"repository": "devtable/simple", "manifestref": "sha256:deadbeef"}
-EXPORTLOGS_PARAMS = {"callback_url": "http://foo"}
+TAG_PARAMS = {"repository": "devtable/simple", "tag": "latest"}
+EXPORTLOGS_PARAMS = {"callback_email": "test@example.com"}
+ORG_IMMUTABILITY_POLICY_PARAMS = {"orgname": "buynlarge", "policy_uuid": "someuuid"}
+REPO_IMMUTABILITY_POLICY_PARAMS = {"repository": "devtable/simple", "policy_uuid": "someuuid"}
+ORG_APPLICATION_TOKEN_PARAMS = {"orgname": "buynlarge", "client_id": "missing-client-id"}
+ORG_APPLICATION_TOKEN_UUID_PARAMS = {
+    "orgname": "buynlarge",
+    "client_id": "missing-client-id",
+    "token_uuid": "someuuid",
+}
+ORG_NS_NOTIFICATION_PARAMS = {"orgname": "buynlarge"}
+ORG_NS_NOTIFICATION_UUID_PARAMS = {"orgname": "buynlarge", "uuid": "someuuid"}
+USER_NS_NOTIFICATION_UUID_PARAMS = {"uuid": "someuuid"}
+USER_ROBOT_TOKEN_PARAMS = {"robot_shortname": "missingrobot"}
+USER_ROBOT_TOKEN_UUID_PARAMS = {"robot_shortname": "missingrobot", "token_uuid": "someuuid"}
+ORG_ROBOT_TOKEN_PARAMS = {"orgname": "buynlarge", "robot_shortname": "missingrobot"}
+ORG_ROBOT_TOKEN_UUID_PARAMS = {
+    "orgname": "buynlarge",
+    "robot_shortname": "missingrobot",
+    "token_uuid": "someuuid",
+}
 
 
 SECURITY_TESTS: List[
@@ -76,6 +114,8 @@ SECURITY_TESTS: List[
         int,  # Expected HTTP status code
     ]
 ] = [
+    (BootstrapTokenRenew, "POST", {}, {}, None, 401),
+    (BootstrapTokenRenew, "POST", {}, {}, "devtable", 401),
     (AppTokens, "GET", {}, {}, None, 401),
     (AppTokens, "GET", {}, {}, "freshuser", 200),
     (AppTokens, "GET", {}, {}, "reader", 200),
@@ -125,6 +165,18 @@ SECURITY_TESTS: List[
     (SuperUserRepositoryBuildLogs, "GET", BUILD_PARAMS, None, "reader", 403),
     (SuperUserRepositoryBuildLogs, "GET", BUILD_PARAMS, None, "devtable", 400),
     (SuperUserRepositoryBuildLogs, "GET", BUILD_PARAMS, None, "globalreadonlysuperuser", 400),
+    (SuperUserRepositoryBuildLogsArchive, "GET", BUILD_PARAMS, None, None, 401),
+    (SuperUserRepositoryBuildLogsArchive, "GET", BUILD_PARAMS, None, "freshuser", 403),
+    (SuperUserRepositoryBuildLogsArchive, "GET", BUILD_PARAMS, None, "reader", 403),
+    (SuperUserRepositoryBuildLogsArchive, "GET", BUILD_PARAMS, None, "devtable", 400),
+    (
+        SuperUserRepositoryBuildLogsArchive,
+        "GET",
+        BUILD_PARAMS,
+        None,
+        "globalreadonlysuperuser",
+        400,
+    ),
     (SuperUserRepositoryBuildStatus, "GET", BUILD_PARAMS, None, None, 401),
     (SuperUserRepositoryBuildStatus, "GET", BUILD_PARAMS, None, "freshuser", 403),
     (SuperUserRepositoryBuildStatus, "GET", BUILD_PARAMS, None, "reader", 403),
@@ -135,6 +187,11 @@ SECURITY_TESTS: List[
     (SuperUserRepositoryBuildResource, "GET", BUILD_PARAMS, None, "reader", 403),
     (SuperUserRepositoryBuildResource, "GET", BUILD_PARAMS, None, "devtable", 404),
     (SuperUserRepositoryBuildResource, "GET", BUILD_PARAMS, None, "globalreadonlysuperuser", 404),
+    (SuperUserDumpConfig, "GET", None, None, None, 401),
+    (SuperUserDumpConfig, "GET", None, None, "freshuser", 403),
+    (SuperUserDumpConfig, "GET", None, None, "reader", 403),
+    (SuperUserDumpConfig, "GET", None, None, "devtable", 403),
+    (SuperUserDumpConfig, "GET", None, None, "globalreadonlysuperuser", 403),
     (RepositorySignatures, "GET", REPO_PARAMS, {}, "freshuser", 403),
     (RepositorySignatures, "GET", REPO_PARAMS, {}, "reader", 403),
     (RepositorySignatures, "GET", REPO_PARAMS, {}, "devtable", 404),
@@ -196,7 +253,7 @@ SECURITY_TESTS: List[
         {"username": "A2O9", "repository": "public/publicrepo"},
         None,
         "devtable",
-        403,
+        404,
     ),
     (
         RepositoryUserTransitivePermission,
@@ -451,6 +508,10 @@ SECURITY_TESTS: List[
         "reader",
         201,
     ),
+    (RegistryCapabilities, "GET", None, None, None, 200),
+    (RegistryCapabilities, "GET", None, None, "devtable", 200),
+    (RegistryCapabilities, "GET", None, None, "freshuser", 200),
+    (RegistryCapabilities, "GET", None, None, "reader", 200),
     (DiscoveryResource, "GET", None, None, None, 200),
     (DiscoveryResource, "GET", None, None, "devtable", 200),
     (DiscoveryResource, "GET", None, None, "freshuser", 200),
@@ -719,7 +780,7 @@ SECURITY_TESTS: List[
         {"username": "A2O9", "repository": "public/publicrepo"},
         None,
         "devtable",
-        403,
+        400,
     ),
     (
         RepositoryUserPermission,
@@ -751,7 +812,7 @@ SECURITY_TESTS: List[
         {"username": "A2O9", "repository": "public/publicrepo"},
         None,
         "devtable",
-        403,
+        400,
     ),
     (
         RepositoryUserPermission,
@@ -791,7 +852,7 @@ SECURITY_TESTS: List[
         {"username": "A2O9", "repository": "public/publicrepo"},
         {"role": "read"},
         "devtable",
-        403,
+        400,
     ),
     (
         RepositoryUserPermission,
@@ -1015,7 +1076,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo", "teamname": "readers"},
         None,
         "devtable",
-        403,
+        400,
     ),
     (
         RepositoryTeamPermission,
@@ -1047,7 +1108,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo", "teamname": "readers"},
         None,
         "devtable",
-        403,
+        400,
     ),
     (
         RepositoryTeamPermission,
@@ -1079,7 +1140,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo", "teamname": "readers"},
         {"role": "read"},
         "devtable",
-        403,
+        400,
     ),
     (
         RepositoryTeamPermission,
@@ -1286,6 +1347,14 @@ SECURITY_TESTS: List[
         "PUT",
         {"repository": "buynlarge/orgrepo", "teamname": "readers"},
         {"role": "read"},
+        "globalreadonlysuperuser",
+        403,
+    ),
+    (
+        RepositoryTeamPermission,
+        "PUT",
+        {"repository": "buynlarge/orgrepo", "teamname": "readers"},
+        {"role": "read"},
         "freshuser",
         403,
     ),
@@ -1311,7 +1380,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo", "teamname": "owners"},
         None,
         "devtable",
-        403,
+        400,
     ),
     (
         RepositoryTeamPermission,
@@ -1343,7 +1412,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo", "teamname": "owners"},
         None,
         "devtable",
-        403,
+        400,
     ),
     (
         RepositoryTeamPermission,
@@ -1375,7 +1444,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo", "teamname": "owners"},
         {"role": "read"},
         "devtable",
-        403,
+        400,
     ),
     (
         RepositoryTeamPermission,
@@ -1574,6 +1643,14 @@ SECURITY_TESTS: List[
         "PUT",
         {"repository": "buynlarge/orgrepo", "teamname": "owners"},
         {"role": "read"},
+        "globalreadonlysuperuser",
+        403,
+    ),
+    (
+        RepositoryTeamPermission,
+        "PUT",
+        {"repository": "buynlarge/orgrepo", "teamname": "owners"},
+        {"role": "read"},
         "freshuser",
         403,
     ),
@@ -1599,7 +1676,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo", "trigger_uuid": "SWO1"},
         {},
         "devtable",
-        403,
+        400,
     ),
     (
         BuildTriggerActivate,
@@ -1695,7 +1772,7 @@ SECURITY_TESTS: List[
         {"field_name": "test_field", "repository": "public/publicrepo", "trigger_uuid": "SWO1"},
         {},
         "devtable",
-        403,
+        404,
     ),
     (
         BuildTriggerFieldValues,
@@ -1791,7 +1868,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo", "trigger_uuid": "831C"},
         {"namespace": "foo"},
         "devtable",
-        403,
+        404,
     ),
     (
         BuildTriggerSources,
@@ -1887,7 +1964,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo", "trigger_uuid": "4I2Y"},
         {},
         "devtable",
-        403,
+        404,
     ),
     (
         BuildTriggerSubdirs,
@@ -1983,7 +2060,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo", "trigger_uuid": "ZM1W"},
         None,
         "devtable",
-        403,
+        200,
     ),
     (
         TriggerBuildList,
@@ -2087,7 +2164,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo", "trigger_uuid": "0BYE"},
         None,
         "devtable",
-        403,
+        400,
     ),
     (
         ActivateBuildTrigger,
@@ -2183,7 +2260,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo", "trigger_uuid": "0BYE"},
         {"config": {}},
         "devtable",
-        403,
+        404,
     ),
     (
         BuildTriggerAnalyze,
@@ -2471,7 +2548,7 @@ SECURITY_TESTS: List[
         {"build_uuid": "FG86", "repository": "public/publicrepo"},
         None,
         "devtable",
-        403,
+        404,
     ),
     (
         RepositoryBuildResource,
@@ -2567,7 +2644,7 @@ SECURITY_TESTS: List[
         {"build_uuid": "S5J8", "repository": "public/publicrepo"},
         None,
         "devtable",
-        403,
+        400,
     ),
     (
         RepositoryBuildLogs,
@@ -3037,7 +3114,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo"},
         None,
         "devtable",
-        403,
+        200,
     ),
     (
         RepositoryTeamPermissionList,
@@ -3092,7 +3169,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo"},
         None,
         "devtable",
-        403,
+        200,
     ),
     (
         RepositoryUserPermissionList,
@@ -3154,7 +3231,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo", "trigger_uuid": "D6TI"},
         None,
         "devtable",
-        403,
+        404,
     ),
     (
         BuildTrigger,
@@ -3186,7 +3263,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo", "trigger_uuid": "D6TI"},
         None,
         "devtable",
-        403,
+        404,
     ),
     (
         BuildTrigger,
@@ -3354,7 +3431,7 @@ SECURITY_TESTS: List[
         {"uuid": "QFAT", "repository": "public/publicrepo"},
         None,
         "devtable",
-        403,
+        400,
     ),
     (
         RepositoryNotification,
@@ -3386,7 +3463,7 @@ SECURITY_TESTS: List[
         {"uuid": "QFAT", "repository": "public/publicrepo"},
         None,
         "devtable",
-        403,
+        404,
     ),
     (
         RepositoryNotification,
@@ -3554,7 +3631,7 @@ SECURITY_TESTS: List[
         {"code": "UJQB", "repository": "public/publicrepo"},
         None,
         "devtable",
-        403,
+        410,
     ),
     (
         RepositoryToken,
@@ -3579,7 +3656,7 @@ SECURITY_TESTS: List[
         {"code": "UJQB", "repository": "public/publicrepo"},
         None,
         "devtable",
-        403,
+        410,
     ),
     (
         RepositoryToken,
@@ -3611,7 +3688,7 @@ SECURITY_TESTS: List[
         {"code": "UJQB", "repository": "public/publicrepo"},
         {"role": "read"},
         "devtable",
-        403,
+        410,
     ),
     (
         RepositoryToken,
@@ -3814,7 +3891,7 @@ SECURITY_TESTS: List[
         {"tag": "HP8R", "repository": "public/publicrepo"},
         {"manifest_digest": "WXNG"},
         "devtable",
-        403,
+        404,
     ),
     (
         RestoreTag,
@@ -3910,7 +3987,7 @@ SECURITY_TESTS: List[
         {"tag": "HP8R", "repository": "public/publicrepo"},
         {"manifest_digest": "WXNG"},
         "devtable",
-        403,
+        404,
     ),
     (
         TagTimeMachineDelete,
@@ -3999,7 +4076,7 @@ SECURITY_TESTS: List[
         {"tag": "HP8R", "repository": "public/publicrepo"},
         None,
         "devtable",
-        403,
+        404,
     ),
     (
         RepositoryTag,
@@ -4031,7 +4108,7 @@ SECURITY_TESTS: List[
         {"tag": "HP8R", "repository": "public/publicrepo"},
         {"manifest_digest": "WXNG"},
         "devtable",
-        403,
+        404,
     ),
     (
         RepositoryTag,
@@ -4273,6 +4350,99 @@ SECURITY_TESTS: List[
     (OrgLogs, "GET", {"orgname": "buynlarge"}, None, "freshuser", 403),
     (OrgLogs, "GET", {"orgname": "buynlarge"}, None, "reader", 403),
     (OrgLogs, "GET", {"orgname": "buynlarge"}, None, "globalreadonlysuperuser", 200),
+    (OrganizationApplicationTokens, "GET", ORG_APPLICATION_TOKEN_PARAMS, None, None, 401),
+    (OrganizationApplicationTokens, "GET", ORG_APPLICATION_TOKEN_PARAMS, None, "freshuser", 403),
+    (OrganizationApplicationTokens, "GET", ORG_APPLICATION_TOKEN_PARAMS, None, "reader", 403),
+    (OrganizationApplicationTokens, "GET", ORG_APPLICATION_TOKEN_PARAMS, None, "devtable", 404),
+    (
+        OrganizationApplicationTokens,
+        "GET",
+        ORG_APPLICATION_TOKEN_PARAMS,
+        None,
+        "globalreadonlysuperuser",
+        404,
+    ),
+    (
+        OrganizationApplicationTokens,
+        "POST",
+        ORG_APPLICATION_TOKEN_PARAMS,
+        {"name": "Security token", "scope": "repo:read"},
+        None,
+        401,
+    ),
+    (
+        OrganizationApplicationTokens,
+        "POST",
+        ORG_APPLICATION_TOKEN_PARAMS,
+        {"name": "Security token", "scope": "repo:read"},
+        "freshuser",
+        403,
+    ),
+    (
+        OrganizationApplicationTokens,
+        "POST",
+        ORG_APPLICATION_TOKEN_PARAMS,
+        {"name": "Security token", "scope": "repo:read"},
+        "reader",
+        403,
+    ),
+    (
+        OrganizationApplicationTokens,
+        "POST",
+        ORG_APPLICATION_TOKEN_PARAMS,
+        {"name": "Security token", "scope": "repo:read"},
+        "devtable",
+        404,
+    ),
+    (
+        OrganizationApplicationTokens,
+        "POST",
+        ORG_APPLICATION_TOKEN_PARAMS,
+        {"name": "Security token", "scope": "repo:read"},
+        "globalreadonlysuperuser",
+        403,
+    ),
+    (OrganizationApplicationToken, "DELETE", ORG_APPLICATION_TOKEN_UUID_PARAMS, None, None, 401),
+    (UserRobotMintableScopes, "GET", USER_ROBOT_TOKEN_PARAMS, None, None, 401),
+    (OrganizationRobotMintableScopes, "GET", ORG_ROBOT_TOKEN_PARAMS, None, None, 401),
+    (UserRobotTokens, "GET", USER_ROBOT_TOKEN_PARAMS, None, None, 401),
+    (UserRobotTokens, "POST", USER_ROBOT_TOKEN_PARAMS, None, None, 401),
+    (UserRobotToken, "DELETE", USER_ROBOT_TOKEN_UUID_PARAMS, None, None, 401),
+    (OrganizationRobotTokens, "GET", ORG_ROBOT_TOKEN_PARAMS, None, None, 401),
+    (OrganizationRobotTokens, "POST", ORG_ROBOT_TOKEN_PARAMS, None, None, 401),
+    (OrganizationRobotToken, "DELETE", ORG_ROBOT_TOKEN_UUID_PARAMS, None, None, 401),
+    (
+        OrganizationApplicationToken,
+        "DELETE",
+        ORG_APPLICATION_TOKEN_UUID_PARAMS,
+        None,
+        "freshuser",
+        403,
+    ),
+    (
+        OrganizationApplicationToken,
+        "DELETE",
+        ORG_APPLICATION_TOKEN_UUID_PARAMS,
+        None,
+        "reader",
+        403,
+    ),
+    (
+        OrganizationApplicationToken,
+        "DELETE",
+        ORG_APPLICATION_TOKEN_UUID_PARAMS,
+        None,
+        "devtable",
+        404,
+    ),
+    (
+        OrganizationApplicationToken,
+        "DELETE",
+        ORG_APPLICATION_TOKEN_UUID_PARAMS,
+        None,
+        "globalreadonlysuperuser",
+        403,
+    ),
     (
         RepositoryVisibility,
         "POST",
@@ -4287,6 +4457,14 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo"},
         {"visibility": "public"},
         "devtable",
+        200,
+    ),
+    (
+        RepositoryVisibility,
+        "POST",
+        {"repository": "public/publicrepo"},
+        {"visibility": "public"},
+        "globalreadonlysuperuser",
         403,
     ),
     (
@@ -4326,6 +4504,14 @@ SECURITY_TESTS: List[
         "POST",
         {"repository": "devtable/shared"},
         {"visibility": "public"},
+        "globalreadonlysuperuser",
+        403,
+    ),
+    (
+        RepositoryVisibility,
+        "POST",
+        {"repository": "devtable/shared"},
+        {"visibility": "public"},
         "freshuser",
         403,
     ),
@@ -4352,6 +4538,14 @@ SECURITY_TESTS: List[
         {"visibility": "public"},
         "devtable",
         200,
+    ),
+    (
+        RepositoryVisibility,
+        "POST",
+        {"repository": "buynlarge/orgrepo"},
+        {"visibility": "public"},
+        "globalreadonlysuperuser",
+        403,
     ),
     (
         RepositoryVisibility,
@@ -4370,7 +4564,7 @@ SECURITY_TESTS: List[
         403,
     ),
     (BuildTriggerList, "GET", {"repository": "public/publicrepo"}, None, None, 401),
-    (BuildTriggerList, "GET", {"repository": "public/publicrepo"}, None, "devtable", 403),
+    (BuildTriggerList, "GET", {"repository": "public/publicrepo"}, None, "devtable", 200),
     (
         BuildTriggerList,
         "GET",
@@ -4390,7 +4584,7 @@ SECURITY_TESTS: List[
     (BuildTriggerList, "GET", {"repository": "buynlarge/orgrepo"}, None, "freshuser", 403),
     (BuildTriggerList, "GET", {"repository": "buynlarge/orgrepo"}, None, "reader", 403),
     (RepositoryNotificationList, "GET", {"repository": "public/publicrepo"}, None, None, 401),
-    (RepositoryNotificationList, "GET", {"repository": "public/publicrepo"}, None, "devtable", 403),
+    (RepositoryNotificationList, "GET", {"repository": "public/publicrepo"}, None, "devtable", 200),
     (
         RepositoryNotificationList,
         "GET",
@@ -4409,7 +4603,15 @@ SECURITY_TESTS: List[
     ),
     (RepositoryNotificationList, "GET", {"repository": "public/publicrepo"}, None, "reader", 403),
     (RepositoryNotificationList, "POST", {"repository": "public/publicrepo"}, {}, None, 401),
-    (RepositoryNotificationList, "POST", {"repository": "public/publicrepo"}, {}, "devtable", 403),
+    (RepositoryNotificationList, "POST", {"repository": "public/publicrepo"}, {}, "devtable", 400),
+    (
+        RepositoryNotificationList,
+        "POST",
+        {"repository": "public/publicrepo"},
+        {},
+        "globalreadonlysuperuser",
+        403,
+    ),
     (RepositoryNotificationList, "POST", {"repository": "public/publicrepo"}, {}, "freshuser", 403),
     (RepositoryNotificationList, "POST", {"repository": "public/publicrepo"}, {}, "reader", 403),
     (RepositoryNotificationList, "GET", {"repository": "devtable/shared"}, None, None, 401),
@@ -4424,6 +4626,14 @@ SECURITY_TESTS: List[
         {"config": {"email": "a@b.com"}, "event": "repo_push", "method": "email"},
         "devtable",
         400,
+    ),
+    (
+        RepositoryNotificationList,
+        "POST",
+        {"repository": "devtable/shared"},
+        {},
+        "globalreadonlysuperuser",
+        403,
     ),
     (RepositoryNotificationList, "POST", {"repository": "devtable/shared"}, {}, "freshuser", 403),
     (RepositoryNotificationList, "POST", {"repository": "devtable/shared"}, {}, "reader", 403),
@@ -4447,6 +4657,14 @@ SECURITY_TESTS: List[
         "devtable",
         400,
     ),
+    (
+        RepositoryNotificationList,
+        "POST",
+        {"repository": "buynlarge/orgrepo"},
+        {},
+        "globalreadonlysuperuser",
+        403,
+    ),
     (RepositoryNotificationList, "POST", {"repository": "buynlarge/orgrepo"}, {}, "freshuser", 403),
     (RepositoryNotificationList, "POST", {"repository": "buynlarge/orgrepo"}, {}, "reader", 403),
     (
@@ -4463,7 +4681,7 @@ SECURITY_TESTS: List[
         {"email": "jschorr@devtable.com", "repository": "public/publicrepo"},
         None,
         "devtable",
-        403,
+        404,
     ),
     (
         RepositoryAuthorizedEmail,
@@ -4495,7 +4713,7 @@ SECURITY_TESTS: List[
         {"email": "jschorr@devtable.com", "repository": "public/publicrepo"},
         {},
         "devtable",
-        403,
+        200,
     ),
     (
         RepositoryAuthorizedEmail,
@@ -4642,7 +4860,7 @@ SECURITY_TESTS: List[
         403,
     ),
     (RepositoryTokenList, "GET", {"repository": "public/publicrepo"}, None, None, 401),
-    (RepositoryTokenList, "GET", {"repository": "public/publicrepo"}, None, "devtable", 403),
+    (RepositoryTokenList, "GET", {"repository": "public/publicrepo"}, None, "devtable", 410),
     (RepositoryTokenList, "GET", {"repository": "public/publicrepo"}, None, "freshuser", 403),
     (RepositoryTokenList, "GET", {"repository": "public/publicrepo"}, None, "reader", 403),
     (
@@ -4659,7 +4877,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo"},
         {"friendlyName": "R1CN"},
         "devtable",
-        403,
+        410,
     ),
     (
         RepositoryTokenList,
@@ -4767,7 +4985,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo"},
         {"file_id": "UX7K"},
         "devtable",
-        403,
+        201,
     ),
     (
         RepositoryBuildList,
@@ -4858,7 +5076,7 @@ SECURITY_TESTS: List[
         403,
     ),
     (RepositoryLogs, "GET", {"repository": "public/publicrepo"}, None, None, 401),
-    (RepositoryLogs, "GET", {"repository": "public/publicrepo"}, None, "devtable", 403),
+    (RepositoryLogs, "GET", {"repository": "public/publicrepo"}, None, "devtable", 200),
     (RepositoryLogs, "GET", {"repository": "public/publicrepo"}, None, "freshuser", 403),
     (RepositoryLogs, "GET", {"repository": "public/publicrepo"}, None, "reader", 403),
     (RepositoryLogs, "GET", {"repository": "devtable/shared"}, None, None, 401),
@@ -4982,7 +5200,7 @@ SECURITY_TESTS: List[
     (Organization, "PUT", {"orgname": "buynlarge"}, {}, "freshuser", 403),
     (Organization, "PUT", {"orgname": "buynlarge"}, {}, "reader", 403),
     (Repository, "DELETE", {"repository": "public/publicrepo"}, None, None, 401),
-    (Repository, "DELETE", {"repository": "public/publicrepo"}, None, "devtable", 403),
+    (Repository, "DELETE", {"repository": "public/publicrepo"}, None, "devtable", 204),
     (Repository, "DELETE", {"repository": "public/publicrepo"}, None, "freshuser", 403),
     (Repository, "DELETE", {"repository": "public/publicrepo"}, None, "reader", 403),
     (Repository, "GET", {"repository": "public/publicrepo"}, None, None, 200),
@@ -4996,7 +5214,7 @@ SECURITY_TESTS: List[
         {"repository": "public/publicrepo"},
         {"description": "WXNG"},
         "devtable",
-        403,
+        200,
     ),
     (
         Repository,
@@ -5349,6 +5567,16 @@ SECURITY_TESTS: List[
     (SuperUserLogs, "GET", None, None, "globalreadonlysuperuser", 200),
     (SuperUserLogs, "GET", None, None, "freshuser", 403),
     (SuperUserLogs, "GET", None, None, "reader", 403),
+    (SuperUserRepositoryMirrorHealth, "GET", None, None, None, 401),
+    (SuperUserRepositoryMirrorHealth, "GET", None, None, "devtable", 200),
+    (SuperUserRepositoryMirrorHealth, "GET", None, None, "globalreadonlysuperuser", 200),
+    (SuperUserRepositoryMirrorHealth, "GET", None, None, "freshuser", 403),
+    (SuperUserRepositoryMirrorHealth, "GET", None, None, "reader", 403),
+    (SuperUserAppTokens, "GET", None, None, None, 401),
+    (SuperUserAppTokens, "GET", None, None, "devtable", 200),
+    (SuperUserAppTokens, "GET", None, None, "globalreadonlysuperuser", 200),
+    (SuperUserAppTokens, "GET", None, None, "freshuser", 403),
+    (SuperUserAppTokens, "GET", None, None, "reader", 403),
     (SuperUserSendRecoveryEmail, "POST", {"username": "someuser"}, None, None, 401),
     (SuperUserSendRecoveryEmail, "POST", {"username": "someuser"}, None, "devtable", 404),
     (SuperUserSendRecoveryEmail, "POST", {"username": "someuser"}, None, "freshuser", 403),
@@ -5879,6 +6107,11 @@ SECURITY_TESTS: List[
         "globalreadonlysuperuser",
         404,
     ),
+    (RepositoryMirrorHealth, "GET", None, None, None, 401),
+    (RepositoryMirrorHealth, "GET", None, None, "devtable", 200),
+    (RepositoryMirrorHealth, "GET", None, None, "globalreadonlysuperuser", 200),
+    (RepositoryMirrorHealth, "GET", None, None, "freshuser", 403),
+    (RepositoryMirrorHealth, "GET", None, None, "reader", 403),
     (RepoMirrorResource, "POST", {"repository": "devtable/simple"}, None, None, 401),
     (RepoMirrorResource, "POST", {"repository": "devtable/simple"}, None, "devtable", 400),
     (RepoMirrorResource, "POST", {"repository": "devtable/simple"}, None, "freshuser", 403),
@@ -5941,7 +6174,7 @@ SECURITY_TESTS: List[
         OrganizationProxyCacheConfig,
         "POST",
         {"orgname": "buynlarge"},
-        {"org_name": "buynlarge", "upstream_registry": "some-upstream-registry"},
+        {"upstream_registry": "some-upstream-registry"},
         None,
         401,
     ),
@@ -5949,7 +6182,7 @@ SECURITY_TESTS: List[
         OrganizationProxyCacheConfig,
         "POST",
         {"orgname": "buynlarge"},
-        {"org_name": "buynlarge", "upstream_registry": "some-upstream-registry"},
+        {"upstream_registry": "some-upstream-registry"},
         "randomuser",
         403,
     ),
@@ -5957,7 +6190,7 @@ SECURITY_TESTS: List[
         OrganizationProxyCacheConfig,
         "POST",
         {"orgname": "sellnsmall"},
-        {"org_name": "sellnsmall", "upstream_registry": None},
+        {"upstream_registry": None},
         "devtable",
         400,
     ),
@@ -5965,7 +6198,7 @@ SECURITY_TESTS: List[
         OrganizationProxyCacheConfig,
         "POST",
         {"orgname": "library"},
-        {"org_name": "library", "upstream_registry": "some-upstream-registry"},
+        {"upstream_registry": "docker.io"},
         "devtable",
         201,
     ),
@@ -6422,7 +6655,7 @@ SECURITY_TESTS: List[
     ),
     (OrgAutoPrunePolicies, "GET", {"orgname": "buynlarge"}, None, None, 401),
     (OrgAutoPrunePolicies, "GET", {"orgname": "buynlarge"}, None, "devtable", 200),
-    (OrgAutoPrunePolicies, "GET", {"orgname": "unknown"}, None, "devtable", 403),
+    (OrgAutoPrunePolicies, "GET", {"orgname": "unknown"}, None, "devtable", 200),
     (OrgAutoPrunePolicies, "GET", {"orgname": "buynlarge"}, None, "globalreadonlysuperuser", 200),
     (OrgAutoPrunePolicies, "GET", {"orgname": "buynlarge"}, None, "freshuser", 403),
     (OrgAutoPrunePolicies, "GET", {"orgname": "buynlarge"}, None, "reader", 403),
@@ -6448,7 +6681,7 @@ SECURITY_TESTS: List[
         {"orgname": "unknown"},
         {"method": "number_of_tags", "value": 10},
         "devtable",
-        403,
+        404,
     ),
     (
         OrgAutoPrunePolicies,
@@ -6480,7 +6713,7 @@ SECURITY_TESTS: List[
         {"orgname": "unknown", "policy_uuid": "some_uuid"},
         None,
         "devtable",
-        403,
+        404,
     ),
     (
         OrgAutoPrunePolicy,
@@ -6520,7 +6753,7 @@ SECURITY_TESTS: List[
         {"orgname": "unknown", "policy_uuid": "some_uuid"},
         {"method": "number_of_tags", "value": 10},
         "devtable",
-        403,
+        404,
     ),
     (
         OrgAutoPrunePolicy,
@@ -6552,7 +6785,7 @@ SECURITY_TESTS: List[
         {"orgname": "unknown", "policy_uuid": "some_uuid"},
         None,
         "devtable",
-        403,
+        404,
     ),
     (
         OrgAutoPrunePolicy,
@@ -6848,6 +7081,300 @@ SECURITY_TESTS: List[
         "testuser",
         401,
     ),
+    (UserRobotFederation, "GET", {"robot_shortname": "robotname"}, None, None, 401),
+    (UserRobotFederation, "GET", {"robot_shortname": "robotname"}, None, "devtable", 400),
+    (UserRobotFederation, "POST", {"robot_shortname": "robotname"}, None, None, 401),
+    (UserRobotFederation, "POST", {"robot_shortname": "robotname"}, None, "devtable", 400),
+    (UserRobotFederation, "DELETE", {"robot_shortname": "robotname"}, None, None, 401),
+    (UserRobotFederation, "DELETE", {"robot_shortname": "robotname"}, None, "devtable", 400),
+    (
+        RepositoryTagPullStatistics,
+        "GET",
+        TAG_PARAMS,
+        {},
+        None,
+        401,
+    ),
+    (
+        RepositoryTagPullStatistics,
+        "GET",
+        TAG_PARAMS,
+        {},
+        "freshuser",
+        403,
+    ),
+    (
+        RepositoryTagPullStatistics,
+        "GET",
+        TAG_PARAMS,
+        {},
+        "reader",
+        403,
+    ),
+    (
+        RepositoryTagPullStatistics,
+        "GET",
+        TAG_PARAMS,
+        {},
+        "devtable",
+        200,
+    ),
+    (
+        RepositoryManifestPullStatistics,
+        "GET",
+        MANIFEST_PARAMS,
+        {},
+        None,
+        401,
+    ),
+    (
+        RepositoryManifestPullStatistics,
+        "GET",
+        MANIFEST_PARAMS,
+        {},
+        "freshuser",
+        403,
+    ),
+    (
+        RepositoryManifestPullStatistics,
+        "GET",
+        MANIFEST_PARAMS,
+        {},
+        "reader",
+        403,
+    ),
+    (
+        RepositoryManifestPullStatistics,
+        "GET",
+        MANIFEST_PARAMS,
+        {},
+        "devtable",
+        404,
+    ),
+    # OrgMirrorConfig GET
+    (OrgMirrorConfig, "GET", ORG_PARAMS, None, None, 401),
+    (OrgMirrorConfig, "GET", ORG_PARAMS, None, "freshuser", 403),
+    (OrgMirrorConfig, "GET", ORG_PARAMS, None, "reader", 403),
+    (OrgMirrorConfig, "GET", ORG_PARAMS, None, "devtable", 404),
+    # OrgMirrorConfig POST (JSON validation happens before auth check)
+    (OrgMirrorConfig, "POST", ORG_PARAMS, {}, None, 400),
+    (OrgMirrorConfig, "POST", ORG_PARAMS, {}, "freshuser", 400),
+    (OrgMirrorConfig, "POST", ORG_PARAMS, {}, "reader", 400),
+    (OrgMirrorConfig, "POST", ORG_PARAMS, {}, "devtable", 400),
+    # OrgMirrorConfig PUT
+    (OrgMirrorConfig, "PUT", ORG_PARAMS, {}, None, 401),
+    (OrgMirrorConfig, "PUT", ORG_PARAMS, {}, "freshuser", 403),
+    (OrgMirrorConfig, "PUT", ORG_PARAMS, {}, "reader", 403),
+    (OrgMirrorConfig, "PUT", ORG_PARAMS, {}, "devtable", 404),
+    # OrgMirrorConfig DELETE
+    (OrgMirrorConfig, "DELETE", ORG_PARAMS, None, None, 401),
+    (OrgMirrorConfig, "DELETE", ORG_PARAMS, None, "freshuser", 403),
+    (OrgMirrorConfig, "DELETE", ORG_PARAMS, None, "reader", 403),
+    (OrgMirrorConfig, "DELETE", ORG_PARAMS, None, "devtable", 404),
+    # OrgMirrorSyncNow POST
+    (OrgMirrorSyncNow, "POST", ORG_PARAMS, None, None, 401),
+    (OrgMirrorSyncNow, "POST", ORG_PARAMS, None, "freshuser", 403),
+    (OrgMirrorSyncNow, "POST", ORG_PARAMS, None, "reader", 403),
+    (OrgMirrorSyncNow, "POST", ORG_PARAMS, None, "devtable", 404),
+    # OrgMirrorSyncCancel POST
+    (OrgMirrorSyncCancel, "POST", ORG_PARAMS, None, None, 401),
+    (OrgMirrorSyncCancel, "POST", ORG_PARAMS, None, "freshuser", 403),
+    (OrgMirrorSyncCancel, "POST", ORG_PARAMS, None, "reader", 403),
+    (OrgMirrorSyncCancel, "POST", ORG_PARAMS, None, "devtable", 404),
+    # OrgMirrorVerify POST
+    (OrgMirrorVerify, "POST", ORG_PARAMS, None, None, 401),
+    (OrgMirrorVerify, "POST", ORG_PARAMS, None, "freshuser", 403),
+    (OrgMirrorVerify, "POST", ORG_PARAMS, None, "reader", 403),
+    (OrgMirrorVerify, "POST", ORG_PARAMS, None, "devtable", 404),
+    # OrgMirrorRepositories GET
+    (OrgMirrorRepositories, "GET", ORG_PARAMS, None, None, 401),
+    (OrgMirrorRepositories, "GET", ORG_PARAMS, None, "freshuser", 403),
+    (OrgMirrorRepositories, "GET", ORG_PARAMS, None, "reader", 403),
+    (OrgMirrorRepositories, "GET", ORG_PARAMS, None, "devtable", 404),
+    # OrgImmutabilityPolicies GET
+    (OrgImmutabilityPolicies, "GET", ORG_PARAMS, None, None, 401),
+    (OrgImmutabilityPolicies, "GET", ORG_PARAMS, None, "freshuser", 403),
+    (OrgImmutabilityPolicies, "GET", ORG_PARAMS, None, "reader", 403),
+    (OrgImmutabilityPolicies, "GET", ORG_PARAMS, None, "devtable", 200),
+    # OrgImmutabilityPolicies POST
+    (OrgImmutabilityPolicies, "POST", ORG_PARAMS, {"tagPattern": "^v.*$"}, None, 401),
+    (OrgImmutabilityPolicies, "POST", ORG_PARAMS, {"tagPattern": "^v.*$"}, "freshuser", 403),
+    (OrgImmutabilityPolicies, "POST", ORG_PARAMS, {"tagPattern": "^v.*$"}, "reader", 403),
+    (OrgImmutabilityPolicies, "POST", ORG_PARAMS, {"tagPattern": "^v.*$"}, "devtable", 201),
+    # OrgImmutabilityPolicy GET
+    (OrgImmutabilityPolicy, "GET", ORG_IMMUTABILITY_POLICY_PARAMS, None, None, 401),
+    (OrgImmutabilityPolicy, "GET", ORG_IMMUTABILITY_POLICY_PARAMS, None, "freshuser", 403),
+    (OrgImmutabilityPolicy, "GET", ORG_IMMUTABILITY_POLICY_PARAMS, None, "reader", 403),
+    (OrgImmutabilityPolicy, "GET", ORG_IMMUTABILITY_POLICY_PARAMS, None, "devtable", 404),
+    # OrgImmutabilityPolicy PUT
+    (
+        OrgImmutabilityPolicy,
+        "PUT",
+        ORG_IMMUTABILITY_POLICY_PARAMS,
+        {"tagPattern": "^v.*$"},
+        None,
+        401,
+    ),
+    (
+        OrgImmutabilityPolicy,
+        "PUT",
+        ORG_IMMUTABILITY_POLICY_PARAMS,
+        {"tagPattern": "^v.*$"},
+        "freshuser",
+        403,
+    ),
+    (
+        OrgImmutabilityPolicy,
+        "PUT",
+        ORG_IMMUTABILITY_POLICY_PARAMS,
+        {"tagPattern": "^v.*$"},
+        "reader",
+        403,
+    ),
+    (
+        OrgImmutabilityPolicy,
+        "PUT",
+        ORG_IMMUTABILITY_POLICY_PARAMS,
+        {"tagPattern": "^v.*$"},
+        "devtable",
+        404,
+    ),
+    # OrgImmutabilityPolicy DELETE
+    (OrgImmutabilityPolicy, "DELETE", ORG_IMMUTABILITY_POLICY_PARAMS, None, None, 401),
+    (OrgImmutabilityPolicy, "DELETE", ORG_IMMUTABILITY_POLICY_PARAMS, None, "freshuser", 403),
+    (OrgImmutabilityPolicy, "DELETE", ORG_IMMUTABILITY_POLICY_PARAMS, None, "reader", 403),
+    (OrgImmutabilityPolicy, "DELETE", ORG_IMMUTABILITY_POLICY_PARAMS, None, "devtable", 404),
+    # RepositoryImmutabilityPolicies GET
+    (RepositoryImmutabilityPolicies, "GET", REPO_PARAMS, None, None, 401),
+    (RepositoryImmutabilityPolicies, "GET", REPO_PARAMS, None, "freshuser", 403),
+    (RepositoryImmutabilityPolicies, "GET", REPO_PARAMS, None, "reader", 403),
+    (RepositoryImmutabilityPolicies, "GET", REPO_PARAMS, None, "devtable", 404),
+    # RepositoryImmutabilityPolicies POST
+    (RepositoryImmutabilityPolicies, "POST", REPO_PARAMS, {"tagPattern": "^v.*$"}, None, 401),
+    (
+        RepositoryImmutabilityPolicies,
+        "POST",
+        REPO_PARAMS,
+        {"tagPattern": "^v.*$"},
+        "freshuser",
+        403,
+    ),
+    (RepositoryImmutabilityPolicies, "POST", REPO_PARAMS, {"tagPattern": "^v.*$"}, "reader", 403),
+    (RepositoryImmutabilityPolicies, "POST", REPO_PARAMS, {"tagPattern": "^v.*$"}, "devtable", 404),
+    # RepositoryImmutabilityPolicy GET
+    (RepositoryImmutabilityPolicy, "GET", REPO_IMMUTABILITY_POLICY_PARAMS, None, None, 401),
+    (RepositoryImmutabilityPolicy, "GET", REPO_IMMUTABILITY_POLICY_PARAMS, None, "freshuser", 403),
+    (RepositoryImmutabilityPolicy, "GET", REPO_IMMUTABILITY_POLICY_PARAMS, None, "reader", 403),
+    (RepositoryImmutabilityPolicy, "GET", REPO_IMMUTABILITY_POLICY_PARAMS, None, "devtable", 404),
+    # RepositoryImmutabilityPolicy PUT
+    (
+        RepositoryImmutabilityPolicy,
+        "PUT",
+        REPO_IMMUTABILITY_POLICY_PARAMS,
+        {"tagPattern": "^v.*$"},
+        None,
+        401,
+    ),
+    (
+        RepositoryImmutabilityPolicy,
+        "PUT",
+        REPO_IMMUTABILITY_POLICY_PARAMS,
+        {"tagPattern": "^v.*$"},
+        "freshuser",
+        403,
+    ),
+    (
+        RepositoryImmutabilityPolicy,
+        "PUT",
+        REPO_IMMUTABILITY_POLICY_PARAMS,
+        {"tagPattern": "^v.*$"},
+        "reader",
+        403,
+    ),
+    (
+        RepositoryImmutabilityPolicy,
+        "PUT",
+        REPO_IMMUTABILITY_POLICY_PARAMS,
+        {"tagPattern": "^v.*$"},
+        "devtable",
+        404,
+    ),
+    # RepositoryImmutabilityPolicy DELETE
+    (RepositoryImmutabilityPolicy, "DELETE", REPO_IMMUTABILITY_POLICY_PARAMS, None, None, 401),
+    (
+        RepositoryImmutabilityPolicy,
+        "DELETE",
+        REPO_IMMUTABILITY_POLICY_PARAMS,
+        None,
+        "freshuser",
+        403,
+    ),
+    (RepositoryImmutabilityPolicy, "DELETE", REPO_IMMUTABILITY_POLICY_PARAMS, None, "reader", 403),
+    (
+        RepositoryImmutabilityPolicy,
+        "DELETE",
+        REPO_IMMUTABILITY_POLICY_PARAMS,
+        None,
+        "devtable",
+        404,
+    ),
+    # Namespace notification endpoints (gated by QUOTA_NOTIFICATIONS feature)
+    (OrgNamespaceNotificationList, "GET", ORG_NS_NOTIFICATION_PARAMS, None, None, 401),
+    (OrgNamespaceNotificationList, "GET", ORG_NS_NOTIFICATION_PARAMS, None, "freshuser", 403),
+    (OrgNamespaceNotificationList, "GET", ORG_NS_NOTIFICATION_PARAMS, None, "reader", 403),
+    (OrgNamespaceNotificationList, "GET", ORG_NS_NOTIFICATION_PARAMS, None, "devtable", 200),
+    (OrgNamespaceNotificationList, "POST", ORG_NS_NOTIFICATION_PARAMS, {}, None, 401),
+    (OrgNamespaceNotificationList, "POST", ORG_NS_NOTIFICATION_PARAMS, {}, "freshuser", 403),
+    (OrgNamespaceNotificationList, "POST", ORG_NS_NOTIFICATION_PARAMS, {}, "reader", 403),
+    (OrgNamespaceNotificationList, "POST", ORG_NS_NOTIFICATION_PARAMS, {}, "devtable", 400),
+    (OrgNamespaceNotification, "GET", ORG_NS_NOTIFICATION_UUID_PARAMS, None, None, 401),
+    (OrgNamespaceNotification, "GET", ORG_NS_NOTIFICATION_UUID_PARAMS, None, "freshuser", 403),
+    (OrgNamespaceNotification, "GET", ORG_NS_NOTIFICATION_UUID_PARAMS, None, "reader", 403),
+    (OrgNamespaceNotification, "GET", ORG_NS_NOTIFICATION_UUID_PARAMS, None, "devtable", 404),
+    (OrgNamespaceNotification, "DELETE", ORG_NS_NOTIFICATION_UUID_PARAMS, None, None, 401),
+    (OrgNamespaceNotification, "DELETE", ORG_NS_NOTIFICATION_UUID_PARAMS, None, "freshuser", 403),
+    (OrgNamespaceNotification, "DELETE", ORG_NS_NOTIFICATION_UUID_PARAMS, None, "reader", 403),
+    (OrgNamespaceNotification, "DELETE", ORG_NS_NOTIFICATION_UUID_PARAMS, None, "devtable", 404),
+    (OrgNamespaceNotification, "POST", ORG_NS_NOTIFICATION_UUID_PARAMS, None, None, 401),
+    (OrgNamespaceNotification, "POST", ORG_NS_NOTIFICATION_UUID_PARAMS, None, "freshuser", 403),
+    (OrgNamespaceNotification, "POST", ORG_NS_NOTIFICATION_UUID_PARAMS, None, "reader", 403),
+    (OrgNamespaceNotification, "POST", ORG_NS_NOTIFICATION_UUID_PARAMS, None, "devtable", 404),
+    (TestOrgNamespaceNotification, "POST", ORG_NS_NOTIFICATION_UUID_PARAMS, None, None, 401),
+    (TestOrgNamespaceNotification, "POST", ORG_NS_NOTIFICATION_UUID_PARAMS, None, "freshuser", 403),
+    (TestOrgNamespaceNotification, "POST", ORG_NS_NOTIFICATION_UUID_PARAMS, None, "reader", 403),
+    (TestOrgNamespaceNotification, "POST", ORG_NS_NOTIFICATION_UUID_PARAMS, None, "devtable", 404),
+    (UserNamespaceNotificationList, "GET", {}, None, None, 401),
+    (UserNamespaceNotificationList, "GET", {}, None, "freshuser", 200),
+    (UserNamespaceNotificationList, "GET", {}, None, "devtable", 200),
+    (UserNamespaceNotificationList, "POST", {}, {}, None, 401),
+    (UserNamespaceNotificationList, "POST", {}, {}, "freshuser", 400),
+    (UserNamespaceNotificationList, "POST", {}, {}, "devtable", 400),
+    (UserNamespaceNotification, "GET", USER_NS_NOTIFICATION_UUID_PARAMS, None, None, 401),
+    (UserNamespaceNotification, "GET", USER_NS_NOTIFICATION_UUID_PARAMS, None, "freshuser", 404),
+    (UserNamespaceNotification, "GET", USER_NS_NOTIFICATION_UUID_PARAMS, None, "devtable", 404),
+    (UserNamespaceNotification, "DELETE", USER_NS_NOTIFICATION_UUID_PARAMS, None, None, 401),
+    (UserNamespaceNotification, "DELETE", USER_NS_NOTIFICATION_UUID_PARAMS, None, "freshuser", 404),
+    (UserNamespaceNotification, "DELETE", USER_NS_NOTIFICATION_UUID_PARAMS, None, "devtable", 404),
+    (UserNamespaceNotification, "POST", USER_NS_NOTIFICATION_UUID_PARAMS, None, None, 401),
+    (UserNamespaceNotification, "POST", USER_NS_NOTIFICATION_UUID_PARAMS, None, "freshuser", 404),
+    (UserNamespaceNotification, "POST", USER_NS_NOTIFICATION_UUID_PARAMS, None, "devtable", 404),
+    (TestUserNamespaceNotification, "POST", USER_NS_NOTIFICATION_UUID_PARAMS, None, None, 401),
+    (
+        TestUserNamespaceNotification,
+        "POST",
+        USER_NS_NOTIFICATION_UUID_PARAMS,
+        None,
+        "freshuser",
+        404,
+    ),
+    (
+        TestUserNamespaceNotification,
+        "POST",
+        USER_NS_NOTIFICATION_UUID_PARAMS,
+        None,
+        "devtable",
+        404,
+    ),
 ]
 
 
@@ -6856,9 +7383,18 @@ def empty_context():
     yield None
 
 
-@pytest.mark.parametrize("resource,method,params,body,identity,expected", SECURITY_TESTS)
+def _filter_security_tests():
+    """Filter out tests for resources that are None due to disabled features."""
+    return [test for test in SECURITY_TESTS if test[0] is not None]
+
+
+@pytest.mark.parametrize("resource,method,params,body,identity,expected", _filter_security_tests())
 def test_api_security(resource, method, params, body, identity, expected, app):
-    with client_with_identity(identity, app) as cl:
+    mock_dns = patch(
+        "util.security.ssrf._getaddrinfo",
+        return_value=[(2, 1, 6, "", ("93.184.216.34", 0))],
+    )
+    with mock_dns, client_with_identity(identity, app) as cl:
         conduct_api_call(cl, resource, method, params, body, expected)
 
 
